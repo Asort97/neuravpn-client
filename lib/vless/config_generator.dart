@@ -10,6 +10,7 @@ String generateSingBoxConfig(
   SplitTunnelConfig splitConfig, {
   String inboundTag = 'tun-in',
   String interfaceName = 'wintun0',
+  List<String>? addresses,
 }) {
   final p = link.params;
   final transportType = p['type']; // например ws, tcp, grpc, h2
@@ -110,7 +111,7 @@ String generateSingBoxConfig(
         'interface_name': interfaceName,
         'stack': 'system',
         'mtu': 1400,
-        'address': ['172.19.0.1/30'],
+        'address': addresses ?? const ['172.19.0.1/30'],
         'auto_route': true,
         'strict_route': false,
         'sniff': true,

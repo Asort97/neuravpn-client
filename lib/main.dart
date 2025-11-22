@@ -45,6 +45,7 @@ class _VlessHomePageState extends State<VlessHomePage> {
   SplitTunnelConfig _splitConfig = SplitTunnelConfig();
   final WintunManager _wintunManager = WintunManager();
   final WindowsTunGuard _tunGuard = WindowsTunGuard();
+  String? _activeInterfaceName;
 
   @override
   void initState() {
@@ -98,6 +99,7 @@ class _VlessHomePageState extends State<VlessHomePage> {
 
     String inboundTag = WindowsTunGuard.defaultInboundTag;
     String interfaceName = WindowsTunGuard.defaultInterfaceName;
+    List<String> interfaceAddresses = const ['172.19.0.1/30'];
 
     if (Platform.isWindows) {
       setState(() => _status = 'Проверка TUN интерфейса');
@@ -115,14 +117,21 @@ class _VlessHomePageState extends State<VlessHomePage> {
 
       inboundTag = guardResult.inboundTag;
       interfaceName = guardResult.interfaceName;
+      interfaceAddresses = guardResult.addresses;
+      if (guardResult.leftoverAdapters.isNotEmpty) {
+        _tunGuard.cleanupAdapters(guardResult.leftoverAdapters).then(_appendLogs);
+      }
       setState(() => _status = 'Генерация конфига');
     }
+
+    _activeInterfaceName = interfaceName;
 
     final jsonConfig = generateSingBoxConfig(
       parsed,
       _splitConfig,
       inboundTag: inboundTag,
       interfaceName: interfaceName,
+      addresses: interfaceAddresses,
     );
     _generatedConfig = jsonConfig;
     final tempDir = Directory.systemTemp.createTempSync('singbox_cfg_');
@@ -140,7 +149,8 @@ class _VlessHomePageState extends State<VlessHomePage> {
     try {
       final process = await Process.start(exePath, ['run', '-c', cfgFile.path]);
       _process = process;
-      setState(() => _status = 'Подключено (TUN: $interfaceName)');
+      final runInterface = interfaceName;
+      setState(() => _status = 'Подключено (TUN: $runInterface)');
 
       process.stdout.transform(SystemEncoding().decoder).listen((data) {
         setState(() {
@@ -168,7 +178,14 @@ class _VlessHomePageState extends State<VlessHomePage> {
             } else {
               _status = 'Процесс завершён (код $code)';
             }
+            _process = null;
           });
+        } else {
+          _process = null;
+        }
+        if (_activeInterfaceName == runInterface) {
+          _activeInterfaceName = null;
+          _tunGuard.cleanupAdapter(runInterface).then(_appendLogs);
         }
       });
     } catch (e) {
@@ -208,6 +225,13 @@ class _VlessHomePageState extends State<VlessHomePage> {
     await Future.delayed(const Duration(seconds: 1));
     
     _process = null;
+
+    if (Platform.isWindows && _activeInterfaceName != null) {
+      final logs = await _tunGuard.cleanupAdapter(_activeInterfaceName);
+      _appendLogs(logs);
+      _activeInterfaceName = null;
+    }
+
     if (mounted) setState(() => _status = 'Остановлено');
   }
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -7,7 +8,9 @@ class TunPreparationResult {
     required this.requiresElevation,
     required this.inboundTag,
     required this.interfaceName,
+    required this.addresses,
     required this.logs,
+    required this.leftoverAdapters,
     this.error,
   });
 
@@ -15,21 +18,26 @@ class TunPreparationResult {
   final bool requiresElevation;
   final String inboundTag;
   final String interfaceName;
+  final List<String> addresses;
   final List<String> logs;
+  final List<String> leftoverAdapters;
   final String? error;
 }
 
 class WindowsTunGuard {
   WindowsTunGuard({
-    this.removalTimeout = const Duration(seconds: 8),
-    this.pollInterval = const Duration(milliseconds: 400),
+    this.removalTimeout = const Duration(seconds: 3),
+    this.pollInterval = const Duration(milliseconds: 250),
+    this.cleanupBudget = const Duration(seconds: 6),
   });
 
   static const String defaultInboundTag = 'tun-in';
   static const String defaultInterfaceName = 'wintun0';
+  static const List<String> _defaultAddresses = ['172.19.0.1/30'];
 
   final Duration removalTimeout;
   final Duration pollInterval;
+  final Duration cleanupBudget;
   final Random _random = Random();
 
   Future<TunPreparationResult> prepare() async {
@@ -39,7 +47,9 @@ class WindowsTunGuard {
         requiresElevation: false,
         inboundTag: defaultInboundTag,
         interfaceName: defaultInterfaceName,
+        addresses: _defaultAddresses,
         logs: const ['Non-Windows OS detected, TUN guard skipped'],
+        leftoverAdapters: const [],
       );
     }
 
@@ -51,12 +61,12 @@ class WindowsTunGuard {
         requiresElevation: true,
         inboundTag: defaultInboundTag,
         interfaceName: defaultInterfaceName,
+        addresses: _defaultAddresses,
         logs: logs,
+        leftoverAdapters: const [],
         error: 'Run the application as Administrator',
       );
     }
-
-    await _runNetsh(['interface', 'show', 'interface'], logs);
 
     final conflicts = await _findConflictingAdapters(logs);
     if (conflicts.isEmpty) {
@@ -66,56 +76,50 @@ class WindowsTunGuard {
         requiresElevation: false,
         inboundTag: defaultInboundTag,
         interfaceName: defaultInterfaceName,
+        addresses: _defaultAddresses,
         logs: logs,
+        leftoverAdapters: const [],
       );
     }
 
     logs.add('Conflicting adapters detected: ${conflicts.join(', ')}');
-    var cleanupSucceeded = true;
-    for (final adapter in conflicts) {
-      final disable = await _runNetsh(
-        ['interface', 'set', 'interface', 'name="$adapter"', 'admin=disabled'],
-        logs,
-      );
-      if (disable?.exitCode != 0) cleanupSucceeded = false;
-
-      final delete = await _runNetsh(
-        ['interface', 'ipv4', 'delete', 'interface', adapter],
-        logs,
-      );
-      if (delete?.exitCode != 0) cleanupSucceeded = false;
-
-      final remove = await _runPowerShell(
-        "Get-NetAdapter -Name '${_escapePs(adapter)}' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:\$false -Force",
-        logs,
-      );
-      if (remove?.exitCode != 0) cleanupSucceeded = false;
-
-      if (!await _waitForAdapterRemoval(adapter, logs)) {
-        cleanupSucceeded = false;
-      }
-    }
-
-    if (cleanupSucceeded) {
-      logs.add('All conflicting adapters were removed.');
-      return TunPreparationResult(
-        success: true,
-        requiresElevation: false,
-        inboundTag: defaultInboundTag,
-        interfaceName: defaultInterfaceName,
-        logs: logs,
-      );
-    }
-
     final fallbackName = _buildFallbackName();
-    logs.add('Unable to cleanup adapters completely. Switching to $fallbackName');
+    final randomAddresses = _buildRandomAddresses();
+    logs.add('Fast path selected: using $fallbackName with subnet ${randomAddresses.join(', ')}');
     return TunPreparationResult(
       success: true,
       requiresElevation: false,
       inboundTag: fallbackName,
       interfaceName: fallbackName,
+      addresses: randomAddresses,
       logs: logs,
+      leftoverAdapters: conflicts,
     );
+  }
+
+  Future<List<String>> cleanupAdapter(String? interfaceName) async {
+    if (!Platform.isWindows || interfaceName == null || interfaceName.isEmpty) {
+      return const [];
+    }
+
+    final logs = <String>['Cleanup requested for $interfaceName'];
+    if (!await _adapterExists(interfaceName)) {
+      logs.add('Adapter $interfaceName already absent.');
+      return logs;
+    }
+
+    await _removeAdapter(interfaceName, logs, waitTimeout: removalTimeout);
+    return logs;
+  }
+
+  Future<List<String>> cleanupAdapters(List<String> adapters) async {
+    if (!Platform.isWindows || adapters.isEmpty) {
+      return const [];
+    }
+
+    final logs = <String>['Bulk cleanup requested for ${adapters.join(', ')}'];
+    await _cleanupWithBudget(adapters, logs);
+    return logs;
   }
 
   Future<List<String>> _findConflictingAdapters(List<String> logs) async {
@@ -133,16 +137,17 @@ class WindowsTunGuard {
     return names;
   }
 
-  Future<bool> _waitForAdapterRemoval(String name, List<String> logs) async {
-    final deadline = DateTime.now().add(removalTimeout);
+  Future<bool> _waitForAdapterRemoval(String name, List<String>? logs, {Duration? timeout}) async {
+    final limit = timeout ?? removalTimeout;
+    final deadline = DateTime.now().add(limit);
     while (DateTime.now().isBefore(deadline)) {
       if (!await _adapterExists(name)) {
-        logs.add('Adapter $name removed.');
+        logs?.add('Adapter $name removed.');
         return true;
       }
       await Future.delayed(pollInterval);
     }
-    logs.add('Adapter $name is still present after ${removalTimeout.inSeconds}s.');
+    logs?.add('Adapter $name is still present after ${limit.inSeconds}s.');
     return false;
   }
 
@@ -152,6 +157,69 @@ class WindowsTunGuard {
     final result = await _runPowerShell(command, null);
     if (result == null || result.stdout == null) return false;
     return result.stdout.toString().toLowerCase().contains('true');
+  }
+
+  Future<bool> _cleanupWithBudget(List<String> adapters, List<String> logs) async {
+    if (adapters.isEmpty) return true;
+    final stopwatch = Stopwatch()..start();
+    var removedCount = 0;
+
+    for (final adapter in adapters) {
+      final remaining = cleanupBudget - stopwatch.elapsed;
+      if (remaining <= Duration.zero) {
+        logs.add('Cleanup budget exceeded after removing $removedCount adapter(s).');
+        return false;
+      }
+
+      final waitTimeout = remaining < removalTimeout ? remaining : removalTimeout;
+      final removed = await _removeAdapter(adapter, logs, waitTimeout: waitTimeout);
+      if (!removed) {
+        logs.add('Stopping cleanup loop early because $adapter is still present.');
+        return false;
+      }
+      removedCount++;
+    }
+
+    logs.add('Removed $removedCount adapter(s) within ${stopwatch.elapsed.inSeconds}s.');
+    return true;
+  }
+
+  Future<bool> _removeAdapter(String adapter, List<String> logs, {Duration? waitTimeout}) async {
+    var success = true;
+
+    final disable = await _runNetsh(
+      ['interface', 'set', 'interface', 'name="$adapter"', 'admin=disabled'],
+      logs,
+    );
+    if (disable?.exitCode != 0) success = false;
+
+    final delete = await _runNetsh(
+      ['interface', 'ipv4', 'delete', 'interface', 'name="$adapter"'],
+      logs,
+    );
+    if (delete?.exitCode != 0) success = false;
+
+    await _releaseAdapterAddresses(adapter, logs);
+
+    final remove = await _runPowerShell(
+      "Import-Module NetAdapter -ErrorAction SilentlyContinue; Remove-NetAdapter -Name '${_escapePs(adapter)}' -Confirm:\$false -Force",
+      logs,
+    );
+    if (remove?.exitCode != 0) success = false;
+
+    final waitResult = await _waitForAdapterRemoval(adapter, logs, timeout: waitTimeout);
+    if (!waitResult) success = false;
+
+    return success;
+  }
+
+  Future<void> _releaseAdapterAddresses(String adapter, List<String> logs) async {
+    final command =
+        "Import-Module NetTCPIP -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias '${_escapePs(adapter)}' -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:\$false";
+    final result = await _runPowerShell(command, logs);
+    if (result != null && result.exitCode == 0) {
+      logs.add('Cleared IP addresses on $adapter');
+    }
   }
 
   Future<bool> _isElevated() async {
@@ -201,6 +269,14 @@ class WindowsTunGuard {
   String _buildFallbackName() {
     final suffix = _random.nextInt(0xFFFF).toRadixString(16).padLeft(4, '0');
     return 'tun-in-$suffix';
+  }
+
+  List<String> _buildRandomAddresses() {
+    final thirdOctet = 16 + _random.nextInt(200); // 16..215 avoids clashes with default
+    final block = _random.nextInt(64) * 4; // /30 block start within 0..252
+    final host = block + 1;
+    final ip = '172.25.$thirdOctet.$host/30';
+    return [ip];
   }
 
   String _cleanOutput(Object? value) {
