@@ -1,6 +1,7 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:device_apps/device_apps.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -84,22 +85,39 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   final TrayManager _trayManager = TrayManager.instance;
   bool _trayInitialized = false;
   bool _isExitingApp = false;
+  bool _androidAppsLoaded = false;
+  bool _androidAppsLoading = false;
+  String? _androidAppLoadError;
+  List<Application> _androidInstalledApps = const <Application>[];
+  Map<String, String> _androidAppLabels = {};
   static const String _splitConfigPrefsKey = 'split_tunnel_state_v2';
   static const String _legacySplitConfigKey = 'split_tunnel_config_v1';
   static const String _trayShowKey = 'show';
   static const String _trayExitKey = 'exit';
+  static const String _noPresetValue = '__none__';
 
     VlessLink? get _parsed => _singBoxController.parsedLink;
   File? get _configFile => _singBoxController.configFile;
   String? get _generatedConfig => _singBoxController.generatedConfig;
-    bool get _isDesktopPlatform => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-    bool get _hasActivePreset =>
+  bool get _isDesktopPlatform => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+  bool get _hasActivePreset =>
       _activePresetName != null && _splitPresets.any((preset) => preset.name == _activePresetName);
-    String get _activePresetLabel => _activePresetName == null
-      ? 'Произвольный'
-      : _presetDirty
-        ? '${_activePresetName!}*'
-        : _activePresetName!;
+  String get _activePresetLabel {
+    if (_activePresetName == null) return 'Не выбрано';
+    return _presetDirty ? '${_activePresetName!}*' : _activePresetName!;
+  }
+
+  void _showFastSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      ),
+    );
+  }
 
   @override
   void initState() {
@@ -111,6 +129,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
     }
+    if (Platform.isAndroid) {
+      unawaited(_loadAndroidApps());
+    }
   }
 
   Future<void> _checkWintun() async {
@@ -118,6 +139,119 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     if (!available && mounted) {
       setState(() => _status = 'Предупреждение: wintun.dll не найден');
     }
+  }
+
+  Future<void> _loadAndroidApps({bool force = false}) async {
+    if (!Platform.isAndroid) return;
+    if (_androidAppsLoading) return;
+    if (_androidAppsLoaded && !force) return;
+    if (!mounted) return;
+    setState(() {
+      _androidAppsLoading = true;
+      if (force) {
+        _androidAppLoadError = null;
+      }
+    });
+    try {
+      final apps = await DeviceApps.getInstalledApplications(
+        includeAppIcons: false,
+        includeSystemApps: false,
+        onlyAppsWithLaunchIntent: true,
+      );
+      apps.sort((a, b) => a.appName.toLowerCase().compareTo(b.appName.toLowerCase()));
+      if (!mounted) return;
+      setState(() {
+        _androidInstalledApps = apps;
+        _androidAppLabels = {for (final app in apps) app.packageName: app.appName};
+        _androidAppsLoaded = true;
+        _androidAppsLoading = false;
+        _androidAppLoadError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _androidAppsLoading = false;
+        _androidAppLoadError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _showAndroidAppPicker() async {
+    if (!Platform.isAndroid) return;
+    if (!_androidAppsLoaded && !_androidAppsLoading) {
+      await _loadAndroidApps();
+    }
+    if (!mounted) return;
+    final apps = _androidInstalledApps;
+    if (apps.isEmpty) {
+      _showFastSnack('Список приложений пуст. Обновите список и попробуйте снова.');
+      return;
+    }
+    final package = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (ctx) => _AndroidAppPickerSheet(apps: apps),
+    );
+    if (package == null || package.isEmpty) return;
+    _addApplication('package:$package');
+  }
+
+  Widget _buildAndroidAppActions(ThemeData theme) {
+    final canPick = _androidAppsLoaded || !_androidAppsLoading;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          children: [
+            TextButton.icon(
+              onPressed: canPick ? _showAndroidAppPicker : null,
+              icon: const Icon(Icons.apps_outlined),
+              label: const Text('Выбрать приложение из списка'),
+            ),
+            TextButton.icon(
+              onPressed: _androidAppsLoading ? null : () => _loadAndroidApps(force: true),
+              icon: const Icon(Icons.refresh_outlined),
+              label: const Text('Обновить список'),
+            ),
+            if (_androidAppsLoading)
+              const Padding(
+                padding: EdgeInsets.only(left: 4),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        if (_androidAppLoadError != null)
+          Text(
+            'Не удалось загрузить приложения: $_androidAppLoadError',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.error),
+          )
+        else
+          Text(
+            'Список приложений готов. Можно добавить из списка или ввести package name вручную.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+      ],
+    );
+  }
+
+  String _describeApplicationEntry(String value) {
+    if (value.startsWith('package:')) {
+      final package = value.substring('package:'.length);
+      final name = _androidAppLabels[package];
+      if (name != null && name.isNotEmpty) {
+        return '$name ($package)';
+      }
+      return package;
+    }
+    return value;
   }
 
   bool get _isRunning => _singBoxController.isRunning;
@@ -305,11 +439,17 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   void _changeSplitMode(String mode) {
     final normalized = _normalizeSplitMode(mode);
     if (_splitMode == normalized) return;
-    _splitConfigs.putIfAbsent(normalized, () => SplitTunnelConfig(mode: normalized));
+    final current = _activeSplitConfig;
+    final hadPreset = _hasActivePreset;
+    _splitConfigs[normalized] = current.copyWith(mode: normalized);
     setState(() {
       _splitMode = normalized;
-      _activePresetName = null;
-      _presetDirty = false;
+      if (hadPreset) {
+        _presetDirty = true;
+      } else {
+        _activePresetName = null;
+        _presetDirty = false;
+      }
     });
     unawaited(_persistSplitState());
   }
@@ -419,11 +559,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       _presetDirty = false;
     });
     unawaited(_persistSplitState());
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Пресет "${preset.name}" сохранён')),
-      );
-    }
+    _showFastSnack('Пресет "${preset.name}" сохранен');
   }
 
   void _overwriteActivePreset() {
@@ -441,14 +577,10 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       _presetDirty = false;
     });
     unawaited(_persistSplitState());
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Пресет "${preset.name}" обновлён')),
-      );
-    }
+    _showFastSnack('Пресет "${preset.name}" перезаписан');
   }
 
-  void _applyPreset(SplitTunnelPreset preset) {
+  void _applyPreset(SplitTunnelPreset preset, {bool silent = false}) {
     final targetMode = _normalizeSplitMode(preset.mode);
     setState(() {
       _splitConfigs[targetMode] = SplitTunnelConfig(
@@ -461,10 +593,26 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       _presetDirty = false;
     });
     unawaited(_persistSplitState());
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Применён пресет "${preset.name}"')), 
-      );
+    if (!silent) {
+      _showFastSnack('Пресет "${preset.name}" применен');
+    }
+  }
+
+  void _handlePresetSelection(String value) {
+    if (value == _noPresetValue) {
+      setState(() {
+        _activePresetName = null;
+        _presetDirty = false;
+        _splitConfigs[_splitMode] = SplitTunnelConfig(mode: _splitMode);
+      });
+      unawaited(_persistSplitState());
+      return;
+    }
+    for (final preset in _splitPresets) {
+      if (preset.name == value) {
+        _applyPreset(preset, silent: true);
+        return;
+      }
     }
   }
 
@@ -473,7 +621,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Удалить пресет?'),
-            content: Text('Пресет "${preset.name}" будет удалён безвозвратно.'),
+            content: Text('Пресет "${preset.name}" будет удален без возможности восстановления.'),
             actions: [
               TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Отмена')),
               FilledButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Удалить')),
@@ -490,11 +638,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       }
     });
     unawaited(_persistSplitState());
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Пресет "${preset.name}" удалён')),
-      );
-    }
+    _showFastSnack('Пресет "${preset.name}" удален');
   }
 
   String _defaultPresetName() => _ensureUniquePresetName('Пресет ${_splitPresets.length + 1}');
@@ -548,21 +692,30 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Новый профиль VLESS'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: nameController,
-                  decoration: const InputDecoration(labelText: 'Название профиля'),
+            content: SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 480),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(labelText: 'Название профиля'),
+                      textInputAction: TextInputAction.next,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: uriController,
+                      decoration: const InputDecoration(labelText: 'VLESS URI'),
+                      minLines: 3,
+                      maxLines: 8,
+                      keyboardType: TextInputType.multiline,
+                      autofillHints: const [AutofillHints.url],
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: uriController,
-                  decoration: const InputDecoration(labelText: 'VLESS URI'),
-                  minLines: 1,
-                  maxLines: 3,
-                ),
-              ],
+              ),
             ),
             actions: [
               TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Отмена')),
@@ -577,8 +730,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
 
     final name = nameController.text;
     final uri = uriController.text;
-    nameController.dispose();
-    uriController.dispose();
 
     if (!shouldSave || uri.trim().isEmpty) return;
     await _addProfile(name, uri);
@@ -591,21 +742,30 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Редактировать профиль'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: nameController,
-                  decoration: const InputDecoration(labelText: 'Название профиля'),
+            content: SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 480),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: nameController,
+                      decoration: const InputDecoration(labelText: 'Название профиля'),
+                      textInputAction: TextInputAction.next,
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: uriController,
+                      decoration: const InputDecoration(labelText: 'VLESS URI'),
+                      minLines: 3,
+                      maxLines: 8,
+                      keyboardType: TextInputType.multiline,
+                      autofillHints: const [AutofillHints.url],
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: uriController,
-                  decoration: const InputDecoration(labelText: 'VLESS URI'),
-                  minLines: 1,
-                  maxLines: 3,
-                ),
-              ],
+              ),
             ),
             actions: [
               TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Отмена')),
@@ -617,8 +777,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
 
     final newNameRaw = nameController.text.trim();
     final newUri = uriController.text.trim();
-    nameController.dispose();
-    uriController.dispose();
 
     if (!shouldSave || newUri.isEmpty) return;
 
@@ -745,9 +903,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   Future<void> _copyStatusToClipboard() async {
     await Clipboard.setData(ClipboardData(text: _status));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Состояние скопировано')),
-    );
+    _showFastSnack('Состояние скопировано');
   }
 
   void _showConfigDialog(BuildContext context) {
@@ -843,6 +999,8 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
             child: ListView(
               padding: const EdgeInsets.all(20),
               children: [
+                _buildPresetPicker(context),
+                const SizedBox(height: 16),
                 Card(
                   color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.25),
                   elevation: 0,
@@ -858,12 +1016,17 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                             const Text('Split Tunneling', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                           ],
                         ),
-                        const SizedBox(height: 16),
+                        const SizedBox(height: 10),
+                        Text(
+                          'Выберите режим, по которому будет распределяться трафик.',
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).hintColor),
+                        ),
+                        const SizedBox(height: 14),
                         SegmentedButton<String>(
                           segments: const [
                             ButtonSegment(value: 'all', label: Text('Весь трафик')),
-                            ButtonSegment(value: 'whitelist', label: Text('Только список')),
-                            ButtonSegment(value: 'blacklist', label: Text('Кроме списка')),
+                            ButtonSegment(value: 'whitelist', label: Text('Белый список')),
+                            ButtonSegment(value: 'blacklist', label: Text('Черный список')),
                           ],
                           style: SegmentedButton.styleFrom(
                             padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 18),
@@ -882,13 +1045,13 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                   context: context,
                   title: 'Домены и IP',
                   description: isWide
-                      ? 'Например: vk.com, youtube.com, 8.8.8.8, 1.1.1.0/24'
+                      ? 'Примеры: vk.com, youtube.com, 8.8.8.8, 1.1.1.0/24'
                       : 'vk.com · 8.8.8.8 · 1.1.1.0/24',
                   icon: Icons.language_outlined,
                   items: _activeSplitConfig.domains,
-                  emptyPlaceholder: 'Добавьте домен, IP или CIDR, чтобы направить трафик по выбранному правилу.',
+                  emptyPlaceholder: 'Добавьте домены, IP или подсети, чтобы направить их в нужном режиме.',
                   onAdd: () => _promptAddEntry(
-                    title: 'Добавить домен/IP',
+                    title: 'Добавить домен или IP',
                     hint: 'vk.com или 8.8.8.8/32',
                     onSubmit: _addDomainEntry,
                   ),
@@ -898,25 +1061,224 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 _buildEntrySection(
                   context: context,
                   title: 'Приложения',
-                  description: 'Укажите путь к .exe, чтобы приоритизировать трафик приложения.',
+                  description: Platform.isAndroid
+                      ? 'Выберите приложение или введите package name вручную.'
+                      : 'Укажите путь к .exe, чтобы исключить или направить его через VPN.',
                   icon: Icons.apps_outlined,
                   items: _activeSplitConfig.applications,
-                  emptyPlaceholder: 'Например: C:/Program Files/Telegram/Telegram.exe',
+                  emptyPlaceholder: Platform.isAndroid
+                      ? 'Пример: package:com.telegram.messenger'
+                      : 'Пример: C:/Program Files/Telegram/Telegram.exe',
                   onAdd: () => _promptAddEntry(
                     title: 'Добавить приложение',
-                    hint: 'C:/Program Files/App/app.exe',
+                    hint: Platform.isAndroid ? 'com.example.app' : 'C:/Program Files/App/app.exe',
                     onSubmit: _addApplication,
                   ),
                   onRemove: _removeApplication,
+                  extraContent: Platform.isAndroid ? _buildAndroidAppActions(Theme.of(context)) : null,
+                  labelBuilder: Platform.isAndroid ? _describeApplicationEntry : null,
                 ),
-                const SizedBox(height: 16),
-                _buildPresetManagerCard(context),
-                const SizedBox(height: 40),
+                const SizedBox(height: 12),
+                _buildPresetActionsBar(context),
+                const SizedBox(height: 32),
               ],
             ),
           ),
         );
       },
+    );
+  }
+
+  Widget _buildPresetPicker(BuildContext context) {
+    final theme = Theme.of(context);
+    final presets = _splitPresets;
+    final selectedValue = _hasActivePreset ? _activePresetName! : _noPresetValue;
+
+    Widget buildTile({
+      required String title,
+      required String subtitle,
+      required bool selected,
+      IconData icon = Icons.bookmark_border,
+    }) {
+      return Row(
+        children: [
+          Icon(icon, size: 18, color: selected ? theme.colorScheme.primary : theme.colorScheme.onSurfaceVariant),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: selected ? theme.colorScheme.primary : theme.colorScheme.onSurface,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  subtitle,
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+                ),
+              ],
+            ),
+          ),
+          if (selected) Icon(Icons.check, size: 18, color: theme.colorScheme.primary),
+        ],
+      );
+    }
+
+    return Center(
+      child: PopupMenuButton<String>(
+        initialValue: selectedValue,
+        onSelected: _handlePresetSelection,
+        offset: const Offset(0, 10),
+        position: PopupMenuPosition.under,
+        constraints: const BoxConstraints(minWidth: 280),
+        color: theme.colorScheme.surfaceContainerHighest,
+        itemBuilder: (ctx) {
+          final items = <PopupMenuEntry<String>>[
+            PopupMenuItem(
+              value: _noPresetValue,
+              child: buildTile(
+                title: 'Не выбрано',
+                subtitle: 'Настроить и сохранить свой пресет',
+                selected: selectedValue == _noPresetValue,
+                icon: Icons.remove_circle_outline,
+              ),
+            ),
+          ];
+          if (presets.isNotEmpty) {
+            items.add(const PopupMenuDivider());
+            for (final preset in presets) {
+              items.add(
+                PopupMenuItem(
+                  value: preset.name,
+                  child: buildTile(
+                    title: preset.name,
+                    subtitle:
+                        '${_describeSplitMode(preset.mode)} · домены: ${preset.domains.length}, приложения: ${preset.applications.length}',
+                    selected: selectedValue == preset.name,
+                    icon: Icons.bookmark_outline,
+                  ),
+                ),
+              );
+            }
+          } else {
+            items.add(
+              const PopupMenuItem(
+                enabled: false,
+                child: Text('Сохраненных пресетов пока нет'),
+              ),
+            );
+          }
+          return items;
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 14),
+          decoration: BoxDecoration(
+            color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.4),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: theme.colorScheme.primary.withOpacity(0.2)),
+            boxShadow: [
+              BoxShadow(
+                color: theme.colorScheme.primary.withOpacity(0.12),
+                blurRadius: 20,
+                offset: const Offset(0, 10),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Активный пресет', style: theme.textTheme.labelSmall?.copyWith(color: theme.hintColor)),
+              const SizedBox(height: 6),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.bookmarks_outlined, color: theme.colorScheme.primary),
+                  const SizedBox(width: 8),
+                  Text(
+                    _activePresetLabel,
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(Icons.keyboard_arrow_down, color: theme.colorScheme.onSurfaceVariant),
+                ],
+              ),
+              if (_presetDirty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    'Есть несохраненные изменения',
+                    style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPresetActionsBar(BuildContext context) {
+    final theme = Theme.of(context);
+    SplitTunnelPreset? activePreset;
+    if (_activePresetName != null) {
+      for (final preset in _splitPresets) {
+        if (preset.name == _activePresetName) {
+          activePreset = preset;
+          break;
+        }
+      }
+    }
+
+    final buttons = <Widget>[];
+    if (activePreset != null) {
+      buttons.add(
+        FilledButton.icon(
+          onPressed: _presetDirty ? _overwriteActivePreset : null,
+          icon: const Icon(Icons.save_outlined),
+          label: const Text('Перезаписать пресет'),
+        ),
+      );
+      buttons.add(
+        OutlinedButton.icon(
+          onPressed: () => _confirmDeletePreset(activePreset!),
+          icon: const Icon(Icons.delete_outline),
+          label: const Text('Удалить пресет'),
+        ),
+      );
+    } else {
+      buttons.add(
+        FilledButton.icon(
+          onPressed: _promptSavePreset,
+          icon: const Icon(Icons.bookmark_add_outlined),
+          label: const Text('Сохранить пресет'),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Column(
+        children: [
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 12,
+            runSpacing: 10,
+            children: buttons,
+          ),
+          if (_presetDirty && activePreset != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                'Настройки отличаются от сохраненного пресета',
+                style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -932,8 +1294,8 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
         ? (_configFile != null ? _configFile!.path : 'Конфиг ещё не сгенерирован')
         : (_generatedConfig != null ? 'Передан в сервис' : 'Конфиг ещё не сгенерирован');
     final screenWidth = MediaQuery.of(context).size.width;
-    final compactWidth = (screenWidth - 60).clamp(220.0, 600.0);
-    final pillMaxWidth = isWide ? 320.0 : compactWidth;
+    final compactWidth = (screenWidth - 60).clamp(200.0, 320.0);
+    final pillMaxWidth = isWide ? 240.0 : compactWidth;
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1116,16 +1478,14 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 runSpacing: 12,
                 children: [
                   FilledButton.icon(
-                    onPressed: canConnect ? _start : null,
-                    icon: const Icon(Icons.power_settings_new),
-                    label: const Text('Подключить'),
-                    style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 14)),
-                  ),
-                  OutlinedButton.icon(
-                    onPressed: isRunning ? _stop : null,
-                    icon: const Icon(Icons.stop_circle_outlined),
-                    label: const Text('Отключить'),
-                    style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14)),
+                    onPressed: hasProfiles ? (_isRunning ? _stop : _start) : null,
+                    icon: Icon(_isRunning ? Icons.stop_circle_outlined : Icons.power_settings_new),
+                    label: Text(_isRunning ? 'Отключить' : 'Подключить'),
+                    style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 14),
+                      backgroundColor: _isRunning ? theme.colorScheme.error : theme.colorScheme.primary,
+                      foregroundColor: Colors.white,
+                    ),
                   ),
                   TextButton.icon(
                     onPressed: _generatedConfig != null ? () => _showConfigDialog(context) : null,
@@ -1147,7 +1507,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                   if (_parsed != null)
                     _buildInfoPill(context, Icons.language, 'Server', '${_parsed!.host}:${_parsed!.port}'),
                   if (_configFile != null)
-                    _buildInfoPill(context, Icons.folder_outlined, 'Config Path', _configFile!.path, maxWidth: 320),
+                    _buildInfoPill(context, Icons.folder_outlined, 'Config Path', _configFile!.path, maxWidth: 240),
                 ],
               ),
             ],
@@ -1158,7 +1518,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   }
 
   Widget _buildLogPanel(BuildContext context) {
-    final logText = _logLines.isEmpty ? 'Логи появятся после запуска подключения.' : _logLines.join('\n');
+    final logText = _logLines.isEmpty ? 'Логи появляются после запуска подключения.' : _logLines.join('\n');
     return Card(
       color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.25),
       elevation: 0,
@@ -1224,6 +1584,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     required String emptyPlaceholder,
     required Future<void> Function() onAdd,
     required void Function(String value) onRemove,
+    Widget? extraContent,
+    Widget? footer,
+    String Function(String value)? labelBuilder,
   }) {
     final theme = Theme.of(context);
     return Card(
@@ -1262,6 +1625,10 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
               ],
             ),
             const SizedBox(height: 16),
+            if (extraContent != null) ...[
+              extraContent,
+              const SizedBox(height: 16),
+            ],
             if (items.isEmpty)
               Container(
                 width: double.infinity,
@@ -1277,125 +1644,19 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 spacing: 10,
                 runSpacing: 10,
                 children: items.map((value) {
+                  final label = labelBuilder?.call(value) ?? value;
                   return InputChip(
-                    label: Text(value),
+                    label: Text(label),
                     onDeleted: () => onRemove(value),
                     backgroundColor: theme.colorScheme.surfaceContainerHighest.withOpacity(0.35),
                     labelStyle: theme.textTheme.bodyMedium,
                   );
                 }).toList(),
               ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPresetManagerCard(BuildContext context) {
-    final theme = Theme.of(context);
-    final presets = _splitPresets;
-    Widget body;
-    if (presets.isEmpty) {
-      body = Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 14),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.3),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Text(
-          'Пока нет сохранённых пресетов. Сохраните текущий режим, чтобы быстро переключаться между наборами.',
-          style: theme.textTheme.bodySmall,
-        ),
-      );
-    } else {
-      final children = <Widget>[];
-      for (var i = 0; i < presets.length; i++) {
-        final preset = presets[i];
-        children.add(
-          ListTile(
-            contentPadding: EdgeInsets.zero,
-            title: Text(preset.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-            subtitle: Text(
-              '${_describeSplitMode(preset.mode)} | Домены: ${preset.domains.length} | Приложения: ${preset.applications.length}',
-            ),
-            trailing: Wrap(
-              spacing: 8,
-              children: [
-                TextButton(
-                  onPressed: () => _applyPreset(preset),
-                  child: const Text('Применить'),
-                ),
-                IconButton(
-                  tooltip: 'Удалить',
-                  onPressed: () => _confirmDeletePreset(preset),
-                  icon: const Icon(Icons.delete_outline),
-                ),
-              ],
-            ),
-          ),
-        );
-        if (i != presets.length - 1) {
-          children.add(Divider(color: theme.colorScheme.onSurface.withOpacity(0.08)));
-        }
-      }
-      body = Column(children: children);
-    }
-
-    return Card(
-      color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
-      elevation: 0,
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                CircleAvatar(
-                  radius: 18,
-                  backgroundColor: theme.colorScheme.primary.withOpacity(0.15),
-                  child: Icon(Icons.bookmarks_outlined, color: theme.colorScheme.primary),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      const Text('Пресеты split tunneling', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
-                      const SizedBox(height: 4),
-                      Text(
-                        'Сохраняйте разные наборы доменов и приложений и переключайтесь между режимами в один клик.',
-                        style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Wrap(
-                  spacing: 8,
-                  children: [
-                    OutlinedButton.icon(
-                      onPressed: _promptSavePreset,
-                      icon: const Icon(Icons.bookmark_add_outlined),
-                      label: const Text('Сохранить пресет'),
-                    ),
-                    TextButton.icon(
-                      onPressed: _hasActivePreset ? _overwriteActivePreset : null,
-                      icon: const Icon(Icons.save_outlined),
-                      label: Text(_presetDirty ? 'Обновить пресет' : 'Перезаписать пресет'),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Text('Активный режим: ${_describeSplitMode()}', style: theme.textTheme.bodySmall),
-            const SizedBox(height: 4),
-            Text('Активный пресет: $_activePresetLabel', style: theme.textTheme.bodySmall),
-            const SizedBox(height: 16),
-            body,
+            if (footer != null) ...[
+              const SizedBox(height: 12),
+              footer,
+            ],
           ],
         ),
       ),
@@ -1434,8 +1695,16 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   }
 
   void _addApplication(String value) {
-    final normalized = _normalizeEntry(value);
+    var normalized = _normalizeEntry(value);
     if (normalized.isEmpty) return;
+    if (Platform.isAndroid) {
+      const prefix = 'package:';
+      if (normalized.startsWith(prefix)) {
+        normalized = '$prefix${normalized.substring(prefix.length).trim()}';
+      } else {
+        normalized = '$prefix$normalized';
+      }
+    }
     final current = _activeSplitConfig;
     final apps = [...current.applications];
     if (apps.contains(normalized)) return;
@@ -1465,9 +1734,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   Widget _buildInfoPill(BuildContext context, IconData icon, String title, String value, {double? maxWidth}) {
     final theme = Theme.of(context);
     return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: maxWidth ?? 260),
+      constraints: BoxConstraints(maxWidth: maxWidth ?? 220),
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 14),
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
         decoration: BoxDecoration(
           color: theme.colorScheme.primary.withOpacity(0.1),
           borderRadius: BorderRadius.circular(16),
@@ -1502,9 +1771,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final mode = value ?? _splitMode;
     switch (mode) {
       case 'whitelist':
-        return 'Только список';
+        return 'Белый список';
       case 'blacklist':
-        return 'Кроме списка';
+        return 'Черный список';
       default:
         return 'Весь трафик';
     }
@@ -1613,3 +1882,84 @@ class _PresetNameDialogState extends State<_PresetNameDialog> {
     );
   }
 }
+
+class _AndroidAppPickerSheet extends StatefulWidget {
+  const _AndroidAppPickerSheet({required this.apps});
+
+  final List<Application> apps;
+
+  @override
+  State<_AndroidAppPickerSheet> createState() => _AndroidAppPickerSheetState();
+}
+
+class _AndroidAppPickerSheetState extends State<_AndroidAppPickerSheet> {
+  String _query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final normalizedQuery = _query.trim().toLowerCase();
+    final filtered = normalizedQuery.isEmpty
+        ? widget.apps
+        : widget.apps.where((app) {
+            final name = app.appName.toLowerCase();
+            final package = app.packageName.toLowerCase();
+            return name.contains(normalizedQuery) || package.contains(normalizedQuery);
+          }).toList();
+
+    final height = MediaQuery.of(context).size.height * 0.7;
+    return SafeArea(
+      child: SizedBox(
+        height: height,
+        child: Column(
+          children: [
+            const ListTile(
+              title: Text('Выберите приложение'),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: TextField(
+                autofocus: true,
+                decoration: const InputDecoration(
+                  labelText: 'Поиск по названию или пакету',
+                  prefixIcon: Icon(Icons.search),
+                ),
+                onChanged: (value) => setState(() => _query = value),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: filtered.isEmpty
+                  ? const Center(child: Text('Совпадений не найдено'))
+                  : ListView.builder(
+                      itemCount: filtered.length,
+                      itemBuilder: (context, index) {
+                        final app = filtered[index];
+                        return ListTile(
+                          leading: const Icon(Icons.apps_outlined),
+                          title: Text(app.appName),
+                          subtitle: Text(app.packageName),
+                          onTap: () => Navigator.of(context).pop(app.packageName),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+

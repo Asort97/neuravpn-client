@@ -19,10 +19,12 @@ class MainActivity : FlutterActivity() {
 				METHOD_PREPARE -> handlePrepareVpn(result)
 				METHOD_START -> {
 					val config = call.argument<String>(ARG_CONFIG)
+					val includePackages = call.argument<List<String>>(ARG_INCLUDE_PACKAGES)
+					val excludePackages = call.argument<List<String>>(ARG_EXCLUDE_PACKAGES)
 					if (config.isNullOrBlank()) {
 						result.error("INVALID_CONFIG", "Config payload required", null)
 					} else {
-						LibboxVpnService.start(applicationContext, config)
+						LibboxVpnService.start(applicationContext, config, includePackages, excludePackages)
 						result.success(null)
 					}
 				}
@@ -68,6 +70,8 @@ class MainActivity : FlutterActivity() {
 		private const val METHOD_STOP = "stopVpn"
 		private const val METHOD_STATUS = "getVpnStatus"
 		private const val ARG_CONFIG = "config"
+		private const val ARG_INCLUDE_PACKAGES = "includePackages"
+		private const val ARG_EXCLUDE_PACKAGES = "excludePackages"
 		private const val REQUEST_PREPARE_VPN = 1001
 	}
 }

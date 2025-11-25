@@ -38,6 +38,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.security.KeyStore
+import java.util.ArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -51,6 +52,8 @@ class LibboxVpnService : VpnService(), PlatformInterface {
     private var tunDescriptor: ParcelFileDescriptor? = null
     private var interfaceListener: InterfaceUpdateListener? = null
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
+    private var manualIncludePackages: List<String> = emptyList()
+    private var manualExcludePackages: List<String> = emptyList()
 
     override fun onCreate() {
         super.onCreate()
@@ -70,6 +73,9 @@ class LibboxVpnService : VpnService(), PlatformInterface {
             Log.w(TAG, "Missing config payload – ignoring start request")
             return START_NOT_STICKY
         }
+
+        manualIncludePackages = intent.getStringArrayListExtra(EXTRA_INCLUDE_PACKAGES) ?: emptyList()
+        manualExcludePackages = intent.getStringArrayListExtra(EXTRA_EXCLUDE_PACKAGES) ?: emptyList()
 
         startForeground(NOTIFICATION_ID, buildNotification(getStatusLabel()))
         executor.execute { startLibbox(config) }
@@ -114,6 +120,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
             stopForeground(true)
         }
         runningState.set(false)
+        stopSelf()
     }
 
     // region PlatformInterface implementation
@@ -414,14 +421,19 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         val configured = runCatching { options.dnsServerAddress }.getOrNull()
         val configuredValue = configured?.value?.takeIf { it.isNotBlank() }
         var addedAny = false
+        val isVirtualTunDns = configuredValue?.startsWith(TUN_SUBNET_PREFIX) == true
 
-        if (configuredValue != null) {
+        if (configuredValue != null && !isVirtualTunDns) {
             runCatching { builder.addDnsServer(configuredValue) }
                 .onSuccess { addedAny = true }
                 .onFailure { Log.w(TAG, "Unable to apply DNS server $configuredValue", it) }
         }
 
-        val needsFallback = !addedAny || configuredValue?.let { it.startsWith(TUN_SUBNET_PREFIX) } == true
+        if (!addedAny && isVirtualTunDns) {
+            Log.d(TAG, "Ignoring virtual DNS $configuredValue, using fallback servers")
+        }
+
+        val needsFallback = !addedAny
         if (!needsFallback || !options.autoRoute) return
 
         for (server in FALLBACK_DNS) {
@@ -435,20 +447,26 @@ class LibboxVpnService : VpnService(), PlatformInterface {
     }
 
     private fun applyPackageRules(builder: Builder, options: TunOptions) {
-        val includePackages = collectIterator(options.includePackage)
-        val excludePackages = collectIterator(options.excludePackage)
+        val includePackages = collectIterator(options.includePackage).toMutableSet()
+        val excludePackages = collectIterator(options.excludePackage).toMutableSet()
+
+        includePackages.addAll(manualIncludePackages)
+        excludePackages.addAll(manualExcludePackages)
 
         includePackages.forEach { pkg ->
             runCatching { builder.addAllowedApplication(pkg) }
                 .onFailure { Log.w(TAG, "Failed to allow package $pkg", it) }
         }
 
-        excludePackages.forEach { pkg ->
-            runCatching { builder.addDisallowedApplication(pkg) }
-                .onFailure { Log.w(TAG, "Failed to disallow package $pkg", it) }
+        if (includePackages.isEmpty()) {
+            excludePackages.forEach { pkg ->
+                runCatching { builder.addDisallowedApplication(pkg) }
+                    .onFailure { Log.w(TAG, "Failed to disallow package $pkg", it) }
+            }
         }
 
-        if (includePackages.isEmpty() && !excludePackages.contains(packageName)) {
+        val shouldExcludeSelf = includePackages.isEmpty() && !excludePackages.contains(packageName)
+        if (shouldExcludeSelf) {
             runCatching { builder.addDisallowedApplication(packageName) }
                 .onFailure { Log.w(TAG, "Unable to exclude self from VPN", it) }
         }
@@ -532,12 +550,25 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         const val ACTION_STOP = "com.example.happycat_vpnclient.vpn.ACTION_STOP"
         const val EXTRA_CONFIG = "com.example.happycat_vpnclient.vpn.EXTRA_CONFIG"
         const val EXTRA_DEEPLINK = "com.example.happycat_vpnclient.vpn.EXTRA_DEEPLINK"
+        const val EXTRA_INCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_INCLUDE_PACKAGES"
+        const val EXTRA_EXCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_EXCLUDE_PACKAGES"
 
         fun isRunning(): Boolean = runningState.get()
 
-        fun start(context: Context, config: String) {
+        fun start(
+            context: Context,
+            config: String,
+            includePackages: List<String>?,
+            excludePackages: List<String>?,
+        ) {
             val intent = Intent(context, LibboxVpnService::class.java).apply {
                 putExtra(EXTRA_CONFIG, config)
+                if (!includePackages.isNullOrEmpty()) {
+                    putStringArrayListExtra(EXTRA_INCLUDE_PACKAGES, ArrayList(includePackages))
+                }
+                if (!excludePackages.isNullOrEmpty()) {
+                    putStringArrayListExtra(EXTRA_EXCLUDE_PACKAGES, ArrayList(excludePackages))
+                }
             }
             ContextCompat.startForegroundService(context, intent)
         }

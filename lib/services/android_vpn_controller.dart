@@ -15,9 +15,17 @@ class AndroidVpnController {
     return granted ?? false;
   }
 
-  Future<void> startVpn(String config) async {
+  Future<void> startVpn(
+    String config, {
+    List<String>? includePackages,
+    List<String>? excludePackages,
+  }) async {
     if (!isSupported) return;
-    await _channel.invokeMethod('startVpn', {'config': config});
+    await _channel.invokeMethod('startVpn', {
+      'config': config,
+      if (includePackages != null && includePackages.isNotEmpty) 'includePackages': includePackages,
+      if (excludePackages != null && excludePackages.isNotEmpty) 'excludePackages': excludePackages,
+    });
   }
 
   Future<void> stopVpn() async {

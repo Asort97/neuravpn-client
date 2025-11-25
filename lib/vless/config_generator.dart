@@ -13,6 +13,8 @@ String generateSingBoxConfig(
   List<String>? addresses,
   String tunStack = 'system',
   bool enableApplicationRules = false,
+  bool hasAndroidPackageRules = false,
+  bool autoDetectInterface = true,
 }) {
   final p = link.params;
   final transportType = p['type']; // например ws, tcp, grpc, h2
@@ -126,8 +128,8 @@ String generateSingBoxConfig(
       {'type': 'direct', 'tag': 'direct'},
     ],
     'route': {
-      'auto_detect_interface': true,
-      'final': _getDefaultOutbound(splitConfig, vpnTag),
+      'auto_detect_interface': autoDetectInterface,
+      'final': _getDefaultOutbound(splitConfig, vpnTag, hasAndroidPackageRules: hasAndroidPackageRules),
       'rules': [
         ..._buildRouteRules(splitConfig, vpnTag),
         ...appRules,
@@ -137,8 +139,18 @@ String generateSingBoxConfig(
   return const JsonEncoder.withIndent('  ').convert(config);
 }
 
-String _getDefaultOutbound(SplitTunnelConfig config, String vpnTag) {
-  if (config.mode == 'whitelist') return 'direct'; // По умолчанию direct, VPN только для списка
+String _getDefaultOutbound(
+  SplitTunnelConfig config,
+  String vpnTag, {
+  required bool hasAndroidPackageRules,
+}) {
+  if (config.mode == 'whitelist') {
+    final hasDomainRules = config.domains.isNotEmpty;
+    if (!hasDomainRules && hasAndroidPackageRules) {
+      return vpnTag;
+    }
+    return 'direct';
+  }
   return vpnTag; // all или blacklist — по умолчанию через VPN
 }
 
@@ -177,19 +189,38 @@ List<Map<String, dynamic>> _buildApplicationRules(SplitTunnelConfig config, Stri
   final cleaned = config.applications
       .map((path) => path.trim())
       .where((path) => path.isNotEmpty)
+      .map(_parseApplicationRule)
+      .whereType<_ApplicationRule>()
       .toList();
   if (cleaned.isEmpty) return const <Map<String, dynamic>>[];
 
   final outbound = config.mode == 'whitelist' ? vpnTag : 'direct';
   return cleaned
-      .map((entry) {
-        final key = _looksLikePath(entry) ? 'process_path' : 'process_name';
-        return {
-          key: entry,
-          'outbound': outbound,
-        };
-      })
+      .map((rule) => {
+            rule.key: rule.value,
+            'outbound': outbound,
+          })
       .toList();
+}
+
+class _ApplicationRule {
+  const _ApplicationRule(this.key, this.value);
+
+  final String key;
+  final String value;
+}
+
+_ApplicationRule? _parseApplicationRule(String entry) {
+  if (entry.isEmpty) return null;
+  if (entry.startsWith('package:')) {
+    final pkg = entry.substring('package:'.length).trim();
+    if (pkg.isEmpty) return null;
+    return _ApplicationRule('package_name', pkg);
+  }
+
+  final normalized = entry.trim();
+  final key = _looksLikePath(normalized) ? 'process_path' : 'process_name';
+  return _ApplicationRule(key, normalized);
 }
 
 bool _looksLikePath(String value) {

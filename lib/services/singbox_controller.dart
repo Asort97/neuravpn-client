@@ -136,6 +136,8 @@ class SingBoxController {
       _activeInterfaceName = null;
     }
 
+    final androidPackages = Platform.isAndroid ? _extractAndroidPackages(splitConfig) : <String>[];
+
     _notifyStatus('Генерация конфига');
     final jsonConfig = generateSingBoxConfig(
       parsed,
@@ -145,6 +147,8 @@ class SingBoxController {
       addresses: interfaceAddresses,
       tunStack: Platform.isAndroid ? 'gvisor' : 'system',
       enableApplicationRules: Platform.isWindows,
+      hasAndroidPackageRules: Platform.isAndroid && androidPackages.isNotEmpty,
+      autoDetectInterface: !Platform.isAndroid,
     );
     _generatedConfig = jsonConfig;
     _configFile = null;
@@ -156,8 +160,15 @@ class SingBoxController {
         return SingBoxStartResult.failure('Разрешение отклонено пользователем');
       }
 
+      final includePackages = splitConfig.mode == 'whitelist' ? androidPackages : <String>[];
+      final excludePackages = splitConfig.mode == 'blacklist' ? androidPackages : <String>[];
+
       _notifyStatus('Запуск Libbox сервиса');
-      await _androidController.startVpn(jsonConfig);
+      await _androidController.startVpn(
+        jsonConfig,
+        includePackages: includePackages.isEmpty ? null : includePackages,
+        excludePackages: excludePackages.isEmpty ? null : excludePackages,
+      );
       _androidConnected = true;
       _notifyStatus('Libbox сервис запущен');
       return SingBoxStartResult.success();
@@ -305,5 +316,19 @@ class SingBoxController {
 
   void _notifyStatus(String value) {
     _statusSink?.call(value);
+  }
+
+  List<String> _extractAndroidPackages(SplitTunnelConfig config) {
+    final packages = <String>{};
+    for (final entry in config.applications) {
+      var value = entry.trim();
+      if (value.isEmpty) continue;
+      if (value.startsWith('package:')) {
+        value = value.substring('package:'.length).trim();
+      }
+      if (value.isEmpty) continue;
+      packages.add(value);
+    }
+    return packages.toList();
   }
 }
