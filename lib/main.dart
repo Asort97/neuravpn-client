@@ -1,6 +1,7 @@
 ﻿import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:device_apps/device_apps.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -68,13 +69,12 @@ class VlessHomePage extends StatefulWidget {
 class _VlessHomePageState extends State<VlessHomePage> with TrayListener, WindowListener {
   final TextEditingController _controller = TextEditingController();
   String _status = 'Idle';
-  final List<String> _logLines = [];
   final Map<String, SplitTunnelConfig> _splitConfigs = {
     'all': SplitTunnelConfig(mode: 'all'),
     'whitelist': SplitTunnelConfig(mode: 'whitelist'),
     'blacklist': SplitTunnelConfig(mode: 'blacklist'),
   };
-  String _splitMode = 'all';
+  String _splitMode = 'whitelist';
   List<SplitTunnelPreset> _splitPresets = [];
   String? _activePresetName;
   bool _presetDirty = false;
@@ -95,30 +95,36 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   static const String _trayShowKey = 'show';
   static const String _trayExitKey = 'exit';
   static const String _noPresetValue = '__none__';
+  static const String _splitToggleKey = 'split_tunnel_enabled';
+  int? _pingMs;
+  bool _pingInProgress = false;
+  double? _lastSpeedMbps;
+  bool _speedInProgress = false;
+  bool _splitEnabled = true;
+  final Map<String, int> _profilePings = {};
+  final Map<String, double> _profileSpeeds = {};
+  final List<String> _logLines = <String>[];
+  int _profileNameCounter = 0;
+  static const String _profileMetricsKey = 'vpn_profile_metrics';
+  static const String _profileCounterKey = 'vpn_profile_counter';
 
-    VlessLink? get _parsed => _singBoxController.parsedLink;
+  VlessLink? get _parsed => _singBoxController.parsedLink;
   File? get _configFile => _singBoxController.configFile;
   String? get _generatedConfig => _singBoxController.generatedConfig;
   bool get _isDesktopPlatform => Platform.isWindows || Platform.isLinux || Platform.isMacOS;
-  bool get _hasActivePreset =>
-      _activePresetName != null && _splitPresets.any((preset) => preset.name == _activePresetName);
+  bool get _hasActivePreset => _activePresetName != null && _splitPresets.any((preset) => preset.name == _activePresetName);
   String get _activePresetLabel {
-    if (_activePresetName == null) return 'Не выбрано';
+    if (_activePresetName == null) {
+      return _presetDirty ? 'Custom *' : 'Custom';
+    }
     return _presetDirty ? '${_activePresetName!}*' : _activePresetName!;
   }
-
-  void _showFastSnack(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 3),
-        behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      ),
-    );
-  }
-
+  String get _speedLabel =>
+      _speedInProgress ? 'Measuring...' : (_lastSpeedMbps != null ? '${_lastSpeedMbps!.toStringAsFixed(1)} Mbps' : '--');
+  String get _pingLabel => _pingInProgress ? 'Measuring...' : (_pingMs != null ? '$_pingMs ms' : '--');
+  String get _selectedProfileLabel => _selectedProfile?.name ?? 'Choose server';
+  SplitTunnelConfig get _activeSplitConfig => _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
+  SplitTunnelConfig get _effectiveSplitConfig => _splitEnabled ? _activeSplitConfig : SplitTunnelConfig(mode: 'all');
   @override
   void initState() {
     super.initState();
@@ -254,6 +260,16 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     return value;
   }
 
+  void _showFastSnack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
   bool get _isRunning => _singBoxController.isRunning;
 
   String get _interfaceLabel => _singBoxController.interfaceLabel;
@@ -262,6 +278,33 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final prefs = await SharedPreferences.getInstance();
     final savedProfiles = prefs.getString('vpn_profiles');
     var profiles = VpnProfile.listFromJsonString(savedProfiles);
+    final storedCounter = prefs.getInt(_profileCounterKey) ?? 0;
+    final metricsRaw = prefs.getString(_profileMetricsKey);
+    final restoredPings = <String, int>{};
+    final restoredSpeeds = <String, double>{};
+    bool splitEnabled = prefs.getBool(_splitToggleKey) ?? true;
+
+    if (metricsRaw != null && metricsRaw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(metricsRaw);
+        if (decoded is Map<String, dynamic>) {
+          decoded.forEach((key, value) {
+            if (value is Map) {
+              final ping = value['ping'];
+              final speed = value['speed'];
+              if (ping is int) {
+                restoredPings[key] = ping;
+              }
+              if (speed is num) {
+                restoredSpeeds[key] = speed.toDouble();
+              }
+            }
+          });
+        }
+      } catch (_) {
+        // ignore invalid metrics payload
+      }
+    }
 
     if (profiles.isEmpty) {
       final legacyUri = prefs.getString('vless_uri');
@@ -307,6 +350,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
             if (presetName is String && presetName.isNotEmpty) {
               restoredPresetName = presetName;
             }
+            if (decoded['enabled'] is bool) {
+              splitEnabled = decoded['enabled'] as bool;
+            }
 
             if (decoded['presets'] is List) {
               restoredPresets = (decoded['presets'] as List)
@@ -332,7 +378,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     if (!mounted) return;
     setState(() {
       _profiles = profiles;
+      _profileNameCounter = math.max(storedCounter, _findMaxProfileIndex(profiles));
       _selectedProfile = selected;
+      _syncMetricsFromProfile(selected);
       if (restoredMap != null) {
         for (final entry in _splitConfigs.keys.toList()) {
           final restored = restoredMap[entry];
@@ -351,6 +399,13 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       } else {
         _presetDirty = false;
       }
+      _splitEnabled = splitEnabled;
+      _profilePings
+        ..clear()
+        ..addAll(restoredPings);
+      _profileSpeeds
+        ..clear()
+        ..addAll(restoredSpeeds);
     });
 
     if (selected != null) {
@@ -370,7 +425,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       case 'blacklist':
         return 'blacklist';
       default:
-        return 'all';
+        return 'whitelist';
     }
   }
 
@@ -390,9 +445,10 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final prefs = await SharedPreferences.getInstance();
     if (_profiles.isEmpty) {
       await prefs.remove('vpn_profiles');
-      return;
+    } else {
+      await prefs.setString('vpn_profiles', VpnProfile.listToJsonString(_profiles));
     }
-    await prefs.setString('vpn_profiles', VpnProfile.listToJsonString(_profiles));
+    await prefs.setInt(_profileCounterKey, _profileNameCounter);
   }
 
   Future<void> _persistSelectedProfile() async {
@@ -404,12 +460,26 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     }
   }
 
+  Future<void> _persistProfileMetrics() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (_profilePings.isEmpty && _profileSpeeds.isEmpty) {
+      await prefs.remove(_profileMetricsKey);
+      return;
+    }
+    final payload = <String, Map<String, dynamic>>{};
+    for (final entry in _profilePings.entries) {
+      payload.putIfAbsent(entry.key, () => <String, dynamic>{})['ping'] = entry.value;
+    }
+    for (final entry in _profileSpeeds.entries) {
+      payload.putIfAbsent(entry.key, () => <String, dynamic>{})['speed'] = entry.value;
+    }
+    await prefs.setString(_profileMetricsKey, jsonEncode(payload));
+  }
+
   Future<void> _saveUri() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('vless_uri', _controller.text.trim());
   }
-
-  SplitTunnelConfig get _activeSplitConfig => _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
 
   Future<void> _persistSplitState() async {
     final prefs = await SharedPreferences.getInstance();
@@ -419,9 +489,11 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       'configs': configsPayload,
       'presets': _splitPresets.map((preset) => preset.toJson()).toList(),
       'activePreset': _activePresetName,
+      'enabled': _splitEnabled,
     });
     await prefs.setString(_splitConfigPrefsKey, payload);
     await prefs.remove(_legacySplitConfigKey);
+    await prefs.setBool(_splitToggleKey, _splitEnabled);
   }
 
   void _updateActiveSplitConfig(SplitTunnelConfig config) {
@@ -454,6 +526,108 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     unawaited(_persistSplitState());
   }
 
+  Future<void> _setSplitEnabled(bool enabled) async {
+    if (_splitEnabled == enabled) return;
+    setState(() => _splitEnabled = enabled);
+    await _persistSplitState();
+  }
+
+  VlessLink? _currentLink() {
+    if (_parsed != null) return _parsed;
+    return parseVlessUri(_controller.text);
+  }
+
+  Future<int?> _measurePing(String host, int port) async {
+    const attempts = 4;
+    final results = <int>[];
+    for (var i = 0; i < attempts; i++) {
+      final sw = Stopwatch()..start();
+      try {
+        final socket = await Socket.connect(host, port, timeout: const Duration(seconds: 3));
+        results.add(sw.elapsedMilliseconds);
+        socket.destroy();
+      } catch (_) {
+        // ignore attempt errors
+      }
+    }
+    if (results.isEmpty) return null;
+    final avg = results.reduce((a, b) => a + b) / results.length;
+    return avg.round();
+  }
+
+  Future<double?> _measureSpeedSample() async {
+    const sampleBytes = 2 * 1024 * 1024; // 2 MB sample to avoid throttling the connection
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+    final sw = Stopwatch()..start();
+    var received = 0;
+    try {
+      final request = await client.getUrl(Uri.parse('https://speed.cloudflare.com/__down?bytes=$sampleBytes'));
+      final response = await request.close();
+      await for (final chunk in response) {
+        received += chunk.length;
+        if (received >= sampleBytes) {
+          break;
+        }
+      }
+    } catch (_) {
+      return null;
+    } finally {
+      sw.stop();
+      client.close(force: true);
+    }
+    if (received == 0 || sw.elapsedMilliseconds == 0) return null;
+    final seconds = sw.elapsedMilliseconds / 1000;
+    final mbps = (received * 8) / (seconds * 1000 * 1000);
+    return double.parse(mbps.toStringAsFixed(2));
+  }
+
+  Future<void> _refreshMetrics({bool silent = false}) async {
+    if (_pingInProgress || _speedInProgress) return;
+    final link = _currentLink();
+    if (link == null) {
+      if (!silent) {
+        _showFastSnack('Select a profile with a valid VLESS URI first.');
+      }
+      return;
+    }
+    setState(() {
+      _pingInProgress = true;
+      _speedInProgress = true;
+    });
+
+    final ping = await _measurePing(link.host, link.port);
+    final speed = await _measureSpeedSample();
+
+    if (!mounted) return;
+    setState(() {
+      _pingMs = ping;
+      _lastSpeedMbps = speed;
+      _pingInProgress = false;
+      _speedInProgress = false;
+      final profileName = _selectedProfile?.name;
+      if (profileName != null) {
+        if (ping != null) {
+          _profilePings[profileName] = ping;
+        }
+        if (speed != null) {
+          _profileSpeeds[profileName] = speed;
+        }
+      }
+    });
+    await _persistProfileMetrics();
+    if (!silent && (ping != null || speed != null)) {
+      _showFastSnack('Ping/Speed обновлены');
+    }
+  }
+  void _syncMetricsFromProfile(VpnProfile? profile) {
+    if (profile == null) {
+      _pingMs = null;
+      _lastSpeedMbps = null;
+      return;
+    }
+    _pingMs = _profilePings[profile.name];
+    _lastSpeedMbps = _profileSpeeds[profile.name];
+  }
   Future<void> _initDesktopShell() async {
     if (!_isDesktopPlatform) return;
     await windowManager.setPreventClose(true);
@@ -603,7 +777,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
       setState(() {
         _activePresetName = null;
         _presetDirty = false;
-        _splitConfigs[_splitMode] = SplitTunnelConfig(mode: _splitMode);
       });
       unawaited(_persistSplitState());
       return;
@@ -655,16 +828,60 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     }
   }
 
+  Future<void> _showPresetPickerSheet() async {
+    final selection = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 10),
+              child: Text('Split Tunneling Presets', style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.tune),
+              title: const Text('Custom (current rules)'),
+              subtitle: const Text('�������� ��࠭�� ��訣� ���⮢ ���⪨'),
+              onTap: () => Navigator.of(ctx).pop(_noPresetValue),
+            ),
+            const Divider(height: 1),
+            if (_splitPresets.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 14),
+                child: Text('���࠭����� ���⮢ ���� ���'),
+              )
+            else
+              ..._splitPresets.map(
+                (preset) => ListTile(
+                  leading: const Icon(Icons.bookmark_outline),
+                  title: Text(preset.name),
+                  subtitle: Text(
+                    '${_describeSplitMode(preset.mode)} · ������: ${preset.domains.length}, �ਫ������: ${preset.applications.length}',
+                  ),
+                  onTap: () => Navigator.of(ctx).pop(preset.name),
+                ),
+              ),
+            const SizedBox(height: 10),
+          ],
+        ),
+      ),
+    );
+    if (selection == null) return;
+    _handlePresetSelection(selection);
+  }
+
   Future<void> _addProfile(String name, String uri) async {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
-    final baseName = name.trim().isEmpty ? 'Profile ${_profiles.length + 1}' : name.trim();
-    final uniqueName = _ensureUniqueProfileName(baseName);
+    final uniqueName = _allocateProfileName(name);
     final profile = VpnProfile(name: uniqueName, uri: trimmedUri);
 
     setState(() {
       _profiles = [..._profiles, profile];
       _selectedProfile = profile;
+      _syncMetricsFromProfile(profile);
     });
     _controller.text = trimmedUri;
     await _persistProfiles();
@@ -675,17 +892,21 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final updated = _profiles.where((profile) => profile.name != name).toList();
     setState(() {
       _profiles = updated;
+      _profilePings.remove(name);
+      _profileSpeeds.remove(name);
       if (_selectedProfile?.name == name) {
         _selectedProfile = updated.isNotEmpty ? updated.first : null;
         _controller.text = _selectedProfile?.uri ?? '';
       }
+      _syncMetricsFromProfile(_selectedProfile);
     });
     await _persistProfiles();
     await _persistSelectedProfile();
+    await _persistProfileMetrics();
   }
 
   Future<void> _showProfileDialog() async {
-    final defaultName = _ensureUniqueProfileName('Profile ${_profiles.length + 1}');
+    final defaultName = _previewProfileName();
     final nameController = TextEditingController(text: defaultName);
     final uriController = TextEditingController(text: _controller.text.trim());
     final shouldSave = await showDialog<bool>(
@@ -786,6 +1007,9 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     }
 
     final updated = VpnProfile(name: finalName, uri: newUri);
+    final previousName = profile.name;
+    final previousPing = _profilePings.remove(previousName);
+    final previousSpeed = _profileSpeeds.remove(previousName);
 
     setState(() {
       _profiles = _profiles.map((p) => p.name == profile.name ? updated : p).toList();
@@ -793,9 +1017,17 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
         _selectedProfile = updated;
         _controller.text = newUri;
       }
+      if (previousPing != null) {
+        _profilePings[updated.name] = previousPing;
+      }
+      if (previousSpeed != null) {
+        _profileSpeeds[updated.name] = previousSpeed;
+      }
+      _syncMetricsFromProfile(_selectedProfile);
     });
     await _persistProfiles();
     await _persistSelectedProfile();
+    await _persistProfileMetrics();
   }
 
   String _ensureUniqueProfileName(String base, {String? skipName}) {
@@ -819,9 +1051,43 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     }
   }
 
+  int _findMaxProfileIndex(List<VpnProfile> profiles) {
+    final regex = RegExp(r'^Profile\s+(\d+)$');
+    var maxValue = 0;
+    for (final profile in profiles) {
+      final match = regex.firstMatch(profile.name);
+      if (match != null) {
+        final value = int.tryParse(match.group(1) ?? '');
+        if (value != null) {
+          maxValue = math.max(maxValue, value);
+        }
+      }
+    }
+    return maxValue;
+  }
+
+  String _allocateProfileName(String rawName) {
+    final trimmed = rawName.trim();
+    if (trimmed.isNotEmpty) {
+      return _ensureUniqueProfileName(trimmed);
+    }
+    _profileNameCounter = math.max(_profileNameCounter, _findMaxProfileIndex(_profiles));
+    _profileNameCounter += 1;
+    final generated = 'Profile $_profileNameCounter';
+    return _ensureUniqueProfileName(generated);
+  }
+
+  String _previewProfileName() {
+    final nextIndex = math.max(_profileNameCounter, _findMaxProfileIndex(_profiles)) + 1;
+    return _ensureUniqueProfileName('Profile $nextIndex');
+  }
+
   Future<void> _selectProfile(String? name) async {
     if (name == null) {
-      setState(() => _selectedProfile = null);
+      setState(() {
+        _selectedProfile = null;
+        _syncMetricsFromProfile(null);
+      });
       await _persistSelectedProfile();
       return;
     }
@@ -837,6 +1103,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     setState(() {
       _selectedProfile = selected;
       _controller.text = selected.uri;
+      _syncMetricsFromProfile(selected);
     });
     await _persistSelectedProfile();
   }
@@ -854,7 +1121,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
 
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
-      splitConfig: _activeSplitConfig,
+      splitConfig: _effectiveSplitConfig,
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = value);
@@ -871,6 +1138,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     await _saveUri();
     if (!mounted) return;
     setState(() {});
+    unawaited(_refreshMetrics(silent: true));
   }
 
   Future<void> _stop() async {
@@ -992,6 +1260,7 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     return LayoutBuilder(
       builder: (context, constraints) {
         final isWide = constraints.maxWidth >= 900;
+        final theme = Theme.of(context);
         return Align(
           alignment: Alignment.topCenter,
           child: ConstrainedBox(
@@ -999,6 +1268,19 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
             child: ListView(
               padding: const EdgeInsets.all(20),
               children: [
+                if (!_splitEnabled)
+                  Card(
+                    color: theme.colorScheme.errorContainer.withOpacity(0.2),
+                    elevation: 0,
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(
+                        'Split tunneling is disabled on the main screen. Enable the toggle to apply these rules.',
+                        style: theme.textTheme.bodyMedium,
+                      ),
+                    ),
+                  ),
+                if (!_splitEnabled) const SizedBox(height: 12),
                 _buildPresetPicker(context),
                 const SizedBox(height: 16),
                 Card(
@@ -1024,7 +1306,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                         const SizedBox(height: 14),
                         SegmentedButton<String>(
                           segments: const [
-                            ButtonSegment(value: 'all', label: Text('Весь трафик')),
                             ButtonSegment(value: 'whitelist', label: Text('Белый список')),
                             ButtonSegment(value: 'blacklist', label: Text('Черный список')),
                           ],
@@ -1296,6 +1577,10 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final screenWidth = MediaQuery.of(context).size.width;
     final compactWidth = (screenWidth - 60).clamp(200.0, 320.0);
     final pillMaxWidth = isWide ? 240.0 : compactWidth;
+    final canRefreshMetrics = _selectedProfile != null && !_pingInProgress && !_speedInProgress;
+    final presetLabel = !_splitEnabled
+        ? 'Split tunneling off'
+        : (_hasActivePreset ? _activePresetLabel : (_presetDirty ? 'Custom *' : 'Custom'));
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1304,6 +1589,12 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
           spacing: 10,
           runSpacing: 8,
           children: [
+            OutlinedButton.icon(
+              onPressed: canRefreshMetrics ? () => _refreshMetrics() : null,
+              icon: Icon(_pingInProgress || _speedInProgress ? Icons.timelapse : Icons.refresh_outlined),
+              label: Text(_pingInProgress || _speedInProgress ? 'Measuring...' : 'Refresh Ping/Speed'),
+              style: OutlinedButton.styleFrom(foregroundColor: Colors.white),
+            ),
             OutlinedButton.icon(
               onPressed: _copyStatusToClipboard,
               icon: const Icon(Icons.copy_all_outlined),
@@ -1375,9 +1666,43 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 spacing: 16,
                 runSpacing: 8,
                 children: [
-                  _buildInfoPill(context, Icons.account_circle, 'Профиль', _selectedProfile?.name ?? 'Ручной ввод', maxWidth: pillMaxWidth),
-                  _buildInfoPill(context, Icons.cloud_outlined, 'Интерфейс', _interfaceLabel, maxWidth: pillMaxWidth),
+                  _buildInfoPill(context, Icons.account_circle, 'Profile', _selectedProfileLabel, maxWidth: pillMaxWidth),
+                  _buildInfoPill(context, Icons.speed_outlined, 'Ping', _pingLabel, maxWidth: pillMaxWidth),
+                  _buildInfoPill(context, Icons.network_check, 'Speed', _speedLabel, maxWidth: pillMaxWidth),
+                  _buildInfoPill(context, Icons.call_split, 'Split', _splitEnabled ? 'Enabled' : 'Disabled', maxWidth: pillMaxWidth),
+                  if (_splitEnabled)
+                    _buildInfoPill(
+                      context,
+                      Icons.bookmarks_outlined,
+                      'Preset',
+                      presetLabel,
+                      maxWidth: pillMaxWidth,
+                      onTap: _showPresetPickerSheet,
+                    ),
+                  _buildInfoPill(context, Icons.cloud_outlined, 'Interface', _interfaceLabel, maxWidth: pillMaxWidth),
                   _buildInfoPill(context, Icons.folder_outlined, 'Config Path', configLabel, maxWidth: pillMaxWidth),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: const [
+                        Text('Split tunneling', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                        SizedBox(height: 4),
+                        Text(
+                          'Toggle to allow all traffic or use split rules',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch.adaptive(
+                    value: _splitEnabled,
+                    onChanged: (value) => _setSplitEnabled(value),
+                  ),
                 ],
               ),
             ],
@@ -1390,8 +1715,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
   Widget _buildProfileCard(BuildContext context) {
     final theme = Theme.of(context);
     final hasProfiles = _profiles.isNotEmpty;
-    final isRunning = _isRunning;
-    final canConnect = hasProfiles && !isRunning;
 
     return Card(
       color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
@@ -1440,35 +1763,83 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                       ),
                     )
                     .toList(),
-                onChanged: (value) {
+                onChanged: _isRunning ? null : (value) {
                   _selectProfile(value);
                 },
               ),
               const SizedBox(height: 16),
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
+              Column(
                 children: _profiles.map((profile) {
                   final isSelected = _selectedProfile?.name == profile.name;
-                  final chip = FilterChip(
-                    label: Text(profile.name),
-                    selected: isSelected,
-                    onSelected: (_) => _selectProfile(profile.name),
-                    onDeleted: () => _removeProfileByName(profile.name),
-                    backgroundColor: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
-                    selectedColor: theme.colorScheme.primary.withOpacity(0.25),
-                  );
-                  return Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      chip,
-                      const SizedBox(width: 4),
-                      IconButton(
-                        tooltip: 'Редактировать профиль',
-                        icon: const Icon(Icons.edit_outlined, size: 18),
-                        onPressed: () => _showEditProfileDialog(profile),
+                  final ping = _profilePings[profile.name];
+                  final speed = _profileSpeeds[profile.name];
+                  final metricsParts = <String>[];
+                  if (ping != null) metricsParts.add('Ping: $ping ms');
+                  if (speed != null) metricsParts.add('Speed: ${speed.toStringAsFixed(1)} Mbps');
+                  final metricsLabel = metricsParts.isEmpty ? 'No measurements yet' : metricsParts.join(' | ');
+                  return Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(14),
+                      color: isSelected
+                          ? theme.colorScheme.primary.withOpacity(0.12)
+                          : theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+                      border: Border.all(
+                        color: isSelected
+                            ? theme.colorScheme.primary
+                            : theme.colorScheme.outlineVariant.withOpacity(0.4),
                       ),
-                    ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                profile.name,
+                                style: const TextStyle(fontWeight: FontWeight.w700),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            IconButton(
+                              tooltip: 'Edit profile',
+                              icon: const Icon(Icons.edit_outlined, size: 18),
+                              onPressed: () => _showEditProfileDialog(profile),
+                            ),
+                            IconButton(
+                              tooltip: 'Delete profile',
+                              icon: const Icon(Icons.delete_outline, size: 18),
+                              onPressed: () => _removeProfileByName(profile.name),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Text(metricsLabel, style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor)),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            FilledButton.tonal(
+                              onPressed: _isRunning ? null : () => _selectProfile(profile.name),
+                              style: FilledButton.styleFrom(
+                                backgroundColor: isSelected ? theme.colorScheme.primary : null,
+                                foregroundColor: isSelected ? Colors.white : null,
+                              ),
+                              child: const Text('Select'),
+                            ),
+                            if (isSelected)
+                              Padding(
+                                padding: const EdgeInsets.only(left: 8),
+                                child: Text(
+                                  _isRunning ? 'Connected' : 'Selected',
+                                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
                   );
                 }).toList(),
               ),
@@ -1501,8 +1872,8 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 spacing: 16,
                 runSpacing: 12,
                 children: [
-                  _buildInfoPill(context, Icons.route, 'Split Mode', _describeSplitMode()),
-                  _buildInfoPill(context, Icons.bookmark_outline, 'Split Preset', _activePresetLabel),
+                  _buildInfoPill(context, Icons.route, 'Split Mode', _splitEnabled ? _describeSplitMode() : 'Disabled'),
+                  _buildInfoPill(context, Icons.bookmark_outline, 'Split Preset', _splitEnabled ? _activePresetLabel : 'N/A'),
                   _buildInfoPill(context, Icons.history, 'Log lines', _logLines.length.toString()),
                   if (_parsed != null)
                     _buildInfoPill(context, Icons.language, 'Server', '${_parsed!.host}:${_parsed!.port}'),
@@ -1731,39 +2102,50 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     return sanitized;
   }
 
-  Widget _buildInfoPill(BuildContext context, IconData icon, String title, String value, {double? maxWidth}) {
+  Widget _buildInfoPill(BuildContext context, IconData icon, String title, String value, {double? maxWidth, VoidCallback? onTap}) {
     final theme = Theme.of(context);
+    final radius = BorderRadius.circular(16);
+    final content = Container(
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primary.withOpacity(0.1),
+        borderRadius: radius,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: theme.colorScheme.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          )
+        ],
+      ),
+    );
     return ConstrainedBox(
       constraints: BoxConstraints(maxWidth: maxWidth ?? 220),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-        decoration: BoxDecoration(
-          color: theme.colorScheme.primary.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(icon, size: 18, color: theme.colorScheme.primary),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-                  const SizedBox(height: 2),
-                  Text(
-                    value,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
-                  ),
-                ],
+      child: onTap == null
+          ? content
+          : Material(
+              color: Colors.transparent,
+              child: InkWell(
+                borderRadius: radius,
+                onTap: onTap,
+                child: content,
               ),
-            )
-          ],
-        ),
-      ),
+            ),
     );
   }
 
@@ -1949,6 +2331,23 @@ class _AndroidAppPickerSheetState extends State<_AndroidAppPickerSheet> {
     );
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
