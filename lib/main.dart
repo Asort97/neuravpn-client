@@ -1236,16 +1236,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
             child: ListView(
               padding: const EdgeInsets.all(20),
               children: [
-                SwitchListTile(
-                  title: const Text('Smart Routing'),
-                  subtitle: const Text('Automatically bypass Russian websites to increase speed and stability.'),
-                  value: _smartRouting,
-                  onChanged: (value) {
-                    setState(() => _smartRouting = value);
-                    unawaited(_persistSplitState());
-                  },
-                ),
-                const SizedBox(height: 8),
                 if (!_splitEnabled)
                   Card(
                     color: theme.colorScheme.errorContainer.withOpacity(0.2),
@@ -1556,9 +1546,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final compactWidth = (screenWidth - 60).clamp(200.0, 320.0);
     final pillMaxWidth = isWide ? 240.0 : compactWidth;
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
-    final presetLabel = !_splitEnabled
-        ? 'Split tunneling off'
-        : (_hasActivePreset ? _activePresetLabel : (_presetDirty ? 'Custom *' : 'Custom'));
 
     return LayoutBuilder(
       builder: (context, constraints) {
@@ -1670,42 +1657,6 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 ],
               ),
               const SizedBox(height: 14),
-              Row(
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: const [
-                        Text('Split tunneling', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-                        SizedBox(height: 4),
-                        Text(
-                          'Toggle to allow all traffic or use split rules',
-                          style: TextStyle(color: Colors.white70),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Switch.adaptive(
-                    value: _splitEnabled,
-                    onChanged: (value) => _setSplitEnabled(value),
-                  ),
-                ],
-              ),
-              if (_splitEnabled) ...[
-                const SizedBox(height: 10),
-                DropdownButtonFormField<String>(
-                  value: _hasActivePreset ? _activePresetName : _noPresetValue,
-                  decoration: const InputDecoration(labelText: 'Split preset'),
-                  items: [
-                    DropdownMenuItem(value: _noPresetValue, child: Text(_presetDirty ? 'Custom *' : 'Custom')),
-                    ..._splitPresets.map((p) => DropdownMenuItem(value: p.name, child: Text(p.name))).toList(),
-                  ],
-                  onChanged: (value) {
-                    if (value == null) return;
-                    _handlePresetSelection(value);
-                  },
-                ),
-              ],
             ],
           ),
         );
@@ -1717,11 +1668,11 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
     final theme = Theme.of(context);
     final hasProfiles = _profiles.isNotEmpty;
 
-    return Card(
+    final profileCard = Card(
       color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
       elevation: 0,
       child: Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(16),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -1734,17 +1685,15 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                 ),
                 IconButton(
                   tooltip: 'Добавить профиль',
-                  onPressed: () {
-                    _showProfileDialog();
-                  },
+                  onPressed: _showProfileDialog,
                   icon: const Icon(Icons.add_circle_outline),
                 ),
               ],
             ),
-            const SizedBox(height: 18),
+            const SizedBox(height: 16),
             if (!hasProfiles) ...[
               Text(
-                'Подключение выполняется через сохранённые профили. Добавьте свой первый VLESS ключ через плюс.',
+                'Подключение выполняется через выбранный профиль. Создайте новый VLESS профиль для старта.',
                 style: theme.textTheme.bodyMedium,
               ),
               const SizedBox(height: 12),
@@ -1764,42 +1713,75 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                       ),
                     )
                     .toList(),
-                onChanged: _isRunning ? null : (value) {
-                  _selectProfile(value);
-                },
+                onChanged: _isRunning ? null : (value) => _selectProfile(value),
               ),
               const SizedBox(height: 16),
-              Column(
-                children: _profiles.map((profile) {
-                  final isSelected = _selectedProfile?.name == profile.name;
-                  final ping = _profilePings[profile.name];
-                  final metricsParts = <String>[];
-                  if (ping != null) metricsParts.add('Ping: $ping ms');
-                  final metricsLabel = metricsParts.isEmpty ? 'No measurements yet' : metricsParts.join(' | ');
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(14),
-                      color: isSelected
-                          ? theme.colorScheme.primary.withOpacity(0.12)
-                          : theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
-                      border: Border.all(
-                        color: isSelected
-                            ? theme.colorScheme.primary
-                            : theme.colorScheme.outlineVariant.withOpacity(0.4),
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
+              SizedBox(
+                height: 260,
+                child: Scrollbar(
+                  thumbVisibility: true,
+                  child: ListView.builder(
+                    itemCount: _profiles.length,
+                    itemBuilder: (context, index) {
+                      final profile = _profiles[index];
+                      final isSelected = _selectedProfile?.name == profile.name;
+                      final ping = _profilePings[profile.name];
+                      final pingLabel = ping != null ? 'Ping: $ping ms' : 'No ping';
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(12),
+                          color: isSelected
+                              ? theme.colorScheme.primary.withOpacity(0.12)
+                              : theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+                          border: Border.all(
+                            color: isSelected
+                                ? theme.colorScheme.primary
+                                : theme.colorScheme.outlineVariant.withOpacity(0.4),
+                          ),
+                        ),
+                        child: Row(
                           children: [
                             Expanded(
-                              child: Text(
-                                profile.name,
-                                style: const TextStyle(fontWeight: FontWeight.w700),
-                                overflow: TextOverflow.ellipsis,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          profile.name,
+                                          style: const TextStyle(fontWeight: FontWeight.w700),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      Text(pingLabel, style: theme.textTheme.bodySmall),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Row(
+                                    children: [
+                                      FilledButton.tonal(
+                                        onPressed: _isRunning ? null : () => _selectProfile(profile.name),
+                                        style: FilledButton.styleFrom(
+                                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                                          backgroundColor: isSelected ? theme.colorScheme.primary : null,
+                                          foregroundColor: isSelected ? Colors.white : null,
+                                        ),
+                                        child: const Text('Select'),
+                                      ),
+                                      if (isSelected)
+                                        Padding(
+                                          padding: const EdgeInsets.only(left: 8),
+                                          child: Text(
+                                            _isRunning ? 'Connected' : 'Selected',
+                                            style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary),
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ],
                               ),
                             ),
                             IconButton(
@@ -1814,35 +1796,12 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                             ),
                           ],
                         ),
-                        const SizedBox(height: 6),
-                        Text(metricsLabel, style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor)),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            FilledButton.tonal(
-                              onPressed: _isRunning ? null : () => _selectProfile(profile.name),
-                              style: FilledButton.styleFrom(
-                                backgroundColor: isSelected ? theme.colorScheme.primary : null,
-                                foregroundColor: isSelected ? Colors.white : null,
-                              ),
-                              child: const Text('Select'),
-                            ),
-                            if (isSelected)
-                              Padding(
-                                padding: const EdgeInsets.only(left: 8),
-                                child: Text(
-                                  _isRunning ? 'Connected' : 'Selected',
-                                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.primary),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  );
-                }).toList(),
+                      );
+                    },
+                  ),
+                ),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
               Wrap(
                 spacing: 12,
                 runSpacing: 12,
@@ -1854,27 +1813,111 @@ class _VlessHomePageState extends State<VlessHomePage> with TrayListener, Window
                   ),
                 ],
               ),
-              const SizedBox(height: 20),
-              Divider(color: theme.colorScheme.onSurface.withOpacity(0.08)),
-              const SizedBox(height: 16),
-              Wrap(
-                spacing: 16,
-                runSpacing: 12,
-                children: [
-                  _buildInfoPill(context, Icons.history, 'Log lines', _logLines.length.toString()),
-                  if (_parsed != null)
-                    _buildInfoPill(context, Icons.language, 'Server', '${_parsed!.host}:${_parsed!.port}'),
-                  if (_developerMode && _configFile != null)
-                    _buildInfoPill(context, Icons.folder_outlined, 'Config Path', _configFile!.path, maxWidth: 240),
-                ],
-              ),
             ],
           ],
         ),
       ),
     );
-  }
 
+    Widget splitCard = Card(
+      color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+      elevation: 0,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.call_split, color: theme.colorScheme.primary),
+                const SizedBox(width: 8),
+                const Text('Разделенный трафик', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: const [
+                      Text('Split tunneling', style: TextStyle(fontWeight: FontWeight.w600)),
+                      SizedBox(height: 4),
+                      Text('Включите, чтобы применять правила разделения трафика.'),
+                    ],
+                  ),
+                ),
+                Switch.adaptive(
+                  value: _splitEnabled,
+                  onChanged: (value) => _setSplitEnabled(value),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_splitEnabled) ...[
+              DropdownButtonFormField<String>(
+                value: _hasActivePreset ? _activePresetName : _noPresetValue,
+                decoration: const InputDecoration(labelText: 'Split preset'),
+                items: [
+                  DropdownMenuItem(value: _noPresetValue, child: Text(_presetDirty ? 'Custom *' : 'Custom')),
+                  ..._splitPresets.map((p) => DropdownMenuItem(value: p.name, child: Text(p.name))),
+                ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  _handlePresetSelection(value);
+                },
+              ),
+              const SizedBox(height: 12),
+            ],
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: const [
+                      Text('Smart Routing', style: TextStyle(fontWeight: FontWeight.w600)),
+                      SizedBox(height: 4),
+                      Text('Automatically bypass Russian websites to increase speed and stability.'),
+                    ],
+                  ),
+                ),
+                Switch.adaptive(
+                  value: _smartRouting,
+                  onChanged: (value) {
+                    setState(() => _smartRouting = value);
+                    unawaited(_persistSplitState());
+                  },
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        profileCard,
+        const SizedBox(height: 16),
+        splitCard,
+        const SizedBox(height: 20),
+        Divider(color: theme.colorScheme.onSurface.withOpacity(0.08)),
+        const SizedBox(height: 16),
+        Wrap(
+          spacing: 16,
+          runSpacing: 12,
+          children: [
+            _buildInfoPill(context, Icons.history, 'Log lines', _logLines.length.toString()),
+            if (_parsed != null)
+              _buildInfoPill(context, Icons.language, 'Server', '${_parsed!.host}:${_parsed!.port}'),
+            if (_developerMode && _configFile != null)
+              _buildInfoPill(context, Icons.folder_outlined, 'Config Path', _configFile!.path, maxWidth: 240),
+          ],
+        ),
+      ],
+    );
+  }
   Widget _buildLogPanel(BuildContext context) {
     final logText = _logLines.isEmpty ? 'Логи появляются после запуска подключения.' : _logLines.join('\n');
     return Card(
