@@ -111,7 +111,7 @@ Copy-Item README.md $packageName/
 # Создание архива
 Compress-Archive -Path $packageName -DestinationPath "${packageName}.zip"
 ```
-
+ывап
 ## Требования к системе
 
 ### Минимальные
