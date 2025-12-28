@@ -16,6 +16,7 @@ class ProfileListView extends StatefulWidget {
     required this.onProfileSelected,
     required this.onDeleteProfile,
     this.subscriptionsRefreshToken = 0,
+    this.onSubscriptionsChanged,
   });
 
   final List<VpnProfile> profiles;
@@ -23,12 +24,22 @@ class ProfileListView extends StatefulWidget {
   final ValueChanged<VpnProfile> onProfileSelected;
   final ValueChanged<VpnProfile> onDeleteProfile;
   final int subscriptionsRefreshToken;
+  final ValueChanged<bool>? onSubscriptionsChanged;
 
   @override
   State<ProfileListView> createState() => _ProfileListViewState();
 }
 
 class _ProfileListViewState extends State<ProfileListView> {
+  String _formatVlessSummary(String uri) {
+    final parsed = parseVlessUri(uri);
+    if (parsed == null) return uri;
+    if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
+    if (parsed.host.isNotEmpty) return parsed.host;
+    if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
+    return uri;
+  }
+
   late final SubscriptionRepository _repository;
   final SubscriptionService _manager = SubscriptionService();
   List<VpnSubscription> _subscriptions = const [];
@@ -69,6 +80,7 @@ class _ProfileListViewState extends State<ProfileListView> {
           _expandedSubscriptions.putIfAbsent(sub.id, () => true);
         }
       });
+      widget.onSubscriptionsChanged?.call(subs.isNotEmpty);
     } catch (e) {
       if (!mounted) return;
       debugPrint('[ProfileListView] Failed to load subscriptions: $e');
@@ -201,7 +213,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               size: 20,
             ),
             title: Text(
-              profile.name,
+              _formatVlessSummary(profile.uri),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -209,12 +221,6 @@ class _ProfileListViewState extends State<ProfileListView> {
                 color: isSelected ? Colors.blue : Colors.white,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
-            ),
-            subtitle: Text(
-              profile.uri,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 11, color: Colors.grey),
             ),
             trailing: IconButton(
               tooltip: 'Удалить профиль',
@@ -272,12 +278,6 @@ class _ProfileListViewState extends State<ProfileListView> {
                 subscription.name,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-              ),
-              subtitle: Text(
-                '${subscription.profileCount} • ${subscription.formattedLastUpdate}',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 12, color: Colors.grey[500]),
               ),
               trailing: IconButton(
                 icon: Icon(isExpanded ? Icons.expand_less : Icons.expand_more),
@@ -345,18 +345,6 @@ class _ProfileListViewState extends State<ProfileListView> {
     return List.generate(subscription.profiles.length, (index) {
       final vlessUri = subscription.profiles[index];
       final isSelected = widget.selectedProfile?.uri == vlessUri;
-      final link = parseVlessUri(vlessUri);
-      final subtitleParts = <String>[];
-      if (link?.sni != null && link!.sni!.isNotEmpty) {
-        subtitleParts.add(link.sni!);
-      } else if (link?.host.isNotEmpty == true) {
-        subtitleParts.add(link!.host);
-      }
-      if (link?.tag != null && link!.tag!.isNotEmpty) {
-        subtitleParts.add(link.tag!);
-      }
-      final subtitle =
-          subtitleParts.isNotEmpty ? subtitleParts.join(' • ') : vlessUri;
 
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
@@ -379,7 +367,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               size: 20,
             ),
             title: Text(
-              '${subscription.name} • ${index + 1}',
+              _formatVlessSummary(vlessUri),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -388,15 +376,9 @@ class _ProfileListViewState extends State<ProfileListView> {
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
-            subtitle: Text(
-              subtitle,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 11, color: Colors.grey),
-            ),
             onTap: () {
               final profile = VpnProfile(
-                name: '${subscription.name} - ${index + 1}',
+                name: _formatVlessSummary(vlessUri),
                 uri: vlessUri,
               );
               widget.onProfileSelected(profile);

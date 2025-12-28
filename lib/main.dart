@@ -33,9 +33,9 @@ Future<void> main() async {
   await initializeDateFormatting('ru_RU', null);
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
-    const windowOptions = WindowOptions(
-      size: Size(1100, 760),
-      minimumSize: Size(900, 640),
+    final windowOptions = WindowOptions(
+      size: Platform.isWindows ? Size(480, 860) : Size(1100, 760),
+      minimumSize: Platform.isWindows ? Size(360, 640) : Size(900, 640),
       center: true,
       backgroundColor: Colors.transparent,
       titleBarStyle: TitleBarStyle.normal,
@@ -59,7 +59,7 @@ class VpnApp extends StatelessWidget {
       brightness: Brightness.dark,
     );
     return MaterialApp(
-      title: 'VLESS VPN Клиент',
+      title: 'VLESS VPN Client',
       theme: ThemeData(
         colorScheme: colorScheme,
         scaffoldBackgroundColor: const Color(0xFF050608),
@@ -83,9 +83,9 @@ class VlessHomePage extends StatefulWidget {
 }
 
 class _VlessHomePageState extends State<VlessHomePage>
-    with TrayListener, WindowListener {
+    with TrayListener, WindowListener, SingleTickerProviderStateMixin {
   final TextEditingController _controller = TextEditingController();
-  String _status = 'Idle';
+  String _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
   final Map<String, SplitTunnelConfig> _splitConfigs = {
     'all': SplitTunnelConfig(mode: 'all'),
     'whitelist': SplitTunnelConfig(mode: 'whitelist'),
@@ -102,6 +102,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   final TrayManager _trayManager = TrayManager.instance;
   bool _trayInitialized = false;
   bool _isExitingApp = false;
+  bool _isConnecting = false;
+  bool _hasSubscriptions = false;
+  late final AnimationController _connectGlowController;
   bool _androidAppsLoaded = false;
   bool _androidAppsLoading = false;
   String? _androidAppLoadError;
@@ -114,6 +117,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _noPresetValue = '__none__';
   static const String _splitToggleKey = 'split_tunnel_enabled';
   static const String _smartRoutingKey = 'smart_routing_enabled';
+  static const String _hasEverAddedKeyKey = 'has_added_key';
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
@@ -125,6 +129,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _profileCounterKey = 'vpn_profile_counter';
   bool _developerMode = false;
   bool _smartRouting = false;
+  bool _hasEverAddedKey = false;
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
   final ConnectivityTester _connectivityTester = ConnectivityTester();
@@ -158,8 +163,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   String get _pingLabel => _pingInProgress
       ? 'Измерение...'
       : (_pingMs != null ? '$_pingMs мс' : '--');
-  String get _selectedProfileLabel =>
-      _selectedProfile?.name ?? 'Выберите сервер';
   SplitTunnelConfig get _activeSplitConfig =>
       _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
   SplitTunnelConfig get _effectiveSplitConfig =>
@@ -171,6 +174,10 @@ class _VlessHomePageState extends State<VlessHomePage>
   @override
   void initState() {
     super.initState();
+    _connectGlowController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 3),
+    )..repeat();
     _loadInitialData();
     _checkWintun();
     if (_isDesktopPlatform) {
@@ -186,7 +193,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Future<void> _checkWintun() async {
     final available = await _singBoxController.isWintunAvailable();
     if (!available && mounted) {
-      setState(() => _status = 'Предупреждение: wintun.dll не найден');
+      _showFastSnack('wintun.dll ?? ??????');
     }
   }
 
@@ -325,7 +332,6 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   bool get _isRunning => _singBoxController.isRunning;
 
-  String get _interfaceLabel => _singBoxController.interfaceLabel;
 
   Future<void> _loadInitialData() async {
     final prefs = await SharedPreferences.getInstance();
@@ -375,6 +381,15 @@ class _VlessHomePageState extends State<VlessHomePage>
       }
     }
     selected ??= profiles.isNotEmpty ? profiles.first : null;
+
+    final repository = SubscriptionRepository();
+    final subscriptions = await repository.getAllSubscriptions();
+    _hasSubscriptions = subscriptions.isNotEmpty;
+    final storedHasKey = prefs.getBool(_hasEverAddedKeyKey) ?? false;
+    _hasEverAddedKey = storedHasKey || profiles.isNotEmpty || subscriptions.isNotEmpty;
+    if (_hasEverAddedKey && !storedHasKey) {
+      await prefs.setBool(_hasEverAddedKeyKey, true);
+    }
 
     final rawState =
         prefs.getString(_splitConfigPrefsKey) ??
@@ -884,15 +899,19 @@ class _VlessHomePageState extends State<VlessHomePage>
   Future<void> _addProfile(String name, String uri) async {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
-    final uniqueName = _allocateProfileName(name);
+    final autoName = _deriveProfileNameFromUri(trimmedUri);
+    final uniqueName = _allocateProfileName(autoName.isEmpty ? _previewProfileName() : autoName);
     final profile = VpnProfile(name: uniqueName, uri: trimmedUri);
 
     setState(() {
       _profiles = [..._profiles, profile];
       _selectedProfile = profile;
+      _hasEverAddedKey = true;
       _syncMetricsFromProfile(profile);
     });
     _controller.text = trimmedUri;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_hasEverAddedKeyKey, true);
     await _persistProfiles();
     await _persistSelectedProfile();
 
@@ -932,17 +951,32 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (result == null) return;
 
     final input = result['input'] as String;
-    final name = result['name'] as String;
     final isVless = result['isVless'] as bool;
 
     if (isVless) {
       // Это прямой VLESS ключ
-      final displayName = name.isEmpty ? _previewProfileName() : name;
+      final autoName = _deriveProfileNameFromUri(input);
+      final displayName = autoName.isEmpty ? _previewProfileName() : autoName;
       await _addProfile(displayName, input);
     } else {
       // Это подписка - добавляем в репозиторий
-      await _addSubscription(input, name.isEmpty ? 'Новая подписка' : name);
+      await _addSubscription(input, _deriveSubscriptionNameFromUrl(input));
     }
+  }
+
+  Future<void> _pasteProfileFromClipboard() async {
+    final data = await Clipboard.getData('text/plain');
+    final raw = data?.text?.trim() ?? '';
+    if (raw.isEmpty) {
+      _showFastSnack('\u0411\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u043f\u0443\u0441\u0442');
+      return;
+    }
+    if (raw.startsWith('vless://')) {
+      final autoName = _deriveProfileNameFromUri(raw);
+      await _addProfile(autoName.isEmpty ? _previewProfileName() : autoName, raw);
+      return;
+    }
+    await _addSubscription(raw, _deriveSubscriptionNameFromUrl(raw));
   }
 
   Future<void> _addSubscription(String url, String name) async {
@@ -954,7 +988,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       }
 
       final subscription = VpnSubscription(
-        name: name,
+        name: _deriveSubscriptionNameFromUrl(url),
         url: url,
         profiles: profiles,
       );
@@ -963,6 +997,9 @@ class _VlessHomePageState extends State<VlessHomePage>
       final added = await repository.addSubscription(subscription);
 
       if (added) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_hasEverAddedKeyKey, true);
+        setState(() => _hasEverAddedKey = true);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Subscription added')),
         );
@@ -981,8 +1018,13 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _reloadSubscriptions() async {
+    final repository = SubscriptionRepository();
+    final subs = await repository.getAllSubscriptions();
     if (!mounted) return;
-    setState(() => _subscriptionsRefreshToken += 1);
+    setState(() {
+      _subscriptionsRefreshToken += 1;
+      _hasSubscriptions = subs.isNotEmpty;
+    });
   }
 
   Future<void> _clearAllProfilesForSubscriptionMode() async {
@@ -1052,6 +1094,38 @@ class _VlessHomePageState extends State<VlessHomePage>
     return _ensureUniqueProfileName(generated);
   }
 
+  String _mapStatus(String value) {
+    final normalized = value.toLowerCase();
+    if (normalized.contains('connect')) {
+      return '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
+    }
+    if (normalized.contains('connected') || normalized.contains('running')) {
+      return '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
+    }
+    if (normalized.contains('disconnect')) {
+      return '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+    }
+    return _status;
+  }
+
+  String _deriveProfileNameFromUri(String uri) {
+    final parsed = parseVlessUri(uri);
+    if (parsed == null) return '';
+    if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
+    if (parsed.host.isNotEmpty) return parsed.host;
+    if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
+    return '';
+  }
+
+  String _deriveSubscriptionNameFromUrl(String url) {
+    Uri? parsed = Uri.tryParse(url.trim());
+    if (parsed == null || parsed.host.isEmpty) {
+      parsed = Uri.tryParse('https://${url.trim()}');
+    }
+    final host = parsed?.host ?? '';
+    return host.isNotEmpty ? host : 'Subscription';
+  }
+
   String _previewProfileName() {
     final nextIndex =
         math.max(_profileNameCounter, _findMaxProfileIndex(_profiles)) + 1;
@@ -1079,7 +1153,8 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
 
     setState(() {
-      _status = 'Подключение...';
+      _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
+      _isConnecting = true;
       _logLines.clear();
     });
 
@@ -1090,20 +1165,27 @@ class _VlessHomePageState extends State<VlessHomePage>
       dpiEvasionConfig: _dpiEvasionConfig,
       onStatus: (value) {
         if (!mounted) return;
-        setState(() => _status = value);
+        setState(() => _status = _mapStatus(value));
       },
       onLog: (line) => _appendLogs([line]),
     );
 
     if (!result.success) {
       if (!mounted) return;
-      setState(() => _status = result.errorMessage ?? 'Ошибка подключения');
+      _showFastSnack(result.errorMessage ?? '\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f');
+      setState(() {
+        _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+        _isConnecting = false;
+      });
       return;
     }
 
     await _saveUri();
     if (!mounted) return;
-    setState(() {});
+    setState(() {
+      _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
+      _isConnecting = false;
+    });
     unawaited(_applyDpiEvasionInjector());
     unawaited(_refreshMetrics(silent: true));
   }
@@ -1113,13 +1195,16 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _singBoxController.disconnect(
       onStatus: (value) {
         if (!mounted) return;
-        setState(() => _status = value);
+        setState(() => _status = _mapStatus(value));
       },
       onLog: (line) => _appendLogs([line]),
     );
     await _dpiEvasionManager.stopNativeInjector();
     if (!mounted) return;
-    setState(() {});
+    setState(() {
+      _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+      _isConnecting = false;
+    });
   }
 
   Future<void> _applyDpiEvasionInjector() async {
@@ -1163,11 +1248,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     });
   }
 
-  Future<void> _copyStatusToClipboard() async {
-    await Clipboard.setData(ClipboardData(text: _status));
-    if (!mounted) return;
-    _showFastSnack('Статус скопирован');
-  }
 
   void _showConfigDialog(BuildContext context) {
     showDialog(
@@ -1204,6 +1284,7 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   @override
   void dispose() {
+    _connectGlowController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
     if (_isDesktopPlatform) {
@@ -1218,6 +1299,16 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   @override
   Widget build(BuildContext context) {
+    final hasConnectable = _profiles.isNotEmpty || _hasSubscriptions;
+    if (!hasConnectable) {
+      return Scaffold(
+        appBar: AppBar(
+          title: const Text('VLESS VPN Client'),
+        ),
+        body: _buildEmptyState(),
+      );
+    }
+
     return DefaultTabController(
       length: 3,
       child: Scaffold(
@@ -1226,9 +1317,9 @@ class _VlessHomePageState extends State<VlessHomePage>
           bottom: TabBar(
             isScrollable: true,
             tabs: const [
-              Tab(text: 'Подключение'),
-              Tab(text: 'Разделение'),
-              Tab(text: 'Проверка связи'),
+              Tab(text: '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435'),
+              Tab(text: '\u0420\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u0435'),
+              Tab(text: '\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0441\u0432\u044f\u0437\u0438'),
             ],
           ),
         ),
@@ -1238,6 +1329,37 @@ class _VlessHomePageState extends State<VlessHomePage>
             _buildSplitTunnelTab(),
             _buildConnectivityTestTab(),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEmptyState() {
+    final theme = Theme.of(context);
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: Card(
+          color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+          elevation: 0,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                FilledButton(
+                  onPressed: _showProfileDialog,
+                  child: const Text('\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447'),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton(
+                  onPressed: _pasteProfileFromClipboard,
+                  child: const Text('\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430'),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -1634,241 +1756,200 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildStatusHero(BuildContext context, bool isWide) {
     final scheme = Theme.of(context).colorScheme;
     final isRunning = _isRunning;
-    final isMobile = Platform.isAndroid || Platform.isIOS;
     final gradient = isRunning
         ? [const Color(0xFFFF1B2D), const Color(0xFF51030F)]
         : [const Color(0xFF1A1B22), const Color(0xFF08090F)];
-    final icon = isRunning ? Icons.shield : Icons.shield_outlined;
-    final hostLabel = _parsed != null
-        ? '${_parsed!.host}:${_parsed!.port}'
-        : 'Не подключено';
-    final configLabel = Platform.isWindows
-        ? (_configFile != null ? _configFile!.path : 'Конфиг не создан')
-        : (_generatedConfig != null ? 'Конфиг готов' : 'Конфиг не создан');
     final screenWidth = MediaQuery.of(context).size.width;
-    final compactWidth = (screenWidth - 60).clamp(200.0, 320.0);
-    final pillMaxWidth = isWide ? 240.0 : compactWidth;
+    final compact = screenWidth < 640;
+    final isEnabled = _selectedProfile != null || _controller.text.trim().isNotEmpty;
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final compact = constraints.maxWidth < 640;
-        final labeledActions = Wrap(
-          spacing: 10,
-          runSpacing: 8,
-          children: [
-            OutlinedButton.icon(
-              onPressed: canRefreshMetrics ? () => _refreshMetrics() : null,
-              icon: Icon(
-                _pingInProgress ? Icons.timelapse : Icons.refresh_outlined,
-              ),
-              label: Text(_pingInProgress ? 'Измерение...' : 'Обновить'),
-              style: OutlinedButton.styleFrom(foregroundColor: Colors.white),
-            ),
-            OutlinedButton.icon(
-              onPressed: _copyStatusToClipboard,
-              icon: const Icon(Icons.copy_all_outlined),
-              label: const Text('Копировать'),
-              style: OutlinedButton.styleFrom(foregroundColor: Colors.white),
-            ),
-            if (_generatedConfig != null)
-              TextButton.icon(
+    final statusText = Text(
+      _status,
+      textAlign: TextAlign.center,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(
+        fontSize: 22,
+        fontWeight: FontWeight.w700,
+        color: Colors.white,
+      ),
+    );
+
+    final topRow = SizedBox(
+      height: 34,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Center(child: statusText),
+          if (_generatedConfig != null)
+            Align(
+              alignment: Alignment.centerRight,
+              child: IconButton(
                 onPressed: () => _showConfigDialog(context),
-                icon: const Icon(Icons.visibility_outlined),
-                label: const Text('Конфиг'),
-                style: TextButton.styleFrom(foregroundColor: Colors.white),
-              ),
-          ],
-        );
-
-        final compactActions = isMobile || compact;
-        final actions = compactActions
-            ? Wrap(
-                spacing: 6,
-                runSpacing: 6,
-                children: [
-                  IconButton(
-                    onPressed: canRefreshMetrics
-                        ? () => _refreshMetrics()
-                        : null,
-                    tooltip: 'Обновить',
-                    icon: Icon(
-                      _pingInProgress
-                          ? Icons.timelapse
-                          : Icons.refresh_outlined,
-                      color: Colors.white,
-                    ),
-                  ),
-                  IconButton(
-                    onPressed: _copyStatusToClipboard,
-                    tooltip: 'Копировать',
-                    icon: const Icon(
-                      Icons.copy_all_outlined,
-                      color: Colors.white,
-                    ),
-                  ),
-                  if (_generatedConfig != null)
-                    IconButton(
-                      onPressed: () => _showConfigDialog(context),
-                      tooltip: 'Конфиг',
-                      icon: const Icon(
-                        Icons.visibility_outlined,
-                        color: Colors.white,
-                      ),
-                    ),
-                ],
-              )
-            : labeledActions;
-
-        final statusTexts = Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SelectableText(
-              _status,
-              style: const TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
+                icon: const Icon(Icons.receipt_long, color: Colors.white),
               ),
             ),
-            const SizedBox(height: 6),
-            Text(
-              hostLabel,
-              style: TextStyle(color: Colors.white.withOpacity(0.9)),
-            ),
-          ],
-        );
+        ],
+      ),
+    );
 
-        final header = Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Icon(icon, size: compactActions ? 36 : 46, color: Colors.white),
-                const SizedBox(width: 12),
-                Expanded(child: statusTexts),
-              ],
-            ),
-            if (!compactActions) ...[const SizedBox(height: 12), actions],
-          ],
-        );
-
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 300),
-          padding: EdgeInsets.all(compactActions ? 16 : 28),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(28),
-            gradient: LinearGradient(
-              colors: gradient,
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: scheme.primary.withOpacity(isRunning ? 0.25 : 0.1),
-                blurRadius: 30,
-                offset: const Offset(0, 20),
-              ),
-            ],
+    final indicatorRow = Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        if (_smartRouting)
+          Icon(Icons.route_outlined, color: scheme.primary, size: 20),
+        if (_splitEnabled)
+          Padding(
+            padding: const EdgeInsets.only(left: 8),
+            child: Icon(Icons.call_split, color: scheme.primary, size: 20),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              header,
-              const SizedBox(height: 16),
-              Center(
-                child: SizedBox(
-                  width: isWide ? 260 : double.infinity,
-                  // Allow start when a profile is selected or the field is non-empty (subscriptions fill the controller).
-                  child: ElevatedButton.icon(
-                    onPressed: _isRunning
-                        ? _stop
-                        : ((_selectedProfile != null ||
-                                _controller.text.trim().isNotEmpty)
-                            ? _start
-                            : null),
-                    style: ElevatedButton.styleFrom(
-                      minimumSize: const Size.fromHeight(60),
-                      backgroundColor: _isRunning
-                          ? Colors.white
-                          : scheme.primary,
-                      foregroundColor: _isRunning
-                          ? scheme.primary
-                          : Colors.white,
-                      textStyle: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                    ),
-                    icon: Icon(
-                      _isRunning
-                          ? Icons.stop_circle_outlined
-                          : Icons.power_settings_new,
-                    ),
-                    label: Text(_isRunning ? 'Отключить' : 'Подключить'),
+      ],
+    );
+
+    final buttonSize = compact ? 140.0 : 170.0;
+    final connectButton = GestureDetector(
+      onTap: isRunning ? _stop : (isEnabled ? _start : null),
+      child: AnimatedBuilder(
+        animation: _connectGlowController,
+        builder: (context, child) {
+          final rotation = _connectGlowController.value * 6.283185307179586;
+          final showSpin = _isConnecting && !isRunning;
+          final ringGradient = showSpin
+              ? SweepGradient(
+                  colors: [
+                    scheme.primary,
+                    scheme.primary.withOpacity(0.05),
+                    scheme.primary,
+                  ],
+                  stops: const [0.0, 0.6, 1.0],
+                  transform: GradientRotation(rotation),
+                )
+              : SweepGradient(
+                  colors: [
+                    scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
+                    scheme.primary.withOpacity(0.02),
+                    scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
+                  ],
+                );
+
+          return AnimatedOpacity(
+            duration: const Duration(milliseconds: 200),
+            opacity: isEnabled || isRunning ? 1.0 : 0.4,
+            child: Container(
+              width: buttonSize,
+              height: buttonSize,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: ringGradient,
+                boxShadow: [
+                  BoxShadow(
+                    color: scheme.primary.withOpacity(isRunning ? 0.35 : 0.12),
+                    blurRadius: isRunning ? 28 : 18,
+                    spreadRadius: isRunning ? 2 : 0,
+                  ),
+                ],
+              ),
+              child: Center(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 250),
+                  width: buttonSize * 0.7,
+                  height: buttonSize * 0.7,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isRunning
+                        ? scheme.primary
+                        : const Color(0xFF171820),
+                  ),
+                  child: Icon(
+                    isRunning ? Icons.stop_rounded : Icons.power_settings_new,
+                    size: buttonSize * 0.35,
+                    color: Colors.white,
                   ),
                 ),
               ),
-              if (compactActions) ...[const SizedBox(height: 8), actions],
-              const SizedBox(height: 20),
-              Wrap(
-                spacing: 16,
-                runSpacing: 8,
-                children: [
-                  _buildInfoPill(
-                    context,
-                    Icons.account_circle,
-                    'Profile',
-                    _selectedProfileLabel,
-                    maxWidth: pillMaxWidth,
-                  ),
-                  _buildInfoPill(
-                    context,
-                    Icons.speed_outlined,
-                    'Ping',
-                    _pingLabel,
-                    maxWidth: pillMaxWidth,
-                  ),
-                  if (_smartRouting)
-                    _buildInfoPill(
-                      context,
-                      Icons.route_outlined,
-                      'Smart Routing',
-                      'Smart Routing: ON',
-                      maxWidth: pillMaxWidth,
-                    ),
-                  if (_developerMode)
-                    _buildInfoPill(
-                      context,
-                      Icons.cloud_outlined,
-                      'Interface',
-                      _interfaceLabel,
-                      maxWidth: pillMaxWidth,
-                    ),
-                  if (_developerMode && _configFile != null)
-                    _buildInfoPill(
-                      context,
-                      Icons.folder_outlined,
-                      'Config path',
-                      configLabel,
-                      maxWidth: pillMaxWidth,
-                    ),
-                ],
-              ),
-              const SizedBox(height: 14),
-            ],
+            ),
+          );
+        },
+      ),
+    );
+
+    final pingRow = Row(
+      mainAxisAlignment: MainAxisAlignment.end,
+      children: [
+        Text(
+          'Ping: $_pingLabel',
+          style: TextStyle(color: Colors.white.withOpacity(0.8)),
+        ),
+        const SizedBox(width: 6),
+        IconButton(
+          onPressed: canRefreshMetrics ? () => _refreshMetrics() : null,
+          icon: Icon(
+            _pingInProgress ? Icons.timelapse : Icons.refresh_outlined,
+            color: Colors.white,
           ),
-        );
-      },
+        ),
+      ],
+    );
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      padding: EdgeInsets.all(compact ? 16 : 28),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(28),
+        gradient: LinearGradient(
+          colors: gradient,
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: scheme.primary.withOpacity(isRunning ? 0.25 : 0.1),
+            blurRadius: 30,
+            offset: const Offset(0, 20),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          topRow,
+          const SizedBox(height: 6),
+          indicatorRow,
+          const SizedBox(height: 16),
+          Center(child: connectButton),
+          const SizedBox(height: 12),
+          pingRow,
+        ],
+      ),
     );
   }
 
   Widget _buildProfileCard(BuildContext context) {
     final theme = Theme.of(context);
+    if (!_hasEverAddedKey) {
+      return Card(
+        color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+        elevation: 0,
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              FilledButton(
+                onPressed: _showProfileDialog,
+                child: const Text('\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447'),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: _pasteProfileFromClipboard,
+                child: const Text('\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
     // ...existing code...
     final profileCard = Card(
       color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
@@ -1902,6 +1983,10 @@ class _VlessHomePageState extends State<VlessHomePage>
                 profiles: _profiles,
                 selectedProfile: _selectedProfile,
                 subscriptionsRefreshToken: _subscriptionsRefreshToken,
+                onSubscriptionsChanged: (hasSubs) {
+                  if (!mounted) return;
+                  setState(() => _hasSubscriptions = hasSubs);
+                },
                 onProfileSelected: (profile) {
                   if (!_isRunning) {
                     _selectCurrentProfile(profile);
@@ -1911,20 +1996,6 @@ class _VlessHomePageState extends State<VlessHomePage>
                   _removeProfileByName(profile.name);
                 },
               ),
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                TextButton.icon(
-                  onPressed: _generatedConfig != null
-                      ? () => _showConfigDialog(context)
-                      : null,
-                  icon: const Icon(Icons.receipt_long),
-                  label: const Text('Show config'),
-                ),
-              ],
             ),
           ],
         ),
