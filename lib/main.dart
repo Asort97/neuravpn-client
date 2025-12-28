@@ -27,6 +27,7 @@ import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
 import 'widgets/dpi_evasion_widget.dart';
+import 'widgets/animated_emoji.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1348,14 +1349,20 @@ class _VlessHomePageState extends State<VlessHomePage>
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                const Center(child: AnimatedEmoji(emoji: '??', size: 84)),
+                const SizedBox(height: 16),
                 FilledButton(
                   onPressed: _showProfileDialog,
-                  child: const Text('\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447'),
+                  child: const Text(
+                    '\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447',
+                  ),
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton(
                   onPressed: _pasteProfileFromClipboard,
-                  child: const Text('\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430'),
+                  child: const Text(
+                    '\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430',
+                  ),
                 ),
               ],
             ),
@@ -1756,12 +1763,14 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildStatusHero(BuildContext context, bool isWide) {
     final scheme = Theme.of(context).colorScheme;
     final isRunning = _isRunning;
+    final isWindows = Platform.isWindows;
     final gradient = isRunning
         ? [const Color(0xFFFF1B2D), const Color(0xFF51030F)]
         : [const Color(0xFF1A1B22), const Color(0xFF08090F)];
     final screenWidth = MediaQuery.of(context).size.width;
     final compact = screenWidth < 640;
-    final isEnabled = _selectedProfile != null || _controller.text.trim().isNotEmpty;
+    final isEnabled =
+        _selectedProfile != null || _controller.text.trim().isNotEmpty;
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
 
     final statusText = Text(
@@ -1892,24 +1901,34 @@ class _VlessHomePageState extends State<VlessHomePage>
       ],
     );
 
+    final decoration = isWindows
+        ? BoxDecoration(
+            color: scheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(
+              color: scheme.primary.withOpacity(0.15),
+            ),
+          )
+        : BoxDecoration(
+            borderRadius: BorderRadius.circular(28),
+            gradient: LinearGradient(
+              colors: gradient,
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: scheme.primary.withOpacity(isRunning ? 0.25 : 0.1),
+                blurRadius: 30,
+                offset: const Offset(0, 20),
+              ),
+            ],
+          );
+
     return AnimatedContainer(
       duration: const Duration(milliseconds: 300),
       padding: EdgeInsets.all(compact ? 16 : 28),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(28),
-        gradient: LinearGradient(
-          colors: gradient,
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: scheme.primary.withOpacity(isRunning ? 0.25 : 0.1),
-            blurRadius: 30,
-            offset: const Offset(0, 20),
-          ),
-        ],
-      ),
+      decoration: decoration,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [

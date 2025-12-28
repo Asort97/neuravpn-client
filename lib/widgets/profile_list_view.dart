@@ -188,6 +188,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   List<Widget> _buildRegularKeys() {
+    final scheme = Theme.of(context).colorScheme;
     return List.generate(widget.profiles.length, (index) {
       final profile = widget.profiles[index];
       final isSelected = widget.selectedProfile?.uri == profile.uri;
@@ -198,19 +199,22 @@ class _ProfileListViewState extends State<ProfileListView> {
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? Colors.blue.withOpacity(0.15) : null,
+            color: isSelected ? scheme.primary.withOpacity(0.12) : null,
             border: Border.all(
-              color: isSelected ? Colors.blue : Colors.transparent,
+              color: isSelected ? scheme.primary : Colors.transparent,
               width: isSelected ? 1 : 0,
             ),
           ),
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
-            leading: Icon(
-              isSelected ? Icons.check_circle : Icons.circle_outlined,
-              color: isSelected ? Colors.blue : Colors.grey,
-              size: 20,
+            leading: CircleAvatar(
+              radius: 16,
+              backgroundColor: scheme.primary.withOpacity(0.15),
+              child: Text(
+                '🔑',
+                style: TextStyle(fontSize: 14, color: scheme.primary),
+              ),
             ),
             title: Text(
               _formatVlessSummary(profile.uri),
@@ -218,7 +222,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 13,
-                color: isSelected ? Colors.blue : Colors.white,
+                color: isSelected ? scheme.primary : Colors.white,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
@@ -266,6 +270,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   Widget _buildSubscriptionCard(VpnSubscription subscription, bool isExpanded) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       child: Card(
@@ -273,7 +278,7 @@ class _ProfileListViewState extends State<ProfileListView> {
           children: [
             ListTile(
               dense: true,
-              leading: Icon(Icons.cloud_download, color: Colors.blue[400]),
+              leading: Icon(Icons.cloud_download, color: scheme.primary),
               title: Text(
                 subscription.name,
                 maxLines: 1,
@@ -342,6 +347,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   List<Widget> _buildSubscriptionProfiles(VpnSubscription subscription) {
+    final scheme = Theme.of(context).colorScheme;
     return List.generate(subscription.profiles.length, (index) {
       final vlessUri = subscription.profiles[index];
       final isSelected = widget.selectedProfile?.uri == vlessUri;
@@ -352,19 +358,22 @@ class _ProfileListViewState extends State<ProfileListView> {
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? Colors.blue.withOpacity(0.15) : null,
+            color: isSelected ? scheme.primary.withOpacity(0.12) : null,
             border: Border.all(
-              color: isSelected ? Colors.blue : Colors.transparent,
+              color: isSelected ? scheme.primary : Colors.transparent,
               width: isSelected ? 1 : 0,
             ),
           ),
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
-            leading: Icon(
-              isSelected ? Icons.check_circle : Icons.circle_outlined,
-              color: isSelected ? Colors.blue : Colors.grey,
-              size: 20,
+            leading: CircleAvatar(
+              radius: 16,
+              backgroundColor: scheme.primary.withOpacity(0.15),
+              child: Text(
+                '🌐',
+                style: TextStyle(fontSize: 14, color: scheme.primary),
+              ),
             ),
             title: Text(
               _formatVlessSummary(vlessUri),
@@ -372,7 +381,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 13,
-                color: isSelected ? Colors.blue : Colors.white,
+                color: isSelected ? scheme.primary : Colors.white,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
