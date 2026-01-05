@@ -73,6 +73,8 @@ flutter:
     - assets/bin/WinDivert.dll
     - assets/bin/WinDivert64.sys
     - windows/runner/resources/app_icon.ico
+    - assets/images/logo.png
+    - assets/images/11zon_cropped.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

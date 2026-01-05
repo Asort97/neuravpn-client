@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import '../models/split_tunnel_config.dart';
@@ -60,11 +61,19 @@ class SingBoxController {
   StreamSubscription<String>? _stderrSub;
   bool _androidConnected = false;
   bool _accessDeniedDetected = false;
+  bool _startupCheckInProgress = false;
+  WebSocket? _trafficSocket;
+  StreamSubscription? _trafficSocketSub;
+  final StreamController<int> _trafficController =
+      StreamController<int>.broadcast();
 
   String? _activeInterfaceName;
   File? _configFile;
   String? _generatedConfig;
   VlessLink? _parsedLink;
+  String? _lastStartError;
+  final List<String> _recentLogs = <String>[];
+  static const int _clashApiPort = 9090;
 
   void Function(String status)? _statusSink;
   void Function(String log)? _logSink;
@@ -72,6 +81,8 @@ class SingBoxController {
   VlessLink? get parsedLink => _parsedLink;
   File? get configFile => _configFile;
   String? get generatedConfig => _generatedConfig;
+  int get clashApiPort => _clashApiPort;
+  Stream<int> get trafficStream => _trafficController.stream;
 
   String get interfaceLabel {
     if (Platform.isWindows) {
@@ -96,6 +107,8 @@ class SingBoxController {
     _statusSink = onStatus;
     _logSink = onLog;
     _accessDeniedDetected = false;
+    _lastStartError = null;
+    _recentLogs.clear();
 
     final trimmed = rawUri.trim();
     if (trimmed.isEmpty) {
@@ -118,6 +131,11 @@ class SingBoxController {
     WinDivertPaths? winDivertPaths;
 
     if (Platform.isWindows) {
+      if (_activeInterfaceName != null) {
+        final logs = await _tunGuard.cleanupAdapter(_activeInterfaceName);
+        _emitLogs(logs);
+        _activeInterfaceName = null;
+      }
       _notifyStatus('Проверка TUN интерфейса');
       final guardResult = await _tunGuard.prepare();
       _emitLogs(guardResult.logs);
@@ -195,6 +213,7 @@ class SingBoxController {
           : const <String>[],
       extraRouteRules: extraRouteRules,
       dpiEvasionConfig: dpiEvasionConfig,
+      clashApiPort: Platform.isWindows ? _clashApiPort : null,
     );
     _generatedConfig = jsonConfig;
     _configFile = null;
@@ -247,16 +266,33 @@ class SingBoxController {
             : '$dllDir;$existingPath';
       }
 
-      final process = await Process.start(exePath, [
-        'run',
-        '-c',
-        cfgFile.path,
-      ], environment: environment);
-      _process = process;
-      _attachProcessHandlers(process, interfaceName);
-      _notifyStatus('Подключено (TUN: $interfaceName)');
-      unawaited(_warmupConnection());
-      return SingBoxStartResult.success();
+      const maxAttempts = 2;
+      for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+        final process = await Process.start(exePath, [
+          'run',
+          '-c',
+          cfgFile.path,
+        ], environment: environment);
+        _process = process;
+        _attachProcessHandlers(process, interfaceName);
+        final startupError = await _verifyStartup(process, interfaceName);
+        if (startupError == null) {
+          _notifyStatus('Подключено (TUN: $interfaceName)');
+          unawaited(_warmupConnection());
+          return SingBoxStartResult.success();
+        }
+
+        await _forceStopProcess(process);
+        await _teardownProcess();
+        final logs = await _tunGuard.cleanupAdapter(interfaceName);
+        _emitLogs(logs);
+        if (attempt < maxAttempts) {
+          await Future.delayed(const Duration(milliseconds: 900));
+          continue;
+        }
+        return SingBoxStartResult.failure(startupError);
+      }
+      return SingBoxStartResult.failure('Ошибка запуска: неизвестная ошибка');
     } catch (e) {
       return SingBoxStartResult.failure('Ошибка запуска: $e');
     }
@@ -282,26 +318,16 @@ class SingBoxController {
     if (process == null) return;
 
     _notifyStatus('Остановка...');
-    process.kill(ProcessSignal.sigterm);
-
-    try {
-      final exitCode = await process.exitCode.timeout(
-        const Duration(seconds: 3),
-        onTimeout: () {
-          process.kill(ProcessSignal.sigkill);
-          return -1;
-        },
-      );
-      if (exitCode == -1) {
-        await Future.delayed(const Duration(milliseconds: 500));
-      }
-    } catch (_) {
-      process.kill(ProcessSignal.sigkill);
-      await Future.delayed(const Duration(milliseconds: 500));
-    }
+    await _forceStopProcess(process);
 
     await Future.delayed(const Duration(seconds: 1));
     await _teardownProcess();
+    final interfaceName = _activeInterfaceName;
+    _activeInterfaceName = null;
+    if (interfaceName != null) {
+      final logs = await _tunGuard.cleanupAdapter(interfaceName);
+      _emitLogs(logs);
+    }
     _notifyStatus('Остановлено');
   }
 
@@ -349,11 +375,85 @@ class SingBoxController {
     _process = null;
   }
 
+  Future<int?> fetchTrafficBps() async {
+    if (!Platform.isWindows) return null;
+    if (_process == null) return null;
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(milliseconds: 800);
+    try {
+      final request = await client
+          .getUrl(Uri.parse('http://127.0.0.1:$_clashApiPort/traffic'))
+          .timeout(const Duration(milliseconds: 800));
+      final response = await request.close().timeout(
+        const Duration(milliseconds: 800),
+      );
+      if (response.statusCode != 200) return null;
+      final body = await response.transform(SystemEncoding().decoder).join();
+      final data = jsonDecode(body);
+      if (data is Map) {
+        final down = data['down'];
+        final up = data['up'];
+        if (down is num && up is num) {
+          return (down + up).round();
+        }
+      }
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
+    return null;
+  }
+
+  Future<void> startTrafficStream() async {
+    if (!Platform.isWindows) return;
+    if (_trafficSocket != null) return;
+    try {
+      final socket = await WebSocket.connect(
+        'ws://127.0.0.1:$_clashApiPort/traffic',
+      );
+      _trafficSocket = socket;
+      _trafficSocketSub = socket.listen(
+        (event) {
+          try {
+            final data = jsonDecode(event as String);
+            if (data is Map) {
+              final down = data['down'];
+              final up = data['up'];
+              if (down is num && up is num) {
+                _trafficController.add((down + up).round());
+              }
+            }
+          } catch (_) {
+            // ignore malformed traffic payloads
+          }
+        },
+        onError: (_) {
+          _trafficSocket = null;
+        },
+        onDone: () {
+          _trafficSocket = null;
+        },
+        cancelOnError: true,
+      );
+    } catch (_) {
+      _trafficSocket = null;
+    }
+  }
+
+  Future<void> stopTrafficStream() async {
+    await _trafficSocketSub?.cancel();
+    _trafficSocketSub = null;
+    await _trafficSocket?.close();
+    _trafficSocket = null;
+  }
+
   void _emitChunk(String chunk, {required bool isError}) {
     final lines = chunk.split(RegExp(r'[\r\n]+'));
     for (final raw in lines) {
       final line = raw.trim();
       if (line.isEmpty) continue;
+      _rememberLogLine(line, isError: isError);
       if (isError &&
           (line.contains('Access is denied') ||
               line.contains('configure tun interface'))) {
@@ -371,6 +471,63 @@ class SingBoxController {
       final trimmed = line.trim();
       if (trimmed.isEmpty) continue;
       _logSink?.call(trimmed);
+    }
+  }
+
+  void _rememberLogLine(String line, {required bool isError}) {
+    _recentLogs.add(line);
+    if (_recentLogs.length > 80) {
+      _recentLogs.removeAt(0);
+    }
+    if (isError) {
+      _lastStartError = line;
+    }
+  }
+
+  Future<void> _forceStopProcess(Process process) async {
+    if (process.pid == 0) return;
+    process.kill(ProcessSignal.sigterm);
+    try {
+      await process.exitCode.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {
+          process.kill(ProcessSignal.sigkill);
+          return -1;
+        },
+      );
+    } catch (_) {
+      process.kill(ProcessSignal.sigkill);
+    }
+  }
+
+  Future<String?> _verifyStartup(Process process, String interfaceName) async {
+    if (_startupCheckInProgress) return null;
+    _startupCheckInProgress = true;
+    try {
+      try {
+        final exitCode = await process.exitCode.timeout(
+          const Duration(milliseconds: 800),
+        );
+        final hint = _lastStartError ?? (_recentLogs.isNotEmpty ? _recentLogs.last : null);
+        final suffix = hint == null ? '' : ' ($hint)';
+        return 'sing-box exited early (code $exitCode)$suffix';
+      } on TimeoutException {
+        // Process is still alive. Continue with adapter check.
+      }
+      if (Platform.isWindows) {
+        final adapterUp = await _tunGuard.waitForAdapterUp(
+          interfaceName,
+          timeout: const Duration(seconds: 4),
+        );
+        if (!adapterUp) {
+          final hint = _lastStartError ?? (_recentLogs.isNotEmpty ? _recentLogs.last : null);
+          final suffix = hint == null ? '' : ' ($hint)';
+          return 'TUN adapter did not come up$suffix';
+        }
+      }
+      return null;
+    } finally {
+      _startupCheckInProgress = false;
     }
   }
 

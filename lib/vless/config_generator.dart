@@ -20,6 +20,7 @@ String generateSingBoxConfig(
   List<String> smartDomains = const <String>[],
   List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
   DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
+  int? clashApiPort,
 }) {
   final p = link.params;
   final transportType = p['type']; // например ws, tcp, grpc, h2
@@ -166,6 +167,13 @@ String generateSingBoxConfig(
       ],
     },
   };
+  if (clashApiPort != null) {
+    config['experimental'] = {
+      'clash_api': {
+        'external_controller': '127.0.0.1:$clashApiPort',
+      },
+    };
+  }
   return const JsonEncoder.withIndent('  ').convert(config);
 }
 

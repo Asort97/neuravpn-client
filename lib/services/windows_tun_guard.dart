@@ -29,6 +29,7 @@ class WindowsTunGuard {
     this.removalTimeout = const Duration(seconds: 3),
     this.pollInterval = const Duration(milliseconds: 250),
     this.cleanupBudget = const Duration(seconds: 6),
+    this.adapterUpTimeout = const Duration(seconds: 6),
   });
 
   static const String defaultInboundTag = 'tun-in';
@@ -38,6 +39,7 @@ class WindowsTunGuard {
   final Duration removalTimeout;
   final Duration pollInterval;
   final Duration cleanupBudget;
+  final Duration adapterUpTimeout;
   final Random _random = Random();
 
   Future<TunPreparationResult> prepare() async {
@@ -122,6 +124,21 @@ class WindowsTunGuard {
     return logs;
   }
 
+  Future<bool> waitForAdapterUp(String name, {Duration? timeout}) async {
+    if (!Platform.isWindows) return true;
+    if (name.isEmpty) return false;
+    final limit = timeout ?? adapterUpTimeout;
+    final deadline = DateTime.now().add(limit);
+    while (DateTime.now().isBefore(deadline)) {
+      final status = await _readAdapterStatus(name);
+      if (status == 'up') {
+        return true;
+      }
+      await Future.delayed(pollInterval);
+    }
+    return false;
+  }
+
   Future<List<String>> _findConflictingAdapters(List<String> logs) async {
     const command =
         "Get-NetAdapter | Where-Object { \$_.Name -like 'tun-in*' -or \$_.Name -like 'wintun*' } | Select-Object -ExpandProperty Name";
@@ -157,6 +174,14 @@ class WindowsTunGuard {
     final result = await _runPowerShell(command, null);
     if (result == null || result.stdout == null) return false;
     return result.stdout.toString().toLowerCase().contains('true');
+  }
+
+  Future<String> _readAdapterStatus(String name) async {
+    final command =
+        "Get-NetAdapter -Name '${_escapePs(name)}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status";
+    final result = await _runPowerShell(command, null);
+    if (result == null || result.stdout == null) return '';
+    return result.stdout.toString().trim().toLowerCase();
   }
 
   Future<bool> _cleanupWithBudget(List<String> adapters, List<String> logs) async {

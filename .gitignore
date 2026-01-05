@@ -63,3 +63,4 @@ local.properties
 *.tmp
 *.lock
 Thumbs.db
+FIGMA_MAKE

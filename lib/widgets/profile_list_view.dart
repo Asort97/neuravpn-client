@@ -50,6 +50,9 @@ class _ProfileListViewState extends State<ProfileListView> {
   bool get _isMobile =>
       Theme.of(context).platform == TargetPlatform.android ||
       Theme.of(context).platform == TargetPlatform.iOS;
+  static const Color _cardColor = Color(0xFF1A1A1A);
+  static const Color _surfaceColor = Color(0xFF2A2A2A);
+  static const Color _borderColor = Color(0x14FFFFFF);
 
   @override
   void initState() {
@@ -93,7 +96,7 @@ class _ProfileListViewState extends State<ProfileListView> {
     try {
       final profiles = await _manager.fetchSubscription(subscription.url);
       if (profiles.isEmpty) {
-        throw 'В подписке не найдено профилей';
+        throw 'Subscription returned no profiles.';
       }
 
       final updated = subscription.copyWith(
@@ -105,14 +108,14 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _loadSubscriptions();
 
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Подписка обновлена')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Subscription updated successfully.')),
+      );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка обновления: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to update subscription: $e')),
+      );
     }
   }
 
@@ -120,16 +123,21 @@ class _ProfileListViewState extends State<ProfileListView> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Удалить подписку?'),
-        content: Text('Подписка "${subscription.name}" будет удалена'),
+        title: const Text('Delete subscription?'),
+        content: Text(
+          'Delete "${subscription.name}" from the device? This cannot be undone.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
+            child: const Text('Cancel'),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Удалить', style: TextStyle(color: Colors.red)),
+            child: const Text(
+              'Delete',
+              style: TextStyle(color: Colors.red),
+            ),
           ),
         ],
       ),
@@ -142,9 +150,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _loadSubscriptions();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка удаления: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to delete subscription: $e')),
+      );
     }
   }
 
@@ -158,17 +166,17 @@ class _ProfileListViewState extends State<ProfileListView> {
 
     if (widget.profiles.isNotEmpty) {
       // Standalone VLESS keys imported manually
-      children.add(_buildSectionHeader('Конфигурации'));
+      children.add(_buildSectionHeader('Configurations'));
       children.addAll(_buildRegularKeys());
     }
 
     if (_subscriptions.isNotEmpty) {
-      children.add(_buildSectionHeader('Подписки'));
+      children.add(_buildSectionHeader('Subscriptions'));
       children.addAll(_buildSubscriptions());
     }
 
     if (children.isEmpty) {
-      return const Center(child: Text('Нет профилей'));
+      return const Center(child: Text('No profiles yet'));
     }
 
     return ListView(children: children);
@@ -180,9 +188,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       child: Text(
         title,
         style: Theme.of(context).textTheme.titleSmall?.copyWith(
-          color: Colors.grey[500],
-          fontWeight: FontWeight.bold,
-        ),
+              color: Colors.grey[500],
+              fontWeight: FontWeight.bold,
+            ),
       ),
     );
   }
@@ -194,27 +202,25 @@ class _ProfileListViewState extends State<ProfileListView> {
       final isSelected = widget.selectedProfile?.uri == profile.uri;
 
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
         child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          margin: const EdgeInsets.symmetric(vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? scheme.primary.withOpacity(0.12) : null,
+            color: isSelected ? _surfaceColor : null,
             border: Border.all(
-              color: isSelected ? scheme.primary : Colors.transparent,
+              color:
+                  isSelected ? Colors.white.withOpacity(0.18) : Colors.transparent,
               width: isSelected ? 1 : 0,
             ),
           ),
           child: ListTile(
             dense: true,
-            contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+            contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
             leading: CircleAvatar(
               radius: 16,
-              backgroundColor: scheme.primary.withOpacity(0.15),
-              child: Text(
-                '🔑',
-                style: TextStyle(fontSize: 14, color: scheme.primary),
-              ),
+              backgroundColor: _surfaceColor,
+              child: const Icon(Icons.vpn_key, size: 16, color: Colors.white70),
             ),
             title: Text(
               _formatVlessSummary(profile.uri),
@@ -222,28 +228,28 @@ class _ProfileListViewState extends State<ProfileListView> {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 13,
-                color: isSelected ? scheme.primary : Colors.white,
+                color: Colors.white,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
             trailing: IconButton(
-              tooltip: 'Удалить профиль',
+              tooltip: 'Delete profile',
               icon: const Icon(Icons.delete, size: 18, color: Colors.redAccent),
               onPressed: () async {
                 final confirm = await showDialog<bool>(
                   context: context,
                   builder: (context) => AlertDialog(
-                    title: const Text('Удалить профиль?'),
-                    content: Text('Профиль "${profile.name}" будет удалён.'),
+                    title: const Text('Delete profile?'),
+                    content: Text('Delete "${profile.name}" from this device?'),
                     actions: [
                       TextButton(
                         onPressed: () => Navigator.pop(context, false),
-                        child: const Text('Отмена'),
+                        child: const Text('Cancel'),
                       ),
                       TextButton(
                         onPressed: () => Navigator.pop(context, true),
                         child: const Text(
-                          'Удалить',
+                          'Delete',
                           style: TextStyle(color: Colors.red),
                         ),
                       ),
@@ -272,12 +278,21 @@ class _ProfileListViewState extends State<ProfileListView> {
   Widget _buildSubscriptionCard(VpnSubscription subscription, bool isExpanded) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: Card(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: _borderColor),
+        ),
         child: Column(
           children: [
             ListTile(
               dense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 2,
+              ),
               leading: Icon(Icons.cloud_download, color: scheme.primary),
               title: Text(
                 subscription.name,
@@ -299,21 +314,21 @@ class _ProfileListViewState extends State<ProfileListView> {
               },
             ),
             if (isExpanded) ...[
-              const Divider(height: 1, indent: 16, endIndent: 16),
+              const Divider(height: 1, indent: 12, endIndent: 12),
               ..._buildSubscriptionProfiles(subscription),
               Padding(
-                padding: const EdgeInsets.all(8.0),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                 child: _isMobile
                     ? Row(
                         mainAxisAlignment: MainAxisAlignment.end,
                         children: [
                           IconButton(
-                            tooltip: 'Обновить',
+                            tooltip: 'Refresh',
                             onPressed: () => _refreshSubscription(subscription),
                             icon: const Icon(Icons.refresh),
                           ),
                           IconButton(
-                            tooltip: 'Удалить',
+                            tooltip: 'Delete',
                             onPressed: () => _deleteSubscription(subscription),
                             icon: const Icon(Icons.delete),
                             color: Colors.redAccent,
@@ -323,17 +338,28 @@ class _ProfileListViewState extends State<ProfileListView> {
                     : Row(
                         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                         children: [
-                          ElevatedButton.icon(
+                          OutlinedButton.icon(
                             onPressed: () => _refreshSubscription(subscription),
                             icon: const Icon(Icons.refresh, size: 18),
-                            label: const Text('Обновить'),
+                            label: const Text('Refresh'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              side: BorderSide(
+                                color: Colors.white.withOpacity(0.18),
+                              ),
+                              backgroundColor: _surfaceColor,
+                            ),
                           ),
-                          ElevatedButton.icon(
+                          OutlinedButton.icon(
                             onPressed: () => _deleteSubscription(subscription),
                             icon: const Icon(Icons.delete, size: 18),
-                            label: const Text('Удалить'),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.red[400],
+                            label: const Text('Delete'),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white,
+                              side: BorderSide(
+                                color: Colors.redAccent.withOpacity(0.6),
+                              ),
+                              backgroundColor: Colors.redAccent.withOpacity(0.2),
                             ),
                           ),
                         ],
@@ -353,27 +379,25 @@ class _ProfileListViewState extends State<ProfileListView> {
       final isSelected = widget.selectedProfile?.uri == vlessUri;
 
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
         child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          margin: const EdgeInsets.symmetric(vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? scheme.primary.withOpacity(0.12) : null,
+            color: isSelected ? _surfaceColor : null,
             border: Border.all(
-              color: isSelected ? scheme.primary : Colors.transparent,
+              color:
+                  isSelected ? Colors.white.withOpacity(0.18) : Colors.transparent,
               width: isSelected ? 1 : 0,
             ),
           ),
           child: ListTile(
             dense: true,
-            contentPadding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+            contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
             leading: CircleAvatar(
               radius: 16,
-              backgroundColor: scheme.primary.withOpacity(0.15),
-              child: Text(
-                '🌐',
-                style: TextStyle(fontSize: 14, color: scheme.primary),
-              ),
+              backgroundColor: _surfaceColor,
+              child: const Icon(Icons.public, size: 16, color: Colors.white70),
             ),
             title: Text(
               _formatVlessSummary(vlessUri),
@@ -381,7 +405,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 13,
-                color: isSelected ? scheme.primary : Colors.white,
+                color: Colors.white,
                 fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
               ),
             ),

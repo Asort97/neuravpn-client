@@ -29,6 +29,10 @@ class DpiEvasionWidget extends StatefulWidget {
 
 class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
   bool _busy = false;
+  static const Color _cardColor = Color(0xFF1A1A1A);
+  static const Color _surfaceColor = Color(0xFF2A2A2A);
+  static const Color _borderColor = Color(0x14FFFFFF);
+  static const Color _accentColor = Color(0xFFEF4444);
 
   bool get _isAggressive =>
       widget.config.profile == DpiEvasionProfile.aggressive;
@@ -67,17 +71,17 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
     final isSupported = Platform.isWindows;
     final disabled = !isSupported || !widget.enabled;
     final subtitle = disabled
-        ? 'Доступно только на Windows'
-        : 'Фрагментация + TTL phantom для первых пакетов.';
+        ? '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u043d\u0430 Windows'
+        : '\u0414\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442 \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044e \u0438 TTL phantom \u0434\u043b\u044f \u043e\u0431\u0445\u043e\u0434\u0430 DPI.';
 
     return Column(
       children: [
-        Card(
-          elevation: 0,
-          color: Theme.of(context)
-              .colorScheme
-              .surfaceContainerHighest
-              .withOpacity(0.25),
+        Container(
+          decoration: BoxDecoration(
+            color: _cardColor,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: _borderColor),
+          ),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             child: Row(
@@ -87,7 +91,7 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'Агрессивная Маскировка',
+                        '\u0410\u0433\u0440\u0435\u0441\u0441\u0438\u0432\u043d\u0430\u044f \u043c\u0430\u0441\u043a\u0438\u0440\u043e\u0432\u043a\u0430',
                         style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
                       ),
                       const SizedBox(height: 4),
@@ -103,6 +107,8 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
                 ),
                 Switch.adaptive(
                   value: _isAggressive,
+                  activeColor: _accentColor,
+                  inactiveTrackColor: _surfaceColor,
                   onChanged: disabled ? null : _onToggle,
                 ),
                 if (_busy)
@@ -119,12 +125,12 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
           ),
         ),
         const SizedBox(height: 12),
-        Card(
-          elevation: 0,
-          color: Theme.of(context)
-              .colorScheme
-              .surfaceContainerHighest
-              .withOpacity(0.25),
+        Container(
+          decoration: BoxDecoration(
+            color: _cardColor,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: _borderColor),
+          ),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             child: Row(
@@ -134,14 +140,14 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'Фрагментация Пакетов',
+                        '\u0424\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044f TLS',
                         style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
                       ),
                       const SizedBox(height: 4),
                       Text(
                         disabled
-                            ? 'Доступно только на Windows'
-                            : 'Разбивает TLS hello на маленькие куски для обхода DPI',
+                            ? '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u043d\u0430 Windows'
+                            : '\u0420\u0430\u0437\u0431\u0438\u0432\u0430\u0435\u0442 TLS hello \u0434\u043b\u044f \u0441\u043d\u0438\u0436\u0435\u043d\u0438\u044f DPI-\u0431\u043b\u043e\u043a\u0438\u0440\u043e\u0432\u043e\u043a.',
                         style: Theme.of(context)
                             .textTheme
                             .bodySmall
@@ -152,6 +158,8 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
                 ),
                 Switch.adaptive(
                   value: _isFragmentationEnabled,
+                  activeColor: _accentColor,
+                  inactiveTrackColor: _surfaceColor,
                   onChanged: disabled ? null : _onFragmentationToggle,
                 ),
               ],

@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:ui';
 import 'package:device_apps/device_apps.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
@@ -28,6 +30,8 @@ import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
 import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
+import 'widgets/neural_background.dart';
+import 'widgets/loading_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -35,12 +39,14 @@ Future<void> main() async {
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
     final windowOptions = WindowOptions(
-      size: Platform.isWindows ? Size(480, 860) : Size(1100, 760),
-      minimumSize: Platform.isWindows ? Size(360, 640) : Size(900, 640),
+      size: Platform.isWindows ? Size(420, 720) : Size(1100, 760),
+      minimumSize: Platform.isWindows ? Size(320, 560) : Size(900, 640),
       center: true,
       backgroundColor: Colors.transparent,
-      titleBarStyle: TitleBarStyle.normal,
-      title: 'VLESS VPN Client',
+      titleBarStyle: Platform.isWindows
+          ? TitleBarStyle.hidden
+          : TitleBarStyle.normal,
+      title: 'neuravpn',
     );
     windowManager.waitUntilReadyToShow(windowOptions, () async {
       await windowManager.show();
@@ -60,7 +66,7 @@ class VpnApp extends StatelessWidget {
       brightness: Brightness.dark,
     );
     return MaterialApp(
-      title: 'VLESS VPN Client',
+      title: 'neuravpn',
       theme: ThemeData(
         colorScheme: colorScheme,
         scaffoldBackgroundColor: const Color(0xFF050608),
@@ -76,6 +82,8 @@ class VpnApp extends StatelessWidget {
   }
 }
 
+enum _WindowsView { connection, splitTunneling, settings }
+
 class VlessHomePage extends StatefulWidget {
   const VlessHomePage({super.key});
 
@@ -87,6 +95,12 @@ class _VlessHomePageState extends State<VlessHomePage>
     with TrayListener, WindowListener, SingleTickerProviderStateMixin {
   final TextEditingController _controller = TextEditingController();
   String _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+  _WindowsView _windowsView = _WindowsView.connection;
+  bool _showLoadingScreen = Platform.isWindows;
+  static const Color _neuraBlack = Color(0xFF0A0A0A);
+  static const Color _neuraCardColor = Color(0xFF1A1A1A);
+  static const Color _neuraSurface = Color(0xFF2A2A2A);
+  static const Color _neuraRed = Color(0xFFEF4444);
   final Map<String, SplitTunnelConfig> _splitConfigs = {
     'all': SplitTunnelConfig(mode: 'all'),
     'whitelist': SplitTunnelConfig(mode: 'whitelist'),
@@ -100,12 +114,18 @@ class _VlessHomePageState extends State<VlessHomePage>
   VpnProfile? _selectedProfile;
   final SingBoxController _singBoxController = SingBoxController();
   final ScrollController _logScrollController = ScrollController();
+  Timer? _logFlushTimer;
+  final List<String> _pendingLogLines = <String>[];
+  bool _trafficFetchInProgress = false;
+  final List<double> _trafficHistory = <double>[];
+  StreamSubscription<int>? _trafficSub;
   final TrayManager _trayManager = TrayManager.instance;
   bool _trayInitialized = false;
   bool _isExitingApp = false;
   bool _isConnecting = false;
   bool _hasSubscriptions = false;
   late final AnimationController _connectGlowController;
+  late final Animation<double> _connectGlowAnimation;
   bool _androidAppsLoaded = false;
   bool _androidAppsLoading = false;
   String? _androidAppLoadError;
@@ -177,14 +197,24 @@ class _VlessHomePageState extends State<VlessHomePage>
     super.initState();
     _connectGlowController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 3),
-    )..repeat();
+      duration: const Duration(milliseconds: 1800),
+    );
+    _connectGlowAnimation = CurvedAnimation(
+      parent: _connectGlowController,
+      curve: Curves.easeInOutCubic,
+    );
+    _updateConnectGlowTicker();
     _loadInitialData();
     _checkWintun();
     if (_isDesktopPlatform) {
       windowManager.addListener(this);
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
+      if (Platform.isWindows) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          unawaited(_fitWindowToDisplay());
+        });
+      }
     }
     if (Platform.isAndroid) {
       unawaited(_loadAndroidApps());
@@ -331,6 +361,51 @@ class _VlessHomePageState extends State<VlessHomePage>
     );
   }
 
+  void _dismissLoadingScreen() {
+    if (!_showLoadingScreen) return;
+    if (!mounted) return;
+    setState(() => _showLoadingScreen = false);
+  }
+
+  void _updateConnectGlowTicker() {
+    final shouldAnimate = _isConnecting || _isRunning;
+    if (shouldAnimate) {
+      if (!_connectGlowController.isAnimating) {
+        _connectGlowController.repeat();
+      }
+    } else {
+      if (_connectGlowController.isAnimating) {
+        _connectGlowController.stop();
+      }
+      _connectGlowController.value = 0;
+    }
+  }
+
+  void _startTrafficMonitor() {
+    if (_trafficSub != null) return;
+    if (_trafficHistory.isEmpty) {
+      _trafficHistory.addAll(List<double>.filled(20, 0));
+    }
+    unawaited(_singBoxController.startTrafficStream());
+    _trafficSub = _singBoxController.trafficStream.listen((sample) {
+      if (!mounted) return;
+      setState(() {
+        _trafficHistory.add(sample.toDouble());
+        if (_trafficHistory.length > 80) {
+          _trafficHistory.removeAt(0);
+        }
+      });
+    });
+  }
+
+  void _stopTrafficMonitor() {
+    _trafficSub?.cancel();
+    _trafficSub = null;
+    _trafficFetchInProgress = false;
+    _trafficHistory.clear();
+    unawaited(_singBoxController.stopTrafficStream());
+  }
+
   bool get _isRunning => _singBoxController.isRunning;
 
 
@@ -364,7 +439,11 @@ class _VlessHomePageState extends State<VlessHomePage>
       }
     }
 
-    if (profiles.isEmpty) {
+    final repository = SubscriptionRepository();
+    final subscriptions = await repository.getAllSubscriptions();
+    _hasSubscriptions = subscriptions.isNotEmpty;
+
+    if (profiles.isEmpty && subscriptions.isEmpty) {
       final legacyUri = prefs.getString('vless_uri');
       if (legacyUri != null && legacyUri.isNotEmpty) {
         profiles = [VpnProfile(name: 'Profile 1', uri: legacyUri)];
@@ -383,9 +462,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
     selected ??= profiles.isNotEmpty ? profiles.first : null;
 
-    final repository = SubscriptionRepository();
-    final subscriptions = await repository.getAllSubscriptions();
-    _hasSubscriptions = subscriptions.isNotEmpty;
     final storedHasKey = prefs.getBool(_hasEverAddedKeyKey) ?? false;
     _hasEverAddedKey = storedHasKey || profiles.isNotEmpty || subscriptions.isNotEmpty;
     if (_hasEverAddedKey && !storedHasKey) {
@@ -624,6 +700,12 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _persistSplitState();
   }
 
+  Future<void> _setSmartRouting(bool enabled) async {
+    if (_smartRouting == enabled) return;
+    setState(() => _smartRouting = enabled);
+    await _persistSplitState();
+  }
+
   Future<int?> _measurePing(String host, int port) async {
     const attempts = 4;
     final results = <int>[];
@@ -688,6 +770,21 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (!_isDesktopPlatform) return;
     await windowManager.setPreventClose(true);
     await _setupTrayIcon();
+  }
+
+  Future<void> _fitWindowToDisplay() async {
+    const targetWidth = 420.0;
+    const targetHeight = 720.0;
+    final current = await windowManager.getSize();
+    final nextWidth = current.width > targetWidth ? targetWidth : current.width;
+    final nextHeight =
+        current.height > targetHeight ? targetHeight : current.height;
+    await windowManager.setSize(Size(nextWidth, nextHeight));
+    await windowManager.center();
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.hidden,
+      windowButtonVisibility: false,
+    );
   }
 
   Future<void> _setupTrayIcon() async {
@@ -1158,6 +1255,8 @@ class _VlessHomePageState extends State<VlessHomePage>
       _isConnecting = true;
       _logLines.clear();
     });
+    _updateConnectGlowTicker();
+    _startTrafficMonitor();
 
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
@@ -1178,6 +1277,8 @@ class _VlessHomePageState extends State<VlessHomePage>
         _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
         _isConnecting = false;
       });
+      _updateConnectGlowTicker();
+      _stopTrafficMonitor();
       return;
     }
 
@@ -1187,6 +1288,8 @@ class _VlessHomePageState extends State<VlessHomePage>
       _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
       _isConnecting = false;
     });
+    _updateConnectGlowTicker();
+    _startTrafficMonitor();
     unawaited(_applyDpiEvasionInjector());
     unawaited(_refreshMetrics(silent: true));
   }
@@ -1206,6 +1309,8 @@ class _VlessHomePageState extends State<VlessHomePage>
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
       _isConnecting = false;
     });
+    _updateConnectGlowTicker();
+    _stopTrafficMonitor();
   }
 
   Future<void> _applyDpiEvasionInjector() async {
@@ -1236,16 +1341,22 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   void _appendLogs(Iterable<String> entries) {
-    if (!mounted) return;
     final iterable = entries.where((e) => e.trim().isNotEmpty).toList();
     if (iterable.isEmpty) return;
-    setState(() {
-      for (final line in iterable) {
-        _logLines.add(line);
-        if (_logLines.length > 200) {
-          _logLines.removeAt(0);
+    _pendingLogLines.addAll(iterable);
+    _logFlushTimer ??= Timer(const Duration(milliseconds: 200), () {
+      _logFlushTimer = null;
+      if (!mounted) return;
+      if (_pendingLogLines.isEmpty) return;
+      setState(() {
+        for (final line in _pendingLogLines) {
+          _logLines.add(line);
+          if (_logLines.length > 200) {
+            _logLines.removeAt(0);
+          }
         }
-      }
+        _pendingLogLines.clear();
+      });
     });
   }
 
@@ -1285,6 +1396,8 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   @override
   void dispose() {
+    _logFlushTimer?.cancel();
+    _stopTrafficMonitor();
     _connectGlowController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
@@ -1301,10 +1414,13 @@ class _VlessHomePageState extends State<VlessHomePage>
   @override
   Widget build(BuildContext context) {
     final hasConnectable = _profiles.isNotEmpty || _hasSubscriptions;
+    if (Platform.isWindows) {
+      return _buildWindowsShell(hasConnectable);
+    }
     if (!hasConnectable) {
       return Scaffold(
         appBar: AppBar(
-          title: const Text('VLESS VPN Client'),
+          title: const Text('neuravpn'),
         ),
         body: _buildEmptyState(),
       );
@@ -1314,7 +1430,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       length: 3,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('VLESS VPN Client'),
+          title: const Text('neuravpn'),
           bottom: TabBar(
             isScrollable: true,
             tabs: const [
@@ -1368,6 +1484,1296 @@ class _VlessHomePageState extends State<VlessHomePage>
             ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildWindowsShell(bool hasConnectable) {
+    if (_showLoadingScreen) {
+      return _buildWindowsLoadingShell();
+    }
+    return Scaffold(
+      backgroundColor: _neuraBlack,
+      body: Stack(
+        children: [
+          const Positioned.fill(
+            child: ColoredBox(color: _neuraBlack),
+          ),
+          if (!kReleaseMode)
+            const Positioned.fill(child: NeuralBackground())
+          else
+            const Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFF0A0A0A),
+                      Color(0xFF141018),
+                      Color(0xFF0A0A0A),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          SafeArea(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                return Align(
+                  alignment: Alignment.topCenter,
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 640),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Stack(
+                          children: [
+                            DragToMoveArea(
+                              child: SizedBox(
+                                width: double.infinity,
+                                height: 56,
+                                child: const ColoredBox(
+                                  color: Colors.transparent,
+                                ),
+                              ),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+                              child: _buildWindowsTitleBar(),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        if (hasConnectable)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 24),
+                            child: _buildWindowsTabs(),
+                          ),
+                        const SizedBox(height: 12),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                if (!hasConnectable)
+                                  _buildWindowsEmptyState()
+                                else ...[
+                                  const SizedBox(height: 8),
+                                  _buildWindowsContent(),
+                                  const SizedBox(height: 20),
+                                  _buildWindowsFooter(),
+                                ],
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          Positioned.fill(
+            child: IgnorePointer(
+              ignoring: !_showLoadingScreen,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 400),
+                child: _showLoadingScreen
+                    ? LoadingScreen(
+                        key: const ValueKey('loading'),
+                        onComplete: _dismissLoadingScreen,
+                      )
+                    : const SizedBox.shrink(key: ValueKey('loading-empty')),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsLoadingShell() {
+    return Scaffold(
+      backgroundColor: _neuraBlack,
+      body: Stack(
+        children: [
+          const Positioned.fill(
+            child: ColoredBox(color: _neuraBlack),
+          ),
+          if (!kReleaseMode)
+            const Positioned.fill(child: NeuralBackground())
+          else
+            const Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFF0A0A0A),
+                      Color(0xFF141018),
+                      Color(0xFF0A0A0A),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          const Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            height: 56,
+            child: DragToMoveArea(
+              child: ColoredBox(color: Colors.transparent),
+            ),
+          ),
+          LoadingScreen(
+            key: const ValueKey('loading'),
+            onComplete: _dismissLoadingScreen,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsTitleBar() {
+    return Row(
+      children: [
+        Expanded(
+          child: DragToMoveArea(
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 32,
+                  height: 32,
+                  child: Image.asset(
+                    'assets/images/11zon_cropped.png',
+                    width: 32,
+                    height: 32,
+                    fit: BoxFit.contain,
+                    filterQuality: FilterQuality.high,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                const Text(
+                  'neuravpn',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        Row(
+          children: [
+            _buildWindowButton(
+              icon: Icons.settings,
+              onPressed: () => _setWindowsView(_WindowsView.settings),
+            ),
+            _buildWindowButton(
+              icon: Icons.remove,
+              onPressed: () => windowManager.minimize(),
+            ),
+            _buildWindowButton(
+              icon: Icons.close,
+              hoverColor: _neuraRed.withOpacity(0.2),
+              onPressed: _handleTrayExit,
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWindowButton({
+    required IconData icon,
+    required VoidCallback onPressed,
+    Color? hoverColor,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 6),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          onTap: onPressed,
+          hoverColor: hoverColor ?? Colors.white.withOpacity(0.05),
+          child: SizedBox(
+            width: 32,
+            height: 32,
+            child: Icon(icon, size: 16, color: Colors.white70),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _setWindowsView(_WindowsView view) {
+    if (_windowsView == view) return;
+    setState(() => _windowsView = view);
+  }
+
+  Widget _buildWindowsTabs() {
+    return Row(
+      children: [
+        _buildWindowsTabButton('Connection', _WindowsView.connection),
+        const SizedBox(width: 10),
+        _buildWindowsTabButton('Split Tunneling', _WindowsView.splitTunneling),
+        const SizedBox(width: 10),
+        _buildWindowsTabButton('Settings', _WindowsView.settings),
+      ],
+    );
+  }
+
+  Widget _buildWindowsTabButton(String label, _WindowsView view) {
+    final isActive = _windowsView == view;
+    return Expanded(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOutCubic,
+        decoration: BoxDecoration(
+          color: isActive ? _neuraRed : _neuraCardColor,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: isActive ? _neuraRed : Colors.white.withOpacity(0.08),
+          ),
+        ),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(14),
+            onTap: () => _setWindowsView(view),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Text(
+                label,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: isActive ? Colors.white : Colors.white70,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWindowsContent() {
+    Widget child;
+    switch (_windowsView) {
+      case _WindowsView.connection:
+        child = _buildWindowsConnectionView();
+      case _WindowsView.splitTunneling:
+        child = _buildWindowsSplitView();
+      case _WindowsView.settings:
+        child = _buildWindowsSettingsView();
+    }
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 240),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) {
+        final slide = Tween<Offset>(
+          begin: const Offset(0, 0.04),
+          end: Offset.zero,
+        ).animate(
+          CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+          ),
+        );
+        return FadeTransition(
+          opacity: animation,
+          child: SlideTransition(position: slide, child: child),
+        );
+      },
+      child: KeyedSubtree(
+        key: ValueKey(_windowsView),
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildWindowsConnectionView() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildWindowsConnectionModule(),
+        const SizedBox(height: 16),
+        _buildWindowsProfilesModule(),
+        const SizedBox(height: 16),
+        _buildWindowsSmartRoutingModule(),
+        const SizedBox(height: 16),
+        _buildWindowsServerLocation(),
+      ],
+    );
+  }
+
+  Widget _buildWindowsSplitView() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _buildWindowsSplitModule(),
+        const SizedBox(height: 16),
+        _neuraCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: const [
+              Text(
+                'About Split Tunneling',
+                style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white70,
+                ),
+              ),
+              SizedBox(height: 8),
+              Text(
+                'Split tunneling allows you to route specific domains or apps through the VPN while other traffic bypasses it.',
+                style: TextStyle(color: Colors.white54, height: 1.4),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWindowsSettingsView() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _neuraCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: _neuraSurface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: const Icon(
+                      Icons.tune,
+                      color: _neuraRed,
+                      size: 18,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Advanced Settings',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  if (_generatedConfig != null)
+                    TextButton.icon(
+                      onPressed: () => _showConfigDialog(context),
+                      icon: const Icon(Icons.receipt_long, size: 18),
+                      label: const Text('Show config'),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              DpiEvasionWidget(
+                manager: _dpiEvasionManager,
+                config: _dpiEvasionConfig,
+                serverHost: _currentLink?.host,
+                serverPort: _currentLink?.port,
+                onConfigChanged: _updateDpiConfig,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        _buildWindowsLogPanel(),
+      ],
+    );
+  }
+
+  Widget _buildWindowsFooter() {
+    return const Center(
+      child: Text(
+        'neuravpn • Intelligent Protection',
+        style: TextStyle(color: Colors.white38, fontSize: 11),
+      ),
+    );
+  }
+
+  Widget _buildWindowsEmptyState() {
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'Add your first connection',
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: _showProfileDialog,
+            child: const Text('Enter key'),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: _pasteProfileFromClipboard,
+            child: const Text('Paste from clipboard'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _neuraCard({
+    required Widget child,
+    EdgeInsets padding = const EdgeInsets.all(20),
+    bool repaintBoundary = true,
+  }) {
+    final card = Container(
+      decoration: BoxDecoration(
+        color: _neuraCardColor,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      padding: padding,
+      child: child,
+    );
+    if (!repaintBoundary) {
+      return card;
+    }
+    return RepaintBoundary(child: card);
+  }
+
+  Widget _buildWindowsConnectionModule() {
+    final isRunning = _isRunning;
+    final isEnabled =
+        _selectedProfile != null || _controller.text.trim().isNotEmpty;
+    final statusColor = isRunning
+        ? _neuraRed
+        : _isConnecting
+        ? const Color(0xFFFBBF24)
+        : const Color(0xFF6B7280);
+    final statusText = isRunning
+        ? 'Protected'
+        : _isConnecting
+        ? 'Connecting...'
+        : 'Unprotected';
+    final statusHint = isRunning
+        ? 'Your connection is secure'
+        : _isConnecting
+        ? 'Establishing secure connection'
+        : 'Click to activate protection';
+    final pingLabel = _pingInProgress
+        ? '...'
+        : (_pingMs != null ? '$_pingMs ms' : '--');
+    final link = _currentLink;
+    final protocolLabel =
+        link == null ? 'VLESS' : 'VLESS / ${(link.type ?? 'tcp').toUpperCase()}';
+    final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
+
+    return _neuraCard(
+      child: Stack(
+        children: [
+          if (isRunning)
+            Positioned.fill(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: Stack(
+                  children: [
+                    CustomPaint(
+                      painter: _TrafficGraphPainter(
+                        samples: List<double>.from(_trafficHistory),
+                      ),
+                      child: const SizedBox.expand(),
+                    ),
+                    BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+                      child: Container(
+                        color: Colors.white.withOpacity(0.02),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_isConnecting)
+            Positioned.fill(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: BackdropFilter(
+                  filter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+                  child: CustomPaint(
+                    painter: _ConnectionWavePainter(
+                      progress: _connectGlowAnimation.value,
+                      color: _neuraRed,
+                    ),
+                    child: Container(
+                      color: Colors.white.withOpacity(0.02),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: statusColor,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        if (isRunning)
+                          BoxShadow(
+                            color: _neuraRed.withOpacity(0.6),
+                            blurRadius: 12,
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      statusText,
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                  if (isRunning)
+                    IconButton(
+                      icon: const Icon(Icons.refresh, size: 18),
+                      color: Colors.white54,
+                      onPressed: canRefreshMetrics ? _refreshMetrics : null,
+                    ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              Center(
+                child: GestureDetector(
+                  onTap: isRunning ? _stop : (isEnabled ? _start : null),
+                  child: AnimatedBuilder(
+                    animation: _connectGlowAnimation,
+                    builder: (context, child) {
+                      final rotation = _connectGlowAnimation.value * 2 * math.pi;
+                      final pulse = _isConnecting
+                          ? 1 + 0.04 * math.sin(rotation)
+                          : 1.0;
+                      final ring = Container(
+                        width: 140,
+                        height: 140,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: statusColor,
+                            width: 2,
+                          ),
+                        ),
+                      );
+                      return Opacity(
+                        opacity: isEnabled || isRunning ? 1 : 0.5,
+                        child: Transform.scale(
+                          scale: pulse,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              if (_isConnecting)
+                                Transform.rotate(angle: rotation, child: ring)
+                              else
+                                ring,
+                              if (isRunning)
+                                Container(
+                                  width: 140,
+                                  height: 140,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: RadialGradient(
+                                      colors: [
+                                        _neuraRed.withOpacity(0.25),
+                                        Colors.transparent,
+                                      ],
+                                      stops: const [0.0, 0.7],
+                                    ),
+                                  ),
+                                ),
+                              Container(
+                                width: 104,
+                                height: 104,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: isRunning ? _neuraRed : _neuraSurface,
+                                ),
+                                child: Center(
+                                  child: Image.asset(
+                                    'assets/images/logo.png',
+                                    width: 48,
+                                    height: 48,
+                                    color: Colors.white,
+                                    filterQuality: FilterQuality.high,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                statusHint,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white54),
+              ),
+              if (isRunning) ...[
+                const SizedBox(height: 20),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _neuraCard(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: const [
+                                Icon(Icons.bolt, size: 16, color: _neuraRed),
+                                SizedBox(width: 6),
+                                Text(
+                                  'Latency',
+                                  style: TextStyle(color: Colors.white54),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              pingLabel,
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: _neuraCard(
+                        padding: const EdgeInsets.all(14),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: const [
+                                Icon(
+                                  Icons.shield_outlined,
+                                  size: 16,
+                                  color: _neuraRed,
+                                ),
+                                SizedBox(width: 6),
+                                Text(
+                                  'Protocol',
+                                  style: TextStyle(color: Colors.white54),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              protocolLabel,
+                              style: const TextStyle(color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsProfilesModule() {
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: _neuraSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                ),
+                child: const Icon(Icons.person_outline, color: _neuraRed),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Connection Profiles',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              IconButton(
+                onPressed: _showProfileDialog,
+                icon: const Icon(Icons.add, color: Colors.white70),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 320,
+            child: ProfileListView(
+              profiles: _profiles,
+              selectedProfile: _selectedProfile,
+              subscriptionsRefreshToken: _subscriptionsRefreshToken,
+              onSubscriptionsChanged: (hasSubs) {
+                if (!mounted) return;
+                setState(() => _hasSubscriptions = hasSubs);
+              },
+              onProfileSelected: (profile) {
+                if (!_isRunning) {
+                  _selectCurrentProfile(profile);
+                }
+              },
+              onDeleteProfile: (profile) {
+                _removeProfileByName(profile.name);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsSmartRoutingModule() {
+    final routesCount = _smartRouteEngine.exportLegacyRuleEntries().length;
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: _neuraSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                ),
+                child: const Icon(Icons.psychology, color: _neuraRed),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Smart Routing',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              Switch.adaptive(
+                value: _smartRouting,
+                activeColor: _neuraRed,
+                onChanged: (value) => _setSmartRouting(value),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Level 3',
+            style: TextStyle(color: Colors.white.withOpacity(0.5)),
+          ),
+          const SizedBox(height: 12),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final isNarrow = constraints.maxWidth < 360;
+              final cards = [
+                _neuraCard(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: const [
+                          Icon(Icons.trending_up, size: 16, color: _neuraRed),
+                          SizedBox(width: 6),
+                          Text(
+                            'Optimization',
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        _smartRouting ? 'Active' : 'Disabled',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ],
+                  ),
+                ),
+                _neuraCard(
+                  padding: const EdgeInsets.all(14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: const [
+                          Icon(Icons.graphic_eq, size: 16, color: _neuraRed),
+                          SizedBox(width: 6),
+                          Text(
+                            'Routes',
+                            style: TextStyle(color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '$routesCount nodes',
+                        style: const TextStyle(color: Colors.white),
+                      ),
+                    ],
+                  ),
+                ),
+              ];
+              if (isNarrow) {
+                return Column(
+                  children: [
+                    cards[0],
+                    const SizedBox(height: 12),
+                    cards[1],
+                  ],
+                );
+              }
+              return Row(
+                children: [
+                  Expanded(child: cards[0]),
+                  const SizedBox(width: 12),
+                  Expanded(child: cards[1]),
+                ],
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsServerLocation() {
+    final link = _currentLink;
+    final serverLabel =
+        link == null ? 'Optimal • Auto-select' : '${link.host}:${link.port}';
+    return _neuraCard(
+      padding: const EdgeInsets.all(16),
+      child: Row(
+        children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: _neuraSurface,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.white.withOpacity(0.08)),
+            ),
+            child: const Icon(Icons.place_outlined, color: _neuraRed),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Server Location',
+                  style: TextStyle(color: Colors.white.withOpacity(0.6)),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  serverLabel,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ],
+            ),
+          ),
+          const Icon(Icons.chevron_right, color: Colors.white38),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsSplitModule() {
+    final activeDomains = _activeSplitConfig.domains;
+    final activeApps = _activeSplitConfig.applications;
+    final theme = Theme.of(context);
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: _neuraSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                ),
+                child: const Icon(Icons.call_split, color: _neuraRed),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Split Tunneling',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              Switch.adaptive(
+                value: _splitEnabled,
+                activeColor: _neuraRed,
+                onChanged: (value) => _setSplitEnabled(value),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Route traffic by domain or app',
+            style: TextStyle(color: Colors.white.withOpacity(0.5)),
+          ),
+          const SizedBox(height: 16),
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            child: _splitEnabled
+                ? Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Split Preset',
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: Colors.white70,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButtonFormField<String>(
+                        initialValue: _hasActivePreset
+                            ? _activePresetName
+                            : _noPresetValue,
+                        dropdownColor: _neuraCardColor,
+                        style: const TextStyle(color: Colors.white),
+                        iconEnabledColor: Colors.white70,
+                        decoration: InputDecoration(
+                          filled: true,
+                          fillColor: _neuraSurface,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide(
+                              color: Colors.white.withOpacity(0.1),
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide(
+                              color: Colors.white.withOpacity(0.12),
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide(
+                              color: _neuraRed.withOpacity(0.7),
+                            ),
+                          ),
+                        ),
+                        items: [
+                          DropdownMenuItem(
+                            value: _noPresetValue,
+                            child: Text(_presetDirty ? 'Custom *' : 'Custom'),
+                          ),
+                          ..._splitPresets.map(
+                            (p) => DropdownMenuItem(
+                              value: p.name,
+                              child: Text(p.name),
+                            ),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          _handlePresetSelection(value);
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      _buildWindowsPresetActionsBar(),
+                      const SizedBox(height: 16),
+                      _buildSplitEntrySection(
+                        title: 'Configurations',
+                        icon: Icons.public,
+                        items: activeDomains,
+                        emptyLabel: 'No domains added yet.',
+                        onAdd: () => _promptAddEntry(
+                          title: 'Add domain',
+                          hint: 'example.com',
+                          onSubmit: _addDomainEntry,
+                        ),
+                        onRemove: _removeDomainEntry,
+                      ),
+                      const SizedBox(height: 16),
+                      _buildSplitEntrySection(
+                        title: 'Applications',
+                        icon: Icons.apps_outlined,
+                        items: activeApps,
+                        emptyLabel: 'No apps added yet.',
+                        onAdd: () => _promptAddEntry(
+                          title: 'Add application',
+                          hint: 'C:/Program Files/App/app.exe',
+                          onSubmit: _addApplication,
+                        ),
+                        onRemove: _removeApplication,
+                      ),
+                    ],
+                  )
+                : const SizedBox.shrink(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsPresetActionsBar() {
+    SplitTunnelPreset? activePreset;
+    if (_activePresetName != null) {
+      for (final preset in _splitPresets) {
+        if (preset.name == _activePresetName) {
+          activePreset = preset;
+          break;
+        }
+      }
+    }
+
+    final buttons = <Widget>[];
+    if (activePreset != null) {
+      buttons.add(
+        FilledButton(
+          onPressed: _presetDirty ? _overwriteActivePreset : null,
+          style: FilledButton.styleFrom(
+            backgroundColor: _neuraRed,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+          child: const Text('Update preset'),
+        ),
+      );
+      buttons.add(
+        OutlinedButton(
+          onPressed: () => _confirmDeletePreset(activePreset!),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: Colors.white70,
+            side: BorderSide(color: Colors.white.withOpacity(0.2)),
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+          child: const Text('Delete'),
+        ),
+      );
+    } else {
+      buttons.add(
+        FilledButton(
+          onPressed: _promptSavePreset,
+          style: FilledButton.styleFrom(
+            backgroundColor: _neuraRed,
+            foregroundColor: Colors.white,
+            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+          child: const Text('Save preset'),
+        ),
+      );
+    }
+
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: buttons,
+    );
+  }
+
+  Widget _buildSplitEntrySection({
+    required String title,
+    required IconData icon,
+    required List<String> items,
+    required String emptyLabel,
+    required Future<void> Function() onAdd,
+    required void Function(String value) onRemove,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Text(
+              title,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const Spacer(),
+            IconButton(
+              onPressed: onAdd,
+              icon: const Icon(Icons.add, color: Colors.white54),
+              tooltip: 'Add',
+            ),
+          ],
+        ),
+        if (items.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6),
+            child: Text(
+              emptyLabel,
+              style: const TextStyle(color: Colors.white38),
+            ),
+          )
+        else
+          Column(
+            children: items.map((entry) {
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                decoration: BoxDecoration(
+                  color: _neuraSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: _neuraRed.withOpacity(0.25)),
+                ),
+                child: Row(
+                  children: [
+                    Icon(icon, size: 16, color: _neuraRed),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        entry,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: () => onRemove(entry),
+                      icon: const Icon(Icons.delete, size: 16),
+                      color: _neuraRed,
+                      tooltip: 'Remove',
+                    ),
+                  ],
+                ),
+              );
+            }).toList(),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildWindowsLogPanel() {
+    final logText = _logLines.isEmpty
+        ? 'No log entries yet. Start the VPN to see live events.'
+        : _logLines.join('\\n');
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.terminal_rounded, color: Colors.white70),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Logs',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Clear logs',
+                onPressed: _logLines.isEmpty
+                    ? null
+                    : () {
+                        setState(() => _logLines.clear());
+                      },
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            height: 220,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: _neuraSurface,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: Colors.white.withOpacity(0.06)),
+            ),
+            child: Scrollbar(
+              controller: _logScrollController,
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                controller: _logScrollController,
+                child: SelectableText(
+                  logText,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontFamily: 'monospace',
+                    color: Colors.white70,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -2782,5 +4188,142 @@ class _AndroidAppPickerSheetState extends State<_AndroidAppPickerSheet> {
         ),
       ),
     );
+  }
+}
+
+class _ConnectionWavePainter extends CustomPainter {
+  _ConnectionWavePainter({
+    required this.progress,
+    required this.color,
+  });
+
+  final double progress;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final basePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2
+      ..color = color.withOpacity(0.35);
+    final accentPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..color = color.withOpacity(0.6);
+    final dashedPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..color = color.withOpacity(0.18);
+
+    final midY = size.height * 0.42;
+    final topY = size.height * 0.22;
+    final bottomY = size.height * 0.62;
+
+    _drawWave(
+      canvas,
+      size,
+      midY,
+      progress * 2 * math.pi,
+      basePaint,
+    );
+    _drawWave(
+      canvas,
+      size,
+      topY,
+      progress * 2 * math.pi + 1.4,
+      dashedPaint,
+      dash: true,
+    );
+    _drawWave(
+      canvas,
+      size,
+      bottomY,
+      progress * 2 * math.pi + 2.2,
+      accentPaint,
+    );
+  }
+
+  void _drawWave(
+    Canvas canvas,
+    Size size,
+    double y,
+    double phase,
+    Paint paint, {
+    bool dash = false,
+  }) {
+    final path = Path();
+    final amplitude = size.height * 0.03;
+    for (double x = 0; x <= size.width; x += 4) {
+      final dy = math.sin((x / size.width * 2 * math.pi) + phase) * amplitude;
+      if (x == 0) {
+        path.moveTo(x, y + dy);
+      } else {
+        path.lineTo(x, y + dy);
+      }
+    }
+    if (!dash) {
+      canvas.drawPath(path, paint);
+      return;
+    }
+    final metrics = path.computeMetrics();
+    for (final metric in metrics) {
+      var distance = 0.0;
+      while (distance < metric.length) {
+        final next = math.min(distance + 12, metric.length);
+        canvas.drawPath(metric.extractPath(distance, next), paint);
+        distance = next + 8;
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ConnectionWavePainter oldDelegate) {
+    return oldDelegate.progress != progress || oldDelegate.color != color;
+  }
+}
+
+class _TrafficGraphPainter extends CustomPainter {
+  _TrafficGraphPainter({required this.samples});
+
+  final List<double> samples;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final baseline = size.height * 0.7;
+    final width = size.width - 24;
+    final startX = 12.0;
+    final spikePaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6
+      ..shader = LinearGradient(
+        colors: [
+          const Color(0xFF00E676).withOpacity(0.7),
+          const Color(0xFFFFD54F).withOpacity(0.9),
+        ],
+        begin: Alignment.bottomCenter,
+        end: Alignment.topCenter,
+      ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
+
+    if (samples.isEmpty) return;
+    final maxSample = samples.reduce(math.max);
+    final scale = maxSample <= 0 ? 0 : (size.height * 0.45) / maxSample;
+    final step = width / math.max(1, samples.length - 1);
+
+    final path = Path();
+    for (int i = 0; i < samples.length; i++) {
+      final x = startX + step * i;
+      final y = baseline - (samples[i] * scale);
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(path, spikePaint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TrafficGraphPainter oldDelegate) {
+    return oldDelegate.samples != samples;
   }
 }
