@@ -1928,26 +1928,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildWindowsSplitModule(),
-        const SizedBox(height: 16),
-        _neuraCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: const [
-              Text(
-                'О раздельном туннелировании',
-                style: TextStyle(
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white70,
-                ),
-              ),
-              SizedBox(height: 8),
-              Text(
-                'Раздельное туннелирование позволяет направлять выбранные домены или приложения через VPN, а остальной трафик пропускать напрямую.',
-                style: TextStyle(color: Colors.white54, height: 1.4),
-              ),
-            ],
-          ),
-        ),
       ],
     );
   }
@@ -2575,22 +2555,67 @@ class _VlessHomePageState extends State<VlessHomePage>
                 onPressed: () {
                   showDialog(
                     context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: const Text('Раздельное туннелирование'),
-                      content: const Text(
-                        'Эта функция позволяет выбрать, какие домены и приложения '
-                        'будут идти через VPN, а какие — мимо него.\n\n'
-                        'Белый список: только указанные домены/приложения идут через VPN, '
-                        'всё остальное — напрямую.\n\n'
-                        'Чёрный список: указанные домены/приложения идут напрямую, '
-                        'всё остальное — через VPN.',
+                    builder: (ctx) => Dialog(
+                      backgroundColor: Colors.transparent,
+                      insetPadding: const EdgeInsets.symmetric(
+                        horizontal: 28,
+                        vertical: 24,
                       ),
-                      actions: [
-                        TextButton(
-                          onPressed: () => Navigator.of(ctx).pop(),
-                          child: const Text('Понятно'),
+                      child: Container(
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: _neuraCardColor,
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.08),
+                          ),
                         ),
-                      ],
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Раздельное туннелирование',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              'Вы выбираете, что идёт через VPN, а что — напрямую.\n\n'
+                              'Белый список: через VPN идут только выбранные домены/приложения.\n'
+                              'Всё остальное — напрямую.\n\n'
+                              'Чёрный список: выбранные домены/приложения идут напрямую.\n'
+                              'Всё остальное — через VPN.',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.75),
+                                height: 1.35,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: FilledButton(
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: _neuraRed,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 18,
+                                    vertical: 10,
+                                  ),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                ),
+                                onPressed: () => Navigator.of(ctx).pop(),
+                                child: const Text('Понятно'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     ),
                   );
                 },
@@ -2661,6 +2686,44 @@ class _VlessHomePageState extends State<VlessHomePage>
                         onChanged: (value) {
                           if (value == null) return;
                           _handlePresetSelection(value);
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      Text(
+                        'Режим',
+                        style: theme.textTheme.labelMedium?.copyWith(
+                          color: Colors.white70,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(
+                            value: 'whitelist',
+                            label: Text('Белый список'),
+                          ),
+                          ButtonSegment(
+                            value: 'blacklist',
+                            label: Text('Чёрный список'),
+                          ),
+                        ],
+                        style: SegmentedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(
+                            vertical: 10,
+                            horizontal: 14,
+                          ),
+                          backgroundColor: _neuraSurface,
+                          selectedBackgroundColor: _neuraRed.withOpacity(0.22),
+                          foregroundColor: Colors.white70,
+                          selectedForegroundColor: Colors.white,
+                          side: BorderSide(color: Colors.white.withOpacity(0.18)),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        selected: {_splitMode},
+                        onSelectionChanged: (selection) {
+                          _changeSplitMode(selection.first);
                         },
                       ),
                       const SizedBox(height: 12),
