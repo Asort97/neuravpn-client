@@ -160,6 +160,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
+  bool _showPresetList = false;
   final Map<String, int> _profilePings = {};
   final List<String> _logLines = <String>[];
   int _profileNameCounter = 0;
@@ -2631,6 +2632,7 @@ class _VlessHomePageState extends State<VlessHomePage>
           AnimatedSize(
             duration: const Duration(milliseconds: 220),
             curve: Curves.easeOutCubic,
+            alignment: Alignment.topCenter,
             child: _splitEnabled
                 ? Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -2642,51 +2644,95 @@ class _VlessHomePageState extends State<VlessHomePage>
                         ),
                       ),
                       const SizedBox(height: 8),
-                      DropdownButtonFormField<String>(
-                        initialValue: _hasActivePreset
-                            ? _activePresetName
-                            : _noPresetValue,
-                        dropdownColor: _neuraCardColor,
-                        style: const TextStyle(color: Colors.white),
-                        iconEnabledColor: Colors.white70,
-                        decoration: InputDecoration(
-                          filled: true,
-                          fillColor: _neuraSurface,
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide(
-                              color: Colors.white.withOpacity(0.1),
-                            ),
+                      InkWell(
+                        borderRadius: BorderRadius.circular(14),
+                        onTap: () {
+                          setState(() => _showPresetList = !_showPresetList);
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 12,
                           ),
-                          enabledBorder: OutlineInputBorder(
+                          decoration: BoxDecoration(
+                            color: _neuraSurface,
                             borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide(
+                            border: Border.all(
                               color: Colors.white.withOpacity(0.12),
                             ),
                           ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide(
-                              color: _neuraRed.withOpacity(0.7),
-                            ),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  _activePresetLabel,
+                                  style: const TextStyle(color: Colors.white),
+                                ),
+                              ),
+                              Icon(
+                                _showPresetList
+                                    ? Icons.keyboard_arrow_up
+                                    : Icons.keyboard_arrow_down,
+                                color: Colors.white70,
+                              ),
+                            ],
                           ),
                         ),
-                        items: [
-                          DropdownMenuItem(
-                            value: _noPresetValue,
-                            child: Text(_presetDirty ? 'Свои *' : 'Свои'),
-                          ),
-                          ..._splitPresets.map(
-                            (p) => DropdownMenuItem(
-                              value: p.name,
-                              child: Text(p.name),
+                      ),
+                      AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 240),
+                        switchInCurve: Curves.easeOutCubic,
+                        switchOutCurve: Curves.easeInCubic,
+                        transitionBuilder: (child, animation) {
+                          final offsetAnimation = Tween<Offset>(
+                            begin: const Offset(0, -0.08),
+                            end: Offset.zero,
+                          ).animate(animation);
+                          return FadeTransition(
+                            opacity: animation,
+                            child: SlideTransition(
+                              position: offsetAnimation,
+                              child: child,
                             ),
-                          ),
-                        ],
-                        onChanged: (value) {
-                          if (value == null) return;
-                          _handlePresetSelection(value);
+                          );
                         },
+                        child: _showPresetList
+                            ? Container(
+                                key: const ValueKey('preset-list'),
+                                margin: const EdgeInsets.only(top: 8),
+                                decoration: BoxDecoration(
+                                  color: _neuraSurface,
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: Colors.white.withOpacity(0.1),
+                                  ),
+                                ),
+                                child: Column(
+                                  children: [
+                                    _buildPresetListItem(
+                                      label: _presetDirty ? 'Свои *' : 'Свои',
+                                      selected: !_hasActivePreset,
+                                      onTap: () {
+                                        _handlePresetSelection(_noPresetValue);
+                                        setState(() => _showPresetList = false);
+                                      },
+                                    ),
+                                    for (final preset in _splitPresets)
+                                      _buildPresetListItem(
+                                        label: preset.name,
+                                        selected:
+                                            _activePresetName == preset.name,
+                                        onTap: () {
+                                          _handlePresetSelection(preset.name);
+                                          setState(() => _showPresetList = false);
+                                        },
+                                      ),
+                                  ],
+                                ),
+                              )
+                            : const SizedBox.shrink(
+                                key: ValueKey('preset-list-empty'),
+                              ),
                       ),
                       const SizedBox(height: 12),
                       Text(
@@ -2825,6 +2871,37 @@ class _VlessHomePageState extends State<VlessHomePage>
       spacing: 10,
       runSpacing: 10,
       children: buttons,
+    );
+  }
+
+  Widget _buildPresetListItem({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: selected ? Colors.white : Colors.white70,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                  ),
+                ),
+              ),
+              if (selected)
+                const Icon(Icons.check, size: 16, color: _neuraRed),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
