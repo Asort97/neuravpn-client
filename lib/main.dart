@@ -1082,7 +1082,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       final manager = SubscriptionService();
       final profiles = await manager.fetchSubscription(url);
       if (profiles.isEmpty) {
-        throw 'Subscription did not return profiles';
+        throw 'Подписка не вернула профили';
       }
 
       final subscription = VpnSubscription(
@@ -1099,18 +1099,18 @@ class _VlessHomePageState extends State<VlessHomePage>
         await prefs.setBool(_hasEverAddedKeyKey, true);
         setState(() => _hasEverAddedKey = true);
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Subscription added')),
+          const SnackBar(content: Text('Подписка добавлена')),
         );
         await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Failed to add: duplicate URL')),
+          const SnackBar(content: Text('Не удалось добавить: ссылка уже есть')),
         );
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
+        SnackBar(content: Text('Ошибка: $e')),
       );
     }
   }
@@ -1221,7 +1221,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       parsed = Uri.tryParse('https://${url.trim()}');
     }
     final host = parsed?.host ?? '';
-    return host.isNotEmpty ? host : 'Subscription';
+    return host.isNotEmpty ? host : 'Подписка';
   }
 
   String _previewProfileName() {
@@ -1722,11 +1722,14 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildWindowsTabs() {
     return Row(
       children: [
-        _buildWindowsTabButton('Connection', _WindowsView.connection),
+        _buildWindowsTabButton('Подключение', _WindowsView.connection),
         const SizedBox(width: 10),
-        _buildWindowsTabButton('Split Tunneling', _WindowsView.splitTunneling),
+        _buildWindowsTabButton(
+          'Раздельное туннелирование',
+          _WindowsView.splitTunneling,
+        ),
         const SizedBox(width: 10),
-        _buildWindowsTabButton('Settings', _WindowsView.settings),
+        _buildWindowsTabButton('Настройки', _WindowsView.settings),
       ],
     );
   }
@@ -1829,7 +1832,7 @@ class _VlessHomePageState extends State<VlessHomePage>
             crossAxisAlignment: CrossAxisAlignment.start,
             children: const [
               Text(
-                'About Split Tunneling',
+                'О раздельном туннелировании',
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
                   color: Colors.white70,
@@ -1837,7 +1840,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               ),
               SizedBox(height: 8),
               Text(
-                'Split tunneling allows you to route specific domains or apps through the VPN while other traffic bypasses it.',
+                'Раздельное туннелирование позволяет направлять выбранные домены или приложения через VPN, а остальной трафик пропускать напрямую.',
                 style: TextStyle(color: Colors.white54, height: 1.4),
               ),
             ],
@@ -1874,7 +1877,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                   const SizedBox(width: 12),
                   const Expanded(
                     child: Text(
-                      'Advanced Settings',
+                      'Расширенные настройки',
                       style: TextStyle(
                         fontWeight: FontWeight.w600,
                         color: Colors.white,
@@ -1885,7 +1888,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                     TextButton.icon(
                       onPressed: () => _showConfigDialog(context),
                       icon: const Icon(Icons.receipt_long, size: 18),
-                      label: const Text('Show config'),
+                      label: const Text('Показать конфиг'),
                     ),
                 ],
               ),
@@ -1909,7 +1912,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildWindowsFooter() {
     return const Center(
       child: Text(
-        'neuravpn • Intelligent Protection',
+        'neuravpn ? ???????????????? ??????',
         style: TextStyle(color: Colors.white38, fontSize: 11),
       ),
     );
@@ -1921,7 +1924,7 @@ class _VlessHomePageState extends State<VlessHomePage>
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Text(
-            'Add your first connection',
+            'Добавьте первое подключение',
             style: TextStyle(
               fontSize: 16,
               fontWeight: FontWeight.w600,
@@ -1931,12 +1934,12 @@ class _VlessHomePageState extends State<VlessHomePage>
           const SizedBox(height: 16),
           FilledButton(
             onPressed: _showProfileDialog,
-            child: const Text('Enter key'),
+            child: const Text('Ввести ключ'),
           ),
           const SizedBox(height: 12),
           OutlinedButton(
             onPressed: _pasteProfileFromClipboard,
-            child: const Text('Paste from clipboard'),
+            child: const Text('Вставить из буфера обмена'),
           ),
         ],
       ),
@@ -1973,15 +1976,15 @@ class _VlessHomePageState extends State<VlessHomePage>
         ? const Color(0xFFFBBF24)
         : const Color(0xFF6B7280);
     final statusText = isRunning
-        ? 'Protected'
+        ? 'Защищено'
         : _isConnecting
-        ? 'Connecting...'
-        : 'Unprotected';
+        ? 'Подключение...'
+        : 'Не защищено';
     final statusHint = isRunning
-        ? 'Your connection is secure'
+        ? 'Соединение защищено'
         : _isConnecting
-        ? 'Establishing secure connection'
-        : 'Click to activate protection';
+        ? 'Устанавливается защищённое соединение'
+        : 'Нажмите, чтобы включить защиту';
     final pingLabel = _pingInProgress
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
@@ -2162,7 +2165,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                                 Icon(Icons.bolt, size: 16, color: _neuraRed),
                                 SizedBox(width: 6),
                                 Text(
-                                  'Latency',
+                                  'Задержка',
                                   style: TextStyle(color: Colors.white54),
                                 ),
                               ],
@@ -2192,7 +2195,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                                 ),
                                 SizedBox(width: 6),
                                 Text(
-                                  'Protocol',
+                                  'Протокол',
                                   style: TextStyle(color: Colors.white54),
                                 ),
                               ],
@@ -2236,7 +2239,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               const SizedBox(width: 12),
               const Expanded(
                 child: Text(
-                  'Connection Profiles',
+                  'Профили подключения',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -2296,7 +2299,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               const SizedBox(width: 12),
               const Expanded(
                 child: Text(
-                  'Smart Routing',
+                  'Умная маршрутизация',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -2312,7 +2315,7 @@ class _VlessHomePageState extends State<VlessHomePage>
           ),
           const SizedBox(height: 12),
           Text(
-            'Level 3',
+            'Уровень 3',
             style: TextStyle(color: Colors.white.withOpacity(0.5)),
           ),
           const SizedBox(height: 12),
@@ -2330,14 +2333,14 @@ class _VlessHomePageState extends State<VlessHomePage>
                           Icon(Icons.trending_up, size: 16, color: _neuraRed),
                           SizedBox(width: 6),
                           Text(
-                            'Optimization',
+                            'Оптимизация',
                             style: TextStyle(color: Colors.white54),
                           ),
                         ],
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        _smartRouting ? 'Active' : 'Disabled',
+                        _smartRouting ? 'Активно' : 'Выключено',
                         style: const TextStyle(color: Colors.white),
                       ),
                     ],
@@ -2353,14 +2356,14 @@ class _VlessHomePageState extends State<VlessHomePage>
                           Icon(Icons.graphic_eq, size: 16, color: _neuraRed),
                           SizedBox(width: 6),
                           Text(
-                            'Routes',
+                            'Маршруты',
                             style: TextStyle(color: Colors.white54),
                           ),
                         ],
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        '$routesCount nodes',
+                        '$routesCount узлов',
                         style: const TextStyle(color: Colors.white),
                       ),
                     ],
@@ -2393,7 +2396,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildWindowsServerLocation() {
     final link = _currentLink;
     final serverLabel =
-        link == null ? 'Optimal • Auto-select' : '${link.host}:${link.port}';
+        link == null ? '?????????? ? ?????????' : '${link.host}:${link.port}';
     return _neuraCard(
       padding: const EdgeInsets.all(16),
       child: Row(
@@ -2414,7 +2417,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Server Location',
+                  '??????',
                   style: TextStyle(color: Colors.white.withOpacity(0.6)),
                 ),
                 const SizedBox(height: 4),
@@ -2456,7 +2459,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               const SizedBox(width: 12),
               const Expanded(
                 child: Text(
-                  'Split Tunneling',
+                  'Раздельное туннелирование',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -2472,7 +2475,7 @@ class _VlessHomePageState extends State<VlessHomePage>
           ),
           const SizedBox(height: 12),
           Text(
-            'Route traffic by domain or app',
+            'Маршрутизация по доменам и приложениям',
             style: TextStyle(color: Colors.white.withOpacity(0.5)),
           ),
           const SizedBox(height: 16),
@@ -2484,7 +2487,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Split Preset',
+                        'Пресет',
                         style: theme.textTheme.labelMedium?.copyWith(
                           color: Colors.white70,
                         ),
@@ -2522,7 +2525,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                         items: [
                           DropdownMenuItem(
                             value: _noPresetValue,
-                            child: Text(_presetDirty ? 'Custom *' : 'Custom'),
+                            child: Text(_presetDirty ? 'Свои *' : 'Свои'),
                           ),
                           ..._splitPresets.map(
                             (p) => DropdownMenuItem(
@@ -2540,12 +2543,12 @@ class _VlessHomePageState extends State<VlessHomePage>
                       _buildWindowsPresetActionsBar(),
                       const SizedBox(height: 16),
                       _buildSplitEntrySection(
-                        title: 'Configurations',
+                        title: 'Конфигурации',
                         icon: Icons.public,
                         items: activeDomains,
-                        emptyLabel: 'No domains added yet.',
+                        emptyLabel: 'Домены не добавлены.',
                         onAdd: () => _promptAddEntry(
-                          title: 'Add domain',
+                          title: 'Добавить домен',
                           hint: 'example.com',
                           onSubmit: _addDomainEntry,
                         ),
@@ -2553,12 +2556,12 @@ class _VlessHomePageState extends State<VlessHomePage>
                       ),
                       const SizedBox(height: 16),
                       _buildSplitEntrySection(
-                        title: 'Applications',
+                        title: 'Приложения',
                         icon: Icons.apps_outlined,
                         items: activeApps,
-                        emptyLabel: 'No apps added yet.',
+                        emptyLabel: 'Приложения не добавлены.',
                         onAdd: () => _promptAddEntry(
-                          title: 'Add application',
+                          title: 'Добавить приложение',
                           hint: 'C:/Program Files/App/app.exe',
                           onSubmit: _addApplication,
                         ),
@@ -2597,7 +2600,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               borderRadius: BorderRadius.circular(12),
             ),
           ),
-          child: const Text('Update preset'),
+          child: const Text('Обновить пресет'),
         ),
       );
       buttons.add(
@@ -2611,7 +2614,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               borderRadius: BorderRadius.circular(12),
             ),
           ),
-          child: const Text('Delete'),
+          child: const Text('Удалить'),
         ),
       );
     } else {
@@ -2626,7 +2629,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               borderRadius: BorderRadius.circular(12),
             ),
           ),
-          child: const Text('Save preset'),
+          child: const Text('Сохранить пресет'),
         ),
       );
     }
@@ -2662,7 +2665,7 @@ class _VlessHomePageState extends State<VlessHomePage>
             IconButton(
               onPressed: onAdd,
               icon: const Icon(Icons.add, color: Colors.white54),
-              tooltip: 'Add',
+              tooltip: 'Добавить',
             ),
           ],
         ),
@@ -2704,7 +2707,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                       onPressed: () => onRemove(entry),
                       icon: const Icon(Icons.delete, size: 16),
                       color: _neuraRed,
-                      tooltip: 'Remove',
+                      tooltip: 'Удалить',
                     ),
                   ],
                 ),
@@ -2717,7 +2720,7 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   Widget _buildWindowsLogPanel() {
     final logText = _logLines.isEmpty
-        ? 'No log entries yet. Start the VPN to see live events.'
+        ? 'Логов пока нет. Запустите VPN, чтобы увидеть события.'
         : _logLines.join('\\n');
     return _neuraCard(
       child: Column(
@@ -2729,7 +2732,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               const SizedBox(width: 12),
               const Expanded(
                 child: Text(
-                  'Logs',
+                  'Логи',
                   style: TextStyle(
                     fontWeight: FontWeight.w600,
                     color: Colors.white,
@@ -2737,7 +2740,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                 ),
               ),
               IconButton(
-                tooltip: 'Clear logs',
+                tooltip: 'Очистить логи',
                 onPressed: _logLines.isEmpty
                     ? null
                     : () {

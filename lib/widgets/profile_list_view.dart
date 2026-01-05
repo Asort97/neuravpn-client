@@ -96,7 +96,7 @@ class _ProfileListViewState extends State<ProfileListView> {
     try {
       final profiles = await _manager.fetchSubscription(subscription.url);
       if (profiles.isEmpty) {
-        throw 'Subscription returned no profiles.';
+        throw 'Подписка не вернула профили.';
       }
 
       final updated = subscription.copyWith(
@@ -109,12 +109,12 @@ class _ProfileListViewState extends State<ProfileListView> {
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Subscription updated successfully.')),
+        const SnackBar(content: Text('Подписка обновлена.')),
       );
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to update subscription: $e')),
+        SnackBar(content: Text('Не удалось обновить подписку: $e')),
       );
     }
   }
@@ -123,19 +123,19 @@ class _ProfileListViewState extends State<ProfileListView> {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete subscription?'),
+        title: const Text('Удалить подписку?'),
         content: Text(
-          'Delete "${subscription.name}" from the device? This cannot be undone.',
+          'Удалить "${subscription.name}" с устройства? Это действие нельзя отменить.',
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
+            child: const Text('Отмена'),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
             child: const Text(
-              'Delete',
+              'Удалить',
               style: TextStyle(color: Colors.red),
             ),
           ),
@@ -151,7 +151,7 @@ class _ProfileListViewState extends State<ProfileListView> {
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to delete subscription: $e')),
+        SnackBar(content: Text('Не удалось удалить подписку: $e')),
       );
     }
   }
@@ -166,17 +166,17 @@ class _ProfileListViewState extends State<ProfileListView> {
 
     if (widget.profiles.isNotEmpty) {
       // Standalone VLESS keys imported manually
-      children.add(_buildSectionHeader('Configurations'));
+      children.add(_buildSectionHeader('Конфигурации'));
       children.addAll(_buildRegularKeys());
     }
 
     if (_subscriptions.isNotEmpty) {
-      children.add(_buildSectionHeader('Subscriptions'));
+      children.add(_buildSectionHeader('Подписки'));
       children.addAll(_buildSubscriptions());
     }
 
     if (children.isEmpty) {
-      return const Center(child: Text('No profiles yet'));
+      return const Center(child: Text('Профилей нет'));
     }
 
     return ListView(children: children);
@@ -233,23 +233,23 @@ class _ProfileListViewState extends State<ProfileListView> {
               ),
             ),
             trailing: IconButton(
-              tooltip: 'Delete profile',
+              tooltip: 'Удалить профиль',
               icon: const Icon(Icons.delete, size: 18, color: Colors.redAccent),
               onPressed: () async {
                 final confirm = await showDialog<bool>(
                   context: context,
                   builder: (context) => AlertDialog(
-                    title: const Text('Delete profile?'),
-                    content: Text('Delete "${profile.name}" from this device?'),
+                    title: const Text('Удалить профиль?'),
+                    content: Text('Удалить "${profile.name}" с этого устройства?'),
                     actions: [
                       TextButton(
                         onPressed: () => Navigator.pop(context, false),
-                        child: const Text('Cancel'),
+                        child: const Text('Отмена'),
                       ),
                       TextButton(
                         onPressed: () => Navigator.pop(context, true),
                         child: const Text(
-                          'Delete',
+                          'Удалить',
                           style: TextStyle(color: Colors.red),
                         ),
                       ),
@@ -323,12 +323,12 @@ class _ProfileListViewState extends State<ProfileListView> {
                         mainAxisAlignment: MainAxisAlignment.end,
                         children: [
                           IconButton(
-                            tooltip: 'Refresh',
+                            tooltip: 'Обновить',
                             onPressed: () => _refreshSubscription(subscription),
                             icon: const Icon(Icons.refresh),
                           ),
                           IconButton(
-                            tooltip: 'Delete',
+                            tooltip: 'Удалить',
                             onPressed: () => _deleteSubscription(subscription),
                             icon: const Icon(Icons.delete),
                             color: Colors.redAccent,
@@ -341,7 +341,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                           OutlinedButton.icon(
                             onPressed: () => _refreshSubscription(subscription),
                             icon: const Icon(Icons.refresh, size: 18),
-                            label: const Text('Refresh'),
+                            label: const Text('Обновить'),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.white70,
                               side: BorderSide(
@@ -353,7 +353,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                           OutlinedButton.icon(
                             onPressed: () => _deleteSubscription(subscription),
                             icon: const Icon(Icons.delete, size: 18),
-                            label: const Text('Delete'),
+                            label: const Text('Удалить'),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.white,
                               side: BorderSide(
