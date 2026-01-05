@@ -77,9 +77,21 @@ class VpnApp extends StatelessWidget {
           ),
         ),
       ),
+      scrollBehavior: const _AppScrollBehavior(),
       home: const VlessHomePage(),
     );
   }
+}
+
+class _AppScrollBehavior extends MaterialScrollBehavior {
+  const _AppScrollBehavior();
+
+  @override
+  Set<PointerDeviceKind> get dragDevices => {
+        PointerDeviceKind.touch,
+        PointerDeviceKind.mouse,
+        PointerDeviceKind.trackpad,
+      };
 }
 
 enum _WindowsView { connection, splitTunneling, settings }
@@ -97,6 +109,12 @@ class _VlessHomePageState extends State<VlessHomePage>
   String _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
   _WindowsView _windowsView = _WindowsView.connection;
   bool _showLoadingScreen = Platform.isWindows;
+  late final PageController _windowsPageController;
+  static const List<_WindowsView> _windowsViewOrder = [
+    _WindowsView.connection,
+    _WindowsView.splitTunneling,
+    _WindowsView.settings,
+  ];
   static const Color _neuraBlack = Color(0xFF0A0A0A);
   static const Color _neuraCardColor = Color(0xFF1A1A1A);
   static const Color _neuraSurface = Color(0xFF2A2A2A);
@@ -192,9 +210,23 @@ class _VlessHomePageState extends State<VlessHomePage>
     smartRouting: _smartRouting,
     smartDomains: _smartRouteEngine.exportLegacyRuleEntries(),
   );
+
+  int _windowsViewIndex(_WindowsView view) {
+    return _windowsViewOrder.indexOf(view);
+  }
+
+  _WindowsView _windowsViewAt(int index) {
+    if (index < 0 || index >= _windowsViewOrder.length) {
+      return _WindowsView.connection;
+    }
+    return _windowsViewOrder[index];
+  }
   @override
   void initState() {
     super.initState();
+    _windowsPageController = PageController(
+      initialPage: _windowsViewIndex(_windowsView),
+    );
     _connectGlowController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1800),
@@ -224,7 +256,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Future<void> _checkWintun() async {
     final available = await _singBoxController.isWintunAvailable();
     if (!available && mounted) {
-      _showFastSnack('wintun.dll ?? ??????');
+      _showFastSnack('wintun.dll \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d');
     }
   }
 
@@ -365,6 +397,17 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (!_showLoadingScreen) return;
     if (!mounted) return;
     setState(() => _showLoadingScreen = false);
+  }
+
+  String _tabLabelForView(_WindowsView view) {
+    switch (view) {
+      case _WindowsView.connection:
+        return 'Подключение';
+      case _WindowsView.splitTunneling:
+        return 'Раздельное туннелирование';
+      case _WindowsView.settings:
+        return 'Настройки';
+    }
   }
 
   void _updateConnectGlowTicker() {
@@ -1399,6 +1442,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     _logFlushTimer?.cancel();
     _stopTrafficMonitor();
     _connectGlowController.dispose();
+    _windowsPageController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
     if (_isDesktopPlatform) {
@@ -1552,22 +1596,37 @@ class _VlessHomePageState extends State<VlessHomePage>
                           ),
                         const SizedBox(height: 12),
                         Expanded(
-                          child: SingleChildScrollView(
-                            padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                if (!hasConnectable)
-                                  _buildWindowsEmptyState()
-                                else ...[
-                                  const SizedBox(height: 8),
-                                  _buildWindowsContent(),
-                                  const SizedBox(height: 20),
-                                  _buildWindowsFooter(),
-                                ],
-                              ],
-                            ),
-                          ),
+                          child: hasConnectable
+                              ? PageView(
+                                  controller: _windowsPageController,
+                                  physics: const PageScrollPhysics(),
+                                  onPageChanged: (index) {
+                                    final view = _windowsViewAt(index);
+                                    if (_windowsView != view) {
+                                      setState(() => _windowsView = view);
+                                    }
+                                  },
+                                  children: [
+                                    _buildWindowsPage(
+                                      _buildWindowsConnectionView(),
+                                    ),
+                                    _buildWindowsPage(
+                                      _buildWindowsSplitView(),
+                                    ),
+                                    _buildWindowsPage(
+                                      _buildWindowsSettingsView(),
+                                    ),
+                                  ],
+                                )
+                              : SingleChildScrollView(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    24,
+                                    0,
+                                    24,
+                                    24,
+                                  ),
+                                  child: _buildWindowsEmptyState(),
+                                ),
                         ),
                       ],
                     ),
@@ -1717,54 +1776,99 @@ class _VlessHomePageState extends State<VlessHomePage>
   void _setWindowsView(_WindowsView view) {
     if (_windowsView == view) return;
     setState(() => _windowsView = view);
+    if (_windowsPageController.hasClients) {
+      final index = _windowsViewIndex(view);
+      _windowsPageController.animateToPage(
+        index,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+      );
+    }
   }
 
   Widget _buildWindowsTabs() {
-    return Row(
-      children: [
-        _buildWindowsTabButton('Подключение', _WindowsView.connection),
-        const SizedBox(width: 10),
-        _buildWindowsTabButton(
-          'Раздельное туннелирование',
-          _WindowsView.splitTunneling,
-        ),
-        const SizedBox(width: 10),
-        _buildWindowsTabButton('Настройки', _WindowsView.settings),
-      ],
-    );
-  }
+    return AnimatedBuilder(
+      animation: _windowsPageController,
+      builder: (context, child) {
+        final fallback = _windowsViewIndex(_windowsView).toDouble();
+        final page =
+            _windowsPageController.hasClients ? (_windowsPageController.page ?? fallback) : fallback;
+        final currentIndex = page.round().clamp(0, _windowsViewOrder.length - 1);
+        final currentView = _windowsViewAt(currentIndex);
 
-  Widget _buildWindowsTabButton(String label, _WindowsView view) {
-    final isActive = _windowsView == view;
-    return Expanded(
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeOutCubic,
-        decoration: BoxDecoration(
-          color: isActive ? _neuraRed : _neuraCardColor,
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(
-            color: isActive ? _neuraRed : Colors.white.withOpacity(0.08),
-          ),
-        ),
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            borderRadius: BorderRadius.circular(14),
-            onTap: () => _setWindowsView(view),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12),
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 240),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) =>
+                  FadeTransition(opacity: animation, child: child),
               child: Text(
-                label,
+                _tabLabelForView(currentView),
+                key: ValueKey(currentView),
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: isActive ? Colors.white : Colors.white70,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white70,
                   fontWeight: FontWeight.w600,
                 ),
               ),
             ),
-          ),
-        ),
+            const SizedBox(height: 10),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: _windowsViewOrder.asMap().entries.map((entry) {
+                final index = entry.key;
+                final view = entry.value;
+                final distance = (page - index).abs().clamp(0.0, 1.0);
+                final t = 1.0 - distance;
+                final size = 8.0 + 6.0 * t;
+                final isActive = _windowsView == view;
+
+                return GestureDetector(
+                  onTap: () => _setWindowsView(view),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 160),
+                    curve: Curves.easeOutCubic,
+                    width: size,
+                    height: size,
+                    margin: const EdgeInsets.symmetric(horizontal: 8),
+                    decoration: BoxDecoration(
+                      color: isActive ? _neuraRed : Colors.white.withOpacity(0.28),
+                      shape: BoxShape.circle,
+                      boxShadow: isActive
+                          ? [
+                              BoxShadow(
+                                color: _neuraRed.withOpacity(0.45),
+                                blurRadius: 8,
+                              ),
+                            ]
+                          : null,
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildWindowsPage(Widget child) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const SizedBox(height: 8),
+          child,
+          const SizedBox(height: 20),
+          _buildWindowsFooter(),
+        ],
       ),
     );
   }
@@ -1815,8 +1919,6 @@ class _VlessHomePageState extends State<VlessHomePage>
         _buildWindowsProfilesModule(),
         const SizedBox(height: 16),
         _buildWindowsSmartRoutingModule(),
-        const SizedBox(height: 16),
-        _buildWindowsServerLocation(),
       ],
     );
   }
@@ -1912,7 +2014,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Widget _buildWindowsFooter() {
     return const Center(
       child: Text(
-        'neuravpn ? ???????????????? ??????',
+        'neuravpn \u00b7 \u0418\u043d\u0442\u0435\u043b\u043b\u0435\u043a\u0442\u0443\u0430\u043b\u044c\u043d\u0430\u044f \u0437\u0430\u0449\u0438\u0442\u0430',
         style: TextStyle(color: Colors.white38, fontSize: 11),
       ),
     );
@@ -1976,15 +2078,15 @@ class _VlessHomePageState extends State<VlessHomePage>
         ? const Color(0xFFFBBF24)
         : const Color(0xFF6B7280);
     final statusText = isRunning
-        ? 'Защищено'
+        ? 'Подключено'
         : _isConnecting
         ? 'Подключение...'
-        : 'Не защищено';
+        : 'Не подключено';
     final statusHint = isRunning
         ? 'Соединение защищено'
         : _isConnecting
         ? 'Устанавливается защищённое соединение'
-        : 'Нажмите, чтобы включить защиту';
+        : 'Нажмите, чтобы подключиться';
     final pingLabel = _pingInProgress
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
@@ -2395,8 +2497,9 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   Widget _buildWindowsServerLocation() {
     final link = _currentLink;
-    final serverLabel =
-        link == null ? '?????????? ? ?????????' : '${link.host}:${link.port}';
+    final serverLabel = link == null
+        ? '\u041e\u043f\u0442\u0438\u043c\u0430\u043b\u044c\u043d\u043e \u00b7 \u0410\u0432\u0442\u043e\u0432\u044b\u0431\u043e\u0440'
+        : '${link.host}:${link.port}';
     return _neuraCard(
       padding: const EdgeInsets.all(16),
       child: Row(
@@ -2417,7 +2520,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '??????',
+                  '\u0421\u0435\u0440\u0432\u0435\u0440',
                   style: TextStyle(color: Colors.white.withOpacity(0.6)),
                 ),
                 const SizedBox(height: 4),
@@ -2466,17 +2569,38 @@ class _VlessHomePageState extends State<VlessHomePage>
                   ),
                 ),
               ),
+              IconButton(
+                tooltip: 'Что это?',
+                icon: const Icon(Icons.help_outline, color: Colors.white70),
+                onPressed: () {
+                  showDialog(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Раздельное туннелирование'),
+                      content: const Text(
+                        'Эта функция позволяет выбрать, какие домены и приложения '
+                        'будут идти через VPN, а какие — мимо него.\n\n'
+                        'Белый список: только указанные домены/приложения идут через VPN, '
+                        'всё остальное — напрямую.\n\n'
+                        'Чёрный список: указанные домены/приложения идут напрямую, '
+                        'всё остальное — через VPN.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          child: const Text('Понятно'),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
               Switch.adaptive(
                 value: _splitEnabled,
                 activeColor: _neuraRed,
                 onChanged: (value) => _setSplitEnabled(value),
               ),
             ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Маршрутизация по доменам и приложениям',
-            style: TextStyle(color: Colors.white.withOpacity(0.5)),
           ),
           const SizedBox(height: 16),
           AnimatedSize(
