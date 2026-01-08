@@ -42,10 +42,12 @@ dependencies:
     path: plugins/device_apps
   http: ^1.1.0
   intl: ^0.19.0
+  package_info_plus: ^8.0.3
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  msix: ^3.16.8
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -75,6 +77,22 @@ flutter:
     - windows/runner/resources/app_icon.ico
     - assets/images/logo.png
     - assets/images/11zon_cropped.png
+
+# Windows MSIX packaging (App Installer updates)
+msix_config:
+  display_name: neuravpn
+  publisher_display_name: neuravpn
+  identity_name: com.neuravpn.client
+  msix_version: 1.0.0.0
+  logo_path: assets/images/11zon_cropped.png
+  capabilities: internetClient
+  output_name: neuravpn
+  # IMPORTANT:
+  # - For public distribution you MUST use a trusted code-signing certificate.
+  # - For GitHub Releases auto-updates you MUST keep the same Publisher/certificate across all versions.
+  certificate_path: windows/certificates/neuravpn.pfx
+  certificate_password: neuravpn-dev
+  publisher: CN=neuravpn
 
   # To add assets to your application, add an assets section, like this:
   # assets:

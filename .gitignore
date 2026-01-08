@@ -64,3 +64,11 @@ local.properties
 *.lock
 Thumbs.db
 FIGMA_MAKE
+
+# MSIX signing (DO NOT COMMIT PRIVATE KEYS)
+windows/certificates/*.pfx
+
+# App Installer / MSIX release artifacts (generated)
+appinstaller/*.appinstaller
+appinstaller/*.cer
+appinstaller/*.msix

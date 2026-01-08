@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:intl/date_symbol_data_local.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'vless/vless_parser.dart';
 import 'models/split_tunnel_config.dart';
 import 'models/split_tunnel_preset.dart';
@@ -25,6 +26,7 @@ import 'services/smart_route_engine.dart';
 import 'services/singbox_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
+import 'services/update_service.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
@@ -105,6 +107,12 @@ class VlessHomePage extends StatefulWidget {
 
 class _VlessHomePageState extends State<VlessHomePage>
     with TrayListener, WindowListener, SingleTickerProviderStateMixin {
+  static const String _updateOwner = 'Asort97';
+  static const String _updateRepo = 'neuravpn-client';
+  static const String _appInstallerAssetName = 'neuravpn.appinstaller';
+  static const String _updateDismissedTagKey = 'update_dismissed_tag';
+  static const String _updateLastCheckKey = 'update_last_check_ms';
+
   final TextEditingController _controller = TextEditingController();
   String _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
   _WindowsView _windowsView = _WindowsView.connection;
@@ -182,6 +190,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   int _connectivityCompleted = 0;
   DateTime? _connectivityLastRun;
   bool _cancelConnectivity = false;
+  String _appVersion = '';
+  UpdateCheckResult? _updateResult;
+  bool _checkingUpdates = false;
 
   VlessLink? get _parsed => _singBoxController.parsedLink;
   VlessLink? get _currentLink =>
@@ -238,6 +249,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     );
     _updateConnectGlowTicker();
     _loadInitialData();
+    unawaited(_initVersionAndUpdates());
     _checkWintun();
     if (_isDesktopPlatform) {
       windowManager.addListener(this);
@@ -258,6 +270,191 @@ class _VlessHomePageState extends State<VlessHomePage>
     final available = await _singBoxController.isWintunAvailable();
     if (!available && mounted) {
       _showFastSnack('wintun.dll \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d');
+    }
+  }
+
+  Future<void> _initVersionAndUpdates() async {
+    if (!Platform.isWindows) return;
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
+      setState(() {
+        _appVersion = info.version;
+      });
+    } catch (_) {
+      // ignore
+    }
+    await _maybeCheckForUpdates();
+  }
+
+  Future<void> _maybeCheckForUpdates({bool manual = false}) async {
+    if (!Platform.isWindows) return;
+    if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
+        _updateRepo == 'YOUR_GITHUB_REPO') {
+      return;
+    }
+    if (_checkingUpdates) return;
+    _checkingUpdates = true;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final now = DateTime.now();
+      final lastMs = prefs.getInt(_updateLastCheckKey);
+      final last = lastMs == null ? null : DateTime.fromMillisecondsSinceEpoch(lastMs);
+      final shouldSkip = !manual &&
+          last != null &&
+          now.difference(last) < const Duration(hours: 12);
+      if (shouldSkip) return;
+      await prefs.setInt(_updateLastCheckKey, now.millisecondsSinceEpoch);
+
+      final service = GithubUpdateService();
+      final latest = await service.fetchLatestRelease(
+        _updateOwner,
+        _updateRepo,
+      );
+      if (latest == null) {
+        if (manual && mounted) {
+          _showFastSnack('\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f');
+        }
+        return;
+      }
+
+      final current = _appVersion.isNotEmpty ? _appVersion : '0.0.0';
+      final result = service.compareVersions(
+        currentVersion: current,
+        latest: latest,
+      );
+      if (result == null) return;
+
+      if (!mounted) return;
+      setState(() => _updateResult = result);
+
+      if (!result.isUpdateAvailable) {
+        if (manual) {
+          _showFastSnack('\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u044f\u044f \u0432\u0435\u0440\u0441\u0438\u044f');
+        }
+        return;
+      }
+
+      final dismissed = prefs.getString(_updateDismissedTagKey);
+      if (!manual && dismissed == result.latestTag) {
+        return;
+      }
+      _showUpdateDialog(result);
+    } finally {
+      _checkingUpdates = false;
+    }
+  }
+
+  Uri _appInstallerUrl() {
+    return Uri.parse(
+      'https://github.com/$_updateOwner/$_updateRepo/releases/latest/download/$_appInstallerAssetName',
+    );
+  }
+
+  void _showUpdateDialog(UpdateCheckResult result) {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: _neuraCardColor,
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                '\u0412\u0435\u0440\u0441\u0438\u044f ${result.latestVersion} \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 (\u0443 \u0432\u0430\u0441 ${result.currentVersion}).',
+                style: TextStyle(color: Colors.white.withOpacity(0.75)),
+              ),
+              if (result.releaseNotes.trim().isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Container(
+                  constraints: const BoxConstraints(maxHeight: 220),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: _neuraSurface,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white.withOpacity(0.06)),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Text(
+                      result.releaseNotes,
+                      style: TextStyle(
+                        color: Colors.white.withOpacity(0.7),
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  TextButton(
+                    onPressed: () async {
+                      final prefs = await SharedPreferences.getInstance();
+                      await prefs.setString(
+                        _updateDismissedTagKey,
+                        result.latestTag,
+                      );
+                      if (ctx.mounted) Navigator.of(ctx).pop();
+                    },
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                    ),
+                    child: const Text('\u041f\u043e\u0437\u0436\u0435'),
+                  ),
+                  const Spacer(),
+                  FilledButton(
+                    onPressed: () {
+                      _openUrl(_appInstallerUrl().toString());
+                      Navigator.of(ctx).pop();
+                    },
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _neuraRed,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 18,
+                        vertical: 12,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: const Text('\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openUrl(String url) async {
+    if (!Platform.isWindows) return;
+    try {
+      await Process.start('cmd', ['/c', 'start', '', url], runInShell: true);
+    } catch (_) {
+      // ignore
     }
   }
 
@@ -823,19 +1020,22 @@ class _VlessHomePageState extends State<VlessHomePage>
     final nextWidth = current.width > targetWidth ? targetWidth : current.width;
     final nextHeight =
         current.height > targetHeight ? targetHeight : current.height;
-    await windowManager.setSize(Size(nextWidth, nextHeight));
-    await windowManager.center();
-    await windowManager.setTitleBarStyle(
-      TitleBarStyle.hidden,
-      windowButtonVisibility: false,
-    );
+      await windowManager.setSize(Size(nextWidth, nextHeight));
+      await windowManager.setMinimumSize(const Size(420, 720));
+      await windowManager.setMaximumSize(const Size(420, 720));
+      await windowManager.setResizable(false);
+      await windowManager.center();
+      await windowManager.setTitleBarStyle(
+        TitleBarStyle.hidden,
+        windowButtonVisibility: false,
+      );
   }
 
   Future<void> _setupTrayIcon() async {
     if (_trayInitialized) return;
     final iconPath = await _prepareTrayIconFile();
     await _trayManager.setIcon(iconPath);
-    await _trayManager.setToolTip('HappyCat VPN Client');
+    await _trayManager.setToolTip('neuravpn');
     final menu = Menu(
       items: [
         MenuItem(key: _trayShowKey, label: 'Показать окно'),
@@ -848,12 +1048,16 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<String> _prepareTrayIconFile() async {
-    const assetKey = 'windows/runner/resources/app_icon.ico';
-    final data = await rootBundle.load(assetKey);
     final tmpDir = await getTemporaryDirectory();
-    final file = File('${tmpDir.path}/happycat_tray.ico');
-    await file.writeAsBytes(data.buffer.asUint8List(), flush: true);
-    return file.path;
+    final localIco = File('windows/runner/resources/hc_icon.ico');
+    if (await localIco.exists()) {
+      return localIco.absolute.path;
+    }
+    const icoAssetKey = 'windows/runner/resources/hc_icon.ico';
+    final icoData = await rootBundle.load(icoAssetKey);
+    final icoFile = File('${tmpDir.path}/neuravpn_tray.ico');
+    await icoFile.writeAsBytes(icoData.buffer.asUint8List(), flush: true);
+    return icoFile.path;
   }
 
   Future<void> _restoreWindowFromTray() async {
@@ -1707,12 +1911,12 @@ class _VlessHomePageState extends State<VlessHomePage>
             child: Row(
               children: [
                 SizedBox(
-                  width: 32,
-                  height: 32,
+                  width: 44,
+                  height: 44,
                   child: Image.asset(
                     'assets/images/11zon_cropped.png',
-                    width: 32,
-                    height: 32,
+                    width: 44,
+                    height: 44,
                     fit: BoxFit.contain,
                     filterQuality: FilterQuality.high,
                   ),
@@ -1937,6 +2141,96 @@ class _VlessHomePageState extends State<VlessHomePage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _neuraCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: _neuraSurface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: const Icon(
+                      Icons.system_update_alt,
+                      color: _neuraRed,
+                      size: 18,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Обновления',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _checkingUpdates
+                        ? null
+                        : () => _maybeCheckForUpdates(manual: true),
+                    child: Text(_checkingUpdates ? 'Проверка...' : 'Проверить'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                _appVersion.isEmpty
+                    ? 'Версия: —'
+                    : 'Версия: $_appVersion',
+                style: TextStyle(color: Colors.white.withOpacity(0.6)),
+              ),
+              if (_updateResult?.isUpdateAvailable == true) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Доступна версия ${_updateResult!.latestVersion}',
+                  style: const TextStyle(
+                    color: _neuraRed,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                FilledButton(
+                  onPressed: () =>
+                      _openUrl(_updateResult!.releaseUrl.toString()),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _neuraRed,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 12,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text('Открыть релиз на GitHub'),
+                ),
+              ] else ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Автопроверка выполняется раз в 12 часов.',
+                  style: TextStyle(color: Colors.white.withOpacity(0.5)),
+                ),
+              ],
+              const SizedBox(height: 10),
+              Text(
+                'Репозиторий: $_updateOwner/$_updateRepo',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.35),
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
         _neuraCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
