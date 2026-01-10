@@ -185,6 +185,13 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _smartRouting = false;
   bool _hasEverAddedKey = false;
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
+  static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
+  static const String _dpiTlsFragmentKey = 'dpi_tls_fragment_enabled';
+  static const String _dpiTlsRecordFragmentKey = 'dpi_tls_record_fragment_enabled';
+  static const String _dpiTrafficNoiseKey = 'dpi_traffic_noise_enabled';
+  static const String _dpiMultiplexPaddingKey = 'dpi_multiplex_padding_enabled';
+  static const String _dpiTcpWindowClampKey = 'dpi_tcp_window_clamp_enabled';
+  static const String _dpiSniRandomizationKey = 'dpi_sni_randomization_enabled';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
   final ConnectivityTester _connectivityTester = ConnectivityTester();
   late final List<ConnectivityTestTarget> _connectivityTargets =
@@ -662,6 +669,22 @@ class _VlessHomePageState extends State<VlessHomePage>
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
+    final dpiBase =
+        dpiAggressive ? DpiEvasionConfig.aggressive : DpiEvasionConfig.balanced;
+    final dpiFragmentation =
+        prefs.getBool(_dpiFragmentationKey) ?? dpiBase.enableFragmentation;
+    final dpiTlsFragment =
+        prefs.getBool(_dpiTlsFragmentKey) ?? dpiBase.enableTlsFragment;
+    final dpiTlsRecordFragment = prefs.getBool(_dpiTlsRecordFragmentKey) ??
+        dpiBase.enableTlsRecordFragment;
+    final dpiTrafficNoise =
+        prefs.getBool(_dpiTrafficNoiseKey) ?? dpiBase.enableTrafficNoise;
+    final dpiMultiplexPadding = prefs.getBool(_dpiMultiplexPaddingKey) ??
+        dpiBase.enableMultiplexPadding;
+    final dpiTcpWindowClamp =
+        prefs.getBool(_dpiTcpWindowClampKey) ?? dpiBase.enableTcpWindowClamp;
+    final dpiSniRandomization = prefs.getBool(_dpiSniRandomizationKey) ??
+        dpiBase.enableSniCaseRandomization;
 
     if (metricsRaw != null && metricsRaw.isNotEmpty) {
       try {
@@ -795,9 +818,15 @@ class _VlessHomePageState extends State<VlessHomePage>
       _selectedProfile = selected;
       _syncMetricsFromProfile(selected);
       _smartRouting = smartRoutingFlag;
-      _dpiEvasionConfig = dpiAggressive
-          ? DpiEvasionConfig.aggressive
-          : DpiEvasionConfig.balanced;
+      _dpiEvasionConfig = dpiBase.copyWith(
+        enableFragmentation: dpiFragmentation,
+        enableTlsFragment: dpiTlsFragment,
+        enableTlsRecordFragment: dpiTlsRecordFragment,
+        enableTrafficNoise: dpiTrafficNoise,
+        enableMultiplexPadding: dpiMultiplexPadding,
+        enableTcpWindowClamp: dpiTcpWindowClamp,
+        enableSniCaseRandomization: dpiSniRandomization,
+      );
       if (restoredMap != null) {
         for (final entry in _splitConfigs.keys.toList()) {
           final restored = restoredMap[entry];
@@ -1231,37 +1260,12 @@ class _VlessHomePageState extends State<VlessHomePage>
     _stopTrafficMonitor();
     await _dpiEvasionManager.stopNativeInjector();
     await _singBoxController.forceTerminate();
-    await _singBoxController.dispose();
+    unawaited(_singBoxController.dispose());
     if (!_isDesktopPlatform) {
       exit(0);
     }
     await windowManager.setPreventClose(false);
     await windowManager.close();
-  }
-
-  Future<bool> _restartAsAdmin() async {
-    if (!Platform.isWindows) return false;
-    if (_isExitingApp) return true;
-    _isExitingApp = true;
-    try {
-      final exePath = Platform.resolvedExecutable;
-      await Process.start(
-        'powershell',
-        [
-          '-NoProfile',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          'Start-Process -FilePath "$exePath" -Verb RunAs',
-        ],
-        mode: ProcessStartMode.detached,
-      );
-      unawaited(_handleTrayExit());
-      return true;
-    } catch (_) {
-      _isExitingApp = false;
-      return false;
-    }
   }
 
   @override
@@ -1728,8 +1732,15 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (!result.success) {
       if (!mounted) return;
       if (result.requiresAdmin && Platform.isWindows) {
-        final restarted = await _restartAsAdmin();
-        if (restarted) return;
+        _showFastSnack('Запустите приложение от имени администратора');
+        setState(() {
+          _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+          _isConnecting = false;
+        });
+        unawaited(_updateTrayMenu());
+        _updateConnectGlowTicker();
+        _stopTrafficMonitor();
+        return;
       }
       _showFastSnack(result.errorMessage ?? '\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f');
       setState(() {
@@ -1777,29 +1788,72 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _applyDpiEvasionInjector() async {
-    if (!_dpiEvasionConfig.enableTtlPhantom) {
+    final shouldRunInjector = _dpiEvasionConfig.enableTtlPhantom ||
+        _dpiEvasionConfig.enableTcpWindowClamp ||
+        _dpiEvasionConfig.enableSniCaseRandomization;
+    if (!shouldRunInjector) {
       await _dpiEvasionManager.stopNativeInjector();
       return;
     }
     final link = _currentLink;
     if (link == null) return;
-    await _dpiEvasionManager.startForHost(link.host, link.port);
+    await _dpiEvasionManager.startForHost(
+      link.host,
+      link.port,
+      enableTcpWindowClamp: _dpiEvasionConfig.enableTcpWindowClamp,
+      enableSniRandomization: _dpiEvasionConfig.enableSniCaseRandomization,
+    );
   }
 
   void _updateDpiConfig(DpiEvasionConfig config) {
     setState(() => _dpiEvasionConfig = config);
     unawaited(
       SharedPreferences.getInstance().then(
-        (prefs) => prefs.setBool(
-          _dpiAggressiveKey,
-          config.profile == DpiEvasionProfile.aggressive,
-        ),
+        (prefs) async {
+          await prefs.setBool(
+            _dpiAggressiveKey,
+            config.profile == DpiEvasionProfile.aggressive,
+          );
+          await prefs.setBool(
+            _dpiFragmentationKey,
+            config.enableFragmentation,
+          );
+          await prefs.setBool(
+            _dpiTlsFragmentKey,
+            config.enableTlsFragment,
+          );
+          await prefs.setBool(
+            _dpiTlsRecordFragmentKey,
+            config.enableTlsRecordFragment,
+          );
+          await prefs.setBool(
+            _dpiTrafficNoiseKey,
+            config.enableTrafficNoise,
+          );
+          await prefs.setBool(
+            _dpiMultiplexPaddingKey,
+            config.enableMultiplexPadding,
+          );
+          await prefs.setBool(
+            _dpiTcpWindowClampKey,
+            config.enableTcpWindowClamp,
+          );
+          await prefs.setBool(
+            _dpiSniRandomizationKey,
+            config.enableSniCaseRandomization,
+          );
+        },
       ),
     );
     if (_isRunning) {
       unawaited(_applyDpiEvasionInjector());
-    } else if (!config.enableTtlPhantom) {
-      unawaited(_dpiEvasionManager.stopNativeInjector());
+    } else {
+      final shouldRunInjector = config.enableTtlPhantom ||
+          config.enableTcpWindowClamp ||
+          config.enableSniCaseRandomization;
+      if (!shouldRunInjector) {
+        unawaited(_dpiEvasionManager.stopNativeInjector());
+      }
     }
   }
 
@@ -2477,10 +2531,10 @@ class _VlessHomePageState extends State<VlessHomePage>
                     ),
                   ),
                   if (_generatedConfig != null)
-                    TextButton.icon(
+                    IconButton(
+                      tooltip: 'Показать конфиг',
                       onPressed: () => _showConfigDialog(context),
                       icon: const Icon(Icons.receipt_long, size: 18),
-                      label: const Text('Показать конфиг'),
                     ),
                 ],
               ),

@@ -69,6 +69,8 @@ String generateSingBoxConfig(
       if (alpn.isNotEmpty) 'alpn': alpn,
       'utls': {'enabled': true, 'fingerprint': fingerprint},
     };
+    tls['fragment'] = dpiEvasionConfig.enableTlsFragment;
+    tls['record_fragment'] = dpiEvasionConfig.enableTlsRecordFragment;
     if (isReality) {
       final shortIdList = (realityShortId ?? '')
           .split(',')
@@ -93,6 +95,23 @@ String generateSingBoxConfig(
   }
   if (dpiEvasionConfig.enableFragmentation && useTls) {
     _applyFragmentation(outbound, transportType);
+  }
+
+  if (dpiEvasionConfig.enableMultiplexPadding) {
+    outbound['multiplex'] = {
+      'enabled': true,
+      'padding': true,
+    };
+  }
+
+  if (dpiEvasionConfig.enableTrafficNoise) {
+    outbound['dial'] = {
+      'noise': {
+        'noise_count': 3,
+        'noise_size': 120,
+        'noise_delay': 20,
+      },
+    };
   }
 
   final appRules = enableApplicationRules

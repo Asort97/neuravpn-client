@@ -5,12 +5,19 @@ import 'package:flutter/services.dart';
 class DpiEvasionManager {
   static const MethodChannel _channel = MethodChannel('happycat.vpn/dpi');
 
-  Future<void> startNativeInjector(String serverIp, int serverPort) async {
+  Future<void> startNativeInjector(
+    String serverIp,
+    int serverPort, {
+    required bool enableTcpWindowClamp,
+    required bool enableSniRandomization,
+  }) async {
     if (!Platform.isWindows) return;
     try {
       final ok = await _channel.invokeMethod<bool>('startTtlInjector', {
         'serverIp': serverIp,
         'serverPort': serverPort,
+        'enableTcpWindowClamp': enableTcpWindowClamp,
+        'enableSniRandomization': enableSniRandomization,
       });
       if (ok != true) {
         debugPrint('[DpiEvasionManager] startTtlInjector returned false');
@@ -29,10 +36,20 @@ class DpiEvasionManager {
     }
   }
 
-  Future<void> startForHost(String host, int serverPort) async {
+  Future<void> startForHost(
+    String host,
+    int serverPort, {
+    required bool enableTcpWindowClamp,
+    required bool enableSniRandomization,
+  }) async {
     final ip = await _resolveIpv4(host);
     if (ip == null) return;
-    await startNativeInjector(ip, serverPort);
+    await startNativeInjector(
+      ip,
+      serverPort,
+      enableTcpWindowClamp: enableTcpWindowClamp,
+      enableSniRandomization: enableSniRandomization,
+    );
   }
 
   Future<String?> _resolveIpv4(String host) async {

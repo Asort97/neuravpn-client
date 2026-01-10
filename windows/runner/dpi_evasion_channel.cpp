@@ -40,6 +40,15 @@ int64_t GetIntArg(const flutter::EncodableMap& map, const std::string& key) {
   }
   return 0;
 }
+
+bool GetBoolArg(const flutter::EncodableMap& map, const std::string& key) {
+  const auto it = map.find(flutter::EncodableValue(key));
+  if (it == map.end()) return false;
+  if (const auto* value = std::get_if<bool>(&it->second)) {
+    return *value;
+  }
+  return false;
+}
 }  // namespace
 
 void SetupDpiEvasionChannel(flutter::BinaryMessenger* messenger) {
@@ -64,14 +73,21 @@ void SetupDpiEvasionChannel(flutter::BinaryMessenger* messenger) {
           }
           const std::string serverIp = GetStringArg(*args, "serverIp");
           const int64_t port = GetIntArg(*args, "serverPort");
+          const bool enableWindowClamp =
+              GetBoolArg(*args, "enableTcpWindowClamp");
+          const bool enableSniRandomization =
+              GetBoolArg(*args, "enableSniRandomization");
           if (serverIp.empty() || port <= 0 || port > 65535) {
             LogDebug("startTtlInjector bad_args: missing ip/port");
             result->Error("bad_args", "Missing serverIp/serverPort");
             return;
           }
           LogDebug("startTtlInjector start " + serverIp + ":" + std::to_string(port));
-          const bool ok = start_ttl_phantom_injector(serverIp.c_str(),
-                                                     static_cast<UINT16>(port));
+          const bool ok = start_ttl_phantom_injector(
+              serverIp.c_str(),
+              static_cast<UINT16>(port),
+              enableWindowClamp,
+              enableSniRandomization);
           LogDebug(std::string("startTtlInjector result ok=") + (ok ? "true" : "false"));
           result->Success(flutter::EncodableValue(ok));
           return;

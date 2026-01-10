@@ -9,7 +9,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -96,6 +96,8 @@ WinDivertApi g_api;
 HMODULE g_windivert_module = nullptr;
 HANDLE g_handle = INVALID_HANDLE_VALUE;
 std::atomic_bool g_stop{false};
+std::atomic_bool g_enable_window_clamp{false};
+std::atomic_bool g_enable_sni_randomization{false};
 std::mutex g_state_mutex;
 std::thread g_worker;
 
@@ -121,7 +123,12 @@ struct SessionKeyHasher {
   }
 };
 
-std::unordered_set<SessionKey, SessionKeyHasher> g_sessions;
+struct SessionState {
+  bool sawSyn = false;
+  bool firstAckAdjusted = false;
+};
+
+std::unordered_map<SessionKey, SessionState, SessionKeyHasher> g_sessions;
 
 #pragma pack(push, 1)
 struct Ipv4Header {
@@ -249,6 +256,96 @@ bool parse_tcp_packet(const uint8_t* packet,
   return true;
 }
 
+uint16_t read_be16(const uint8_t* data) {
+  return static_cast<uint16_t>((data[0] << 8) | data[1]);
+}
+
+bool randomize_sni_case(uint8_t* payload, size_t payloadLen, std::mt19937& rng) {
+  if (payloadLen < 5) return false;
+  if (payload[0] != 0x16) return false;  // TLS handshake
+  const uint16_t recordLen = read_be16(payload + 3);
+  if (recordLen == 0 || payloadLen < 5 + recordLen) return false;
+
+  const size_t recordStart = 5;
+  if (recordLen < 4 || payload[recordStart] != 0x01) return false;  // ClientHello
+  const uint32_t handshakeLen =
+      (payload[recordStart + 1] << 16) | (payload[recordStart + 2] << 8) |
+      payload[recordStart + 3];
+  if (handshakeLen + 4 > recordLen) return false;
+
+  size_t pos = recordStart + 4;
+  if (pos + 2 + 32 > payloadLen) return false;
+  pos += 2 + 32;
+
+  if (pos + 1 > payloadLen) return false;
+  const uint8_t sessionLen = payload[pos];
+  pos += 1;
+  if (pos + sessionLen > payloadLen) return false;
+  pos += sessionLen;
+
+  if (pos + 2 > payloadLen) return false;
+  const uint16_t cipherLen = read_be16(payload + pos);
+  pos += 2;
+  if (pos + cipherLen > payloadLen) return false;
+  pos += cipherLen;
+
+  if (pos + 1 > payloadLen) return false;
+  const uint8_t compLen = payload[pos];
+  pos += 1;
+  if (pos + compLen > payloadLen) return false;
+  pos += compLen;
+
+  if (pos + 2 > payloadLen) return false;
+  const uint16_t extLen = read_be16(payload + pos);
+  pos += 2;
+  if (pos + extLen > payloadLen) return false;
+  const size_t extEnd = pos + extLen;
+
+  std::uniform_int_distribution<int> boolDist(0, 1);
+  while (pos + 4 <= extEnd) {
+    const uint16_t extType = read_be16(payload + pos);
+    const uint16_t extSize = read_be16(payload + pos + 2);
+    pos += 4;
+    if (pos + extSize > extEnd) return false;
+
+    if (extType == 0x0000) {  // server_name
+      if (extSize < 2) return false;
+      size_t listPos = pos;
+      const uint16_t listLen = read_be16(payload + listPos);
+      listPos += 2;
+      if (listPos + listLen > pos + extSize) return false;
+      const size_t listEnd = listPos + listLen;
+      while (listPos + 3 <= listEnd) {
+        const uint8_t nameType = payload[listPos];
+        const uint16_t nameLen = read_be16(payload + listPos + 1);
+        listPos += 3;
+        if (listPos + nameLen > listEnd) return false;
+        if (nameType == 0 && nameLen > 0) {
+          for (uint16_t i = 0; i < nameLen; ++i) {
+            uint8_t ch = payload[listPos + i];
+            const bool isLower = (ch >= 'a' && ch <= 'z');
+            const bool isUpper = (ch >= 'A' && ch <= 'Z');
+            if (!isLower && !isUpper) continue;
+            const bool makeUpper = boolDist(rng) == 1;
+            if (makeUpper) {
+              payload[listPos + i] =
+                  static_cast<uint8_t>(isLower ? ch - 32 : ch);
+            } else {
+              payload[listPos + i] =
+                  static_cast<uint8_t>(isUpper ? ch + 32 : ch);
+            }
+          }
+          return true;
+        }
+        listPos += nameLen;
+      }
+    }
+    pos += extSize;
+  }
+
+  return false;
+}
+
 std::vector<uint8_t> build_decoy(const Ipv4Header* ip,
                                  const TcpHeader* tcp,
                                  size_t ipHeaderLen,
@@ -317,6 +414,7 @@ void worker_loop(const std::string targetIp, UINT16 targetPort) {
 
   std::vector<uint8_t> packet(kMaxPacketSize);
   std::mt19937 rng{std::random_device{}()};
+  std::uniform_int_distribution<int> windowDist(64, 512);
 
   while (!g_stop.load()) {
     WINDIVERT_ADDRESS addr{};
@@ -338,15 +436,61 @@ void worker_loop(const std::string targetIp, UINT16 targetPort) {
 
     SessionKey key{ip->srcAddr, ip->dstAddr, tcp->srcPort, tcp->dstPort};
     bool isNewSession = false;
+    SessionState state{};
     {
       std::lock_guard<std::mutex> lock(g_state_mutex);
-      auto [_, inserted] = g_sessions.insert(key);
+      auto [it, inserted] = g_sessions.emplace(key, SessionState{});
       isNewSession = inserted;
+      state = it->second;
     }
 
     if (isNewSession) {
       auto decoy = build_decoy(ip, tcp, ipHeaderLen, tcpHeaderLen, rng);
       g_api.send(handle, decoy.data(), static_cast<UINT>(decoy.size()), nullptr, &addr);
+    }
+
+    const uint16_t flags = ntohs(tcp->dataOffsetAndFlags);
+    const bool syn = (flags & 0x0002) != 0;
+    const bool ack = (flags & 0x0010) != 0;
+    const size_t payloadLen = recvLen - ipHeaderLen - tcpHeaderLen;
+
+    bool modified = false;
+    bool updatedState = false;
+    const bool windowClampEnabled = g_enable_window_clamp.load();
+    const bool sniRandomizationEnabled = g_enable_sni_randomization.load();
+    auto* ipMutable = reinterpret_cast<Ipv4Header*>(packet.data());
+    auto* tcpMutable =
+        reinterpret_cast<TcpHeader*>(packet.data() + ipHeaderLen);
+    auto* payload = packet.data() + ipHeaderLen + tcpHeaderLen;
+
+    if (windowClampEnabled && syn && !ack) {
+      tcpMutable->window = htons(static_cast<uint16_t>(windowDist(rng)));
+      state.sawSyn = true;
+      updatedState = true;
+      modified = true;
+    } else if (windowClampEnabled && ack && !syn && state.sawSyn &&
+               !state.firstAckAdjusted &&
+               payloadLen == 0) {
+      tcpMutable->window = htons(static_cast<uint16_t>(windowDist(rng)));
+      state.firstAckAdjusted = true;
+      updatedState = true;
+      modified = true;
+    }
+
+    if (sniRandomizationEnabled && payloadLen > 0 &&
+        randomize_sni_case(payload, payloadLen, rng)) {
+      modified = true;
+    }
+
+    if (modified) {
+      tcpMutable->checksum = 0;
+      tcpMutable->checksum = compute_tcp_checksum(
+          ipMutable, tcpMutable, payload, payloadLen, tcpHeaderLen);
+    }
+
+    if (updatedState) {
+      std::lock_guard<std::mutex> lock(g_state_mutex);
+      g_sessions[key] = state;
     }
 
     g_api.send(handle, packet.data(), recvLen, nullptr, &addr);
@@ -363,7 +507,10 @@ void worker_loop(const std::string targetIp, UINT16 targetPort) {
 
 }  // namespace
 
-bool start_ttl_phantom_injector(const char* server_ip, UINT16 server_port) {
+bool start_ttl_phantom_injector(const char* server_ip,
+                                UINT16 server_port,
+                                bool enable_window_clamp,
+                                bool enable_sni_randomization) {
   if (server_ip == nullptr || server_ip[0] == '\0' || server_port == 0) {
     return false;
   }
@@ -374,6 +521,8 @@ bool start_ttl_phantom_injector(const char* server_ip, UINT16 server_port) {
     return false;
   }
 
+  g_enable_window_clamp.store(enable_window_clamp);
+  g_enable_sni_randomization.store(enable_sni_randomization);
   g_stop.store(false);
   const std::string ip(server_ip);
   LogDebug("Starting WinDivert worker for " + ip + ":" + std::to_string(server_port));
