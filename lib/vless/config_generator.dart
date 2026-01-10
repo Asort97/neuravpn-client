@@ -105,7 +105,7 @@ String generateSingBoxConfig(
   }
 
   if (dpiEvasionConfig.enableTrafficNoise) {
-    outbound['dial'] = {
+    outbound['dialer'] = {
       'noise': {
         'noise_count': 3,
         'noise_size': 120,
