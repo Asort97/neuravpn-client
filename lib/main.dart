@@ -2817,7 +2817,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Widget _buildWindowsSmartRoutingModule() {
-    final routesCount = _smartRouteEngine.exportLegacyRuleEntries().length;
     return _neuraCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2844,87 +2843,77 @@ class _VlessHomePageState extends State<VlessHomePage>
                   ),
                 ),
               ),
+              IconButton(
+                tooltip: 'Что это?',
+                icon: const Icon(Icons.help_outline, color: Colors.white70),
+                onPressed: () {
+                  showDialog(
+                    context: context,
+                    builder: (ctx) => Dialog(
+                      backgroundColor: Colors.transparent,
+                      insetPadding: const EdgeInsets.symmetric(
+                        horizontal: 28,
+                        vertical: 24,
+                      ),
+                      child: Container(
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: _neuraCardColor,
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: Colors.white.withOpacity(0.08),
+                          ),
+                        ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Умная маршрутизация',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              'Некоторые сайты, где VPN не нужен, открываются без него.\n'
+                              'А сайты, которым нужен VPN, идут через него.',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.75),
+                                height: 1.35,
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Align(
+                              alignment: Alignment.centerRight,
+                              child: FilledButton(
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: _neuraRed,
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 18,
+                                    vertical: 10,
+                                  ),
+                                ),
+                                onPressed: () => Navigator.of(ctx).pop(),
+                                child: const Text('Понятно'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
               Switch.adaptive(
                 value: _smartRouting,
                 activeColor: _neuraRed,
                 onChanged: (value) => _setSmartRouting(value),
               ),
             ],
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Уровень 3',
-            style: TextStyle(color: Colors.white.withOpacity(0.5)),
-          ),
-          const SizedBox(height: 12),
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final isNarrow = constraints.maxWidth < 360;
-              final cards = [
-                _neuraCard(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: const [
-                          Icon(Icons.trending_up, size: 16, color: _neuraRed),
-                          SizedBox(width: 6),
-                          Text(
-                            'Оптимизация',
-                            style: TextStyle(color: Colors.white54),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        _smartRouting ? 'Активно' : 'Выключено',
-                        style: const TextStyle(color: Colors.white),
-                      ),
-                    ],
-                  ),
-                ),
-                _neuraCard(
-                  padding: const EdgeInsets.all(14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: const [
-                          Icon(Icons.graphic_eq, size: 16, color: _neuraRed),
-                          SizedBox(width: 6),
-                          Text(
-                            'Маршруты',
-                            style: TextStyle(color: Colors.white54),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '$routesCount узлов',
-                        style: const TextStyle(color: Colors.white),
-                      ),
-                    ],
-                  ),
-                ),
-              ];
-              if (isNarrow) {
-                return Column(
-                  children: [
-                    cards[0],
-                    const SizedBox(height: 12),
-                    cards[1],
-                  ],
-                );
-              }
-              return Row(
-                children: [
-                  Expanded(child: cards[0]),
-                  const SizedBox(width: 12),
-                  Expanded(child: cards[1]),
-                ],
-              );
-            },
           ),
         ],
       ),
