@@ -257,6 +257,7 @@ class SingBoxController {
 
     _notifyStatus('Запуск процесса');
     try {
+      await _terminateExistingProcesses();
       final environment = Map<String, String>.from(Platform.environment);
       if (winDivertPaths != null && winDivertPaths.directory.isNotEmpty) {
         final dllDir = winDivertPaths.directory;
@@ -298,6 +299,15 @@ class SingBoxController {
     }
   }
 
+  Future<void> _terminateExistingProcesses() async {
+    if (!Platform.isWindows) return;
+    try {
+      await Process.run('taskkill', ['/F', '/IM', 'sing-box.exe']);
+    } catch (_) {
+      // Best-effort cleanup before starting a new instance.
+    }
+  }
+
   Future<void> disconnect({
     void Function(String status)? onStatus,
     void Function(String log)? onLog,
@@ -329,6 +339,36 @@ class SingBoxController {
       _emitLogs(logs);
     }
     _notifyStatus('Остановлено');
+  }
+
+  Future<void> forceTerminate() async {
+    if (Platform.isAndroid) {
+      if (_androidConnected) {
+        await _androidController.stopVpn();
+        _androidConnected = false;
+      }
+      return;
+    }
+
+    if (Platform.isWindows) {
+      try {
+        await Process.run('taskkill', ['/F', '/IM', 'sing-box.exe']);
+      } catch (_) {
+        // Best-effort cleanup for stray sing-box processes.
+      }
+    }
+
+    final process = _process;
+    if (process == null) return;
+
+    await _forceStopProcess(process);
+    await _teardownProcess();
+    final interfaceName = _activeInterfaceName;
+    _activeInterfaceName = null;
+    if (interfaceName != null) {
+      final logs = await _tunGuard.cleanupAdapter(interfaceName);
+      _emitLogs(logs);
+    }
   }
 
   Future<void> dispose() async {

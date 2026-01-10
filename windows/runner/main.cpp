@@ -41,6 +41,67 @@ std::wstring GetExecutablePath() {
   return std::wstring(buffer, length);
 }
 
+HANDLE g_job_handle = nullptr;
+HANDLE g_instance_mutex = nullptr;
+
+void EnableKillOnJobClose() {
+  if (g_job_handle != nullptr) {
+    return;
+  }
+
+  BOOL in_job = FALSE;
+  if (!::IsProcessInJob(::GetCurrentProcess(), nullptr, &in_job)) {
+    return;
+  }
+  if (in_job) {
+    return;
+  }
+
+  HANDLE job = ::CreateJobObjectW(nullptr, nullptr);
+  if (job == nullptr) {
+    return;
+  }
+
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
+  info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!::SetInformationJobObject(
+          job, JobObjectExtendedLimitInformation, &info, sizeof(info))) {
+    ::CloseHandle(job);
+    return;
+  }
+
+  if (!::AssignProcessToJobObject(job, ::GetCurrentProcess())) {
+    ::CloseHandle(job);
+    return;
+  }
+
+  g_job_handle = job;
+}
+
+bool AcquireInstanceSlot() {
+  const wchar_t* mutex_names[] = {
+      L"HappycatVpnClientInstanceSlot1",
+      L"HappycatVpnClientInstanceSlot2",
+  };
+
+  for (const auto* name : mutex_names) {
+    HANDLE handle = ::CreateMutexW(nullptr, FALSE, name);
+    if (handle == nullptr) {
+      continue;
+    }
+
+    const DWORD wait = ::WaitForSingleObject(handle, 0);
+    if (wait == WAIT_OBJECT_0) {
+      g_instance_mutex = handle;
+      return true;
+    }
+
+    ::CloseHandle(handle);
+  }
+
+  return false;
+}
+
 void EnsureUtf8Locale() {
   std::setlocale(LC_ALL, ".UTF-8");
   _setmbcp(CP_UTF8);
@@ -139,6 +200,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   EnsureUtf8Locale();
   SetSafeWorkingDirectory();
+  EnableKillOnJobClose();
+  if (!AcquireInstanceSlot()) {
+    ::MessageBoxW(nullptr,
+                  L"\u041e\u0434\u043d\u043e\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u043c\u043e\u0436\u043d\u043e \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u0432\u0430 \u044d\u043a\u0437\u0435\u043c\u043f\u043b\u044f\u0440\u0430.",
+                  L"happycat_vpnclient",
+                  MB_OK | MB_ICONWARNING);
+    return EXIT_SUCCESS;
+  }
 
   // Attach to console when present (e.g., 'flutter run') or create a
   // new console when running with a debugger.

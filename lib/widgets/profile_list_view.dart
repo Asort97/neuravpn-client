@@ -336,11 +336,6 @@ class _ProfileListViewState extends State<ProfileListView> {
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            leading: CircleAvatar(
-              radius: 16,
-              backgroundColor: _surfaceColor,
-              child: const Icon(Icons.vpn_key, size: 16, color: Colors.white70),
-            ),
             title: _configTitleMarquee(_formatVlessSummary(profile.uri), enabled: true),
             trailing: IconButton(
               tooltip: 'Удалить профиль',
@@ -514,11 +509,6 @@ class _ProfileListViewState extends State<ProfileListView> {
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            leading: CircleAvatar(
-              radius: 16,
-              backgroundColor: _surfaceColor,
-              child: const Icon(Icons.public, size: 16, color: Colors.white70),
-            ),
             title: _subscriptionProfileTitle(vlessUri, selected: true),
             onTap: () {
               final profile = VpnProfile(

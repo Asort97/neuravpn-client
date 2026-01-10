@@ -117,6 +117,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   _WindowsView _windowsView = _WindowsView.connection;
   bool _showLoadingScreen = Platform.isWindows;
   late final PageController _windowsPageController;
+  bool _singBoxWatchdogStarted = false;
   static const List<_WindowsView> _windowsViewOrder = [
     _WindowsView.connection,
     _WindowsView.splitTunneling,
@@ -261,6 +262,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
       if (Platform.isWindows) {
+        unawaited(_startSingBoxWatchdog());
         WidgetsBinding.instance.addPostFrameCallback((_) {
           unawaited(_fitWindowToDisplay());
         });
@@ -1024,6 +1026,26 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _setupTrayIcon();
   }
 
+  Future<void> _startSingBoxWatchdog() async {
+    if (_singBoxWatchdogStarted || !Platform.isWindows) return;
+    _singBoxWatchdogStarted = true;
+    final parentPid = pid;
+    final command =
+        '\$parent=$parentPid;'
+        'while (Get-Process -Id \$parent -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };'
+        'Start-Sleep -Milliseconds 200;'
+        "Stop-Process -Name 'sing-box' -Force -ErrorAction SilentlyContinue";
+    try {
+      await Process.start(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+        mode: ProcessStartMode.detached,
+      );
+    } catch (_) {
+      // Ignore: best-effort watchdog for forced app termination.
+    }
+  }
+
   Future<void> _fitWindowToDisplay() async {
     const targetWidth = 420.0;
     const targetHeight = 720.0;
@@ -1206,12 +1228,40 @@ class _VlessHomePageState extends State<VlessHomePage>
   Future<void> _handleTrayExit() async {
     if (_isExitingApp) return;
     _isExitingApp = true;
+    _stopTrafficMonitor();
+    await _dpiEvasionManager.stopNativeInjector();
+    await _singBoxController.forceTerminate();
     await _singBoxController.dispose();
     if (!_isDesktopPlatform) {
       exit(0);
     }
     await windowManager.setPreventClose(false);
     await windowManager.close();
+  }
+
+  Future<bool> _restartAsAdmin() async {
+    if (!Platform.isWindows) return false;
+    if (_isExitingApp) return true;
+    _isExitingApp = true;
+    try {
+      final exePath = Platform.resolvedExecutable;
+      await Process.start(
+        'powershell',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          'Start-Process -FilePath "$exePath" -Verb RunAs',
+        ],
+        mode: ProcessStartMode.detached,
+      );
+      unawaited(_handleTrayExit());
+      return true;
+    } catch (_) {
+      _isExitingApp = false;
+      return false;
+    }
   }
 
   @override
@@ -1677,6 +1727,10 @@ class _VlessHomePageState extends State<VlessHomePage>
 
     if (!result.success) {
       if (!mounted) return;
+      if (result.requiresAdmin && Platform.isWindows) {
+        final restarted = await _restartAsAdmin();
+        if (restarted) return;
+      }
       _showFastSnack(result.errorMessage ?? '\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f');
       setState(() {
         _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
