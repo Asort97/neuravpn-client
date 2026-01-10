@@ -75,6 +75,7 @@ flutter:
     - assets/bin/WinDivert.dll
     - assets/bin/WinDivert64.sys
     - windows/runner/resources/app_icon.ico
+    - windows/runner/resources/hc_icon.ico
     - assets/images/logo.png
     - assets/images/11zon_cropped.png
 

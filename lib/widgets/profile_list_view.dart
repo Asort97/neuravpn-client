@@ -34,10 +34,120 @@ class _ProfileListViewState extends State<ProfileListView> {
   String _formatVlessSummary(String uri) {
     final parsed = parseVlessUri(uri);
     if (parsed == null) return uri;
+    if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
     if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
     if (parsed.host.isNotEmpty) return parsed.host;
-    if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
     return uri;
+  }
+
+  String _safeDecode(String value) {
+    try {
+      return Uri.decodeComponent(value);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  String _vlessDisplayName(String uri) {
+    final parsed = parseVlessUri(uri);
+    if (parsed == null) return _safeDecode(uri);
+    final tag = parsed.tag;
+    if (tag != null && tag.trim().isNotEmpty) return _safeDecode(tag.trim());
+    final sni = parsed.sni;
+    if (sni != null && sni.trim().isNotEmpty) return sni.trim();
+    if (parsed.host.trim().isNotEmpty) return parsed.host.trim();
+    return _safeDecode(uri);
+  }
+
+  String _vlessProtocolLine(String uri) {
+    final parsed = parseVlessUri(uri);
+    final transport = (parsed?.type?.trim().isNotEmpty ?? false)
+        ? parsed!.type!.trim()
+        : 'tcp';
+    return 'VLESS / ${transport.toUpperCase()}';
+  }
+
+  Widget _configTitleMarquee(String text, {required bool enabled}) {
+    // Marquee removed: keep UI stable and performant.
+    return Text(
+      text,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: 13,
+        color: Colors.white,
+        fontWeight: enabled ? FontWeight.w700 : FontWeight.w500,
+      ),
+    );
+  }
+
+  List<String> _buildVlessTags(String uri) {
+    final parsed = parseVlessUri(uri);
+    if (parsed == null) return const [];
+
+    final tags = <String>['VLESS'];
+
+    final transport = (parsed.type?.trim().isNotEmpty ?? false)
+        ? parsed.type!.trim()
+        : 'tcp';
+    tags.add(transport.toUpperCase());
+
+    final security = parsed.security?.trim().toLowerCase() ?? '';
+    if (security == 'reality') {
+      tags.add('REALITY');
+    } else if (security == 'tls') {
+      tags.add('TLS');
+    } else {
+      tags.add('PLAIN');
+    }
+
+    final flow = parsed.flow?.trim();
+    if (flow != null && flow.isNotEmpty) {
+      tags.add(flow.toUpperCase());
+    }
+
+    return tags;
+  }
+
+  Widget _tagPill(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: _surfaceColor,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: Colors.white.withOpacity(0.08),
+        ),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(
+          color: Colors.white.withOpacity(0.85),
+          fontSize: 11.5,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+
+  Widget _subscriptionProfileTitle(String uri, {required bool selected}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _configTitleMarquee(_vlessDisplayName(uri), enabled: true),
+        const SizedBox(height: 4),
+        Text(
+          _vlessProtocolLine(uri),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontSize: 12,
+            color: Colors.white.withOpacity(0.65),
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
   }
 
   late final SubscriptionRepository _repository;
@@ -53,6 +163,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   static const Color _cardColor = Color(0xFF1A1A1A);
   static const Color _surfaceColor = Color(0xFF2A2A2A);
   static const Color _borderColor = Color(0x14FFFFFF);
+  static const Color _accentColor = Color(0xFFEF4444);
 
   @override
   void initState() {
@@ -207,12 +318,20 @@ class _ProfileListViewState extends State<ProfileListView> {
           margin: const EdgeInsets.symmetric(vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? _surfaceColor : null,
+            color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color:
-                  isSelected ? Colors.white.withOpacity(0.18) : Colors.transparent,
-              width: isSelected ? 1 : 0,
+              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              width: isSelected ? 1.3 : 0,
             ),
+            boxShadow: isSelected
+                ? [
+                    BoxShadow(
+                      color: _accentColor.withOpacity(0.18),
+                      blurRadius: 14,
+                      offset: const Offset(0, 6),
+                    ),
+                  ]
+                : null,
           ),
           child: ListTile(
             dense: true,
@@ -222,16 +341,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               backgroundColor: _surfaceColor,
               child: const Icon(Icons.vpn_key, size: 16, color: Colors.white70),
             ),
-            title: Text(
-              _formatVlessSummary(profile.uri),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 13,
-                color: Colors.white,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              ),
-            ),
+            title: _configTitleMarquee(_formatVlessSummary(profile.uri), enabled: true),
             trailing: IconButton(
               tooltip: 'Удалить профиль',
               icon: const Icon(Icons.delete, size: 18, color: Colors.redAccent),
@@ -278,12 +388,14 @@ class _ProfileListViewState extends State<ProfileListView> {
   Widget _buildSubscriptionCard(VpnSubscription subscription, bool isExpanded) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Container(
         decoration: BoxDecoration(
           color: Colors.transparent,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: _borderColor),
+          border: Border(
+            top: BorderSide(color: _borderColor),
+            bottom: BorderSide(color: _borderColor),
+          ),
         ),
         child: Column(
           children: [
@@ -384,12 +496,20 @@ class _ProfileListViewState extends State<ProfileListView> {
           margin: const EdgeInsets.symmetric(vertical: 2),
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(8),
-            color: isSelected ? _surfaceColor : null,
+            color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color:
-                  isSelected ? Colors.white.withOpacity(0.18) : Colors.transparent,
-              width: isSelected ? 1 : 0,
+              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              width: isSelected ? 1.3 : 0,
             ),
+            boxShadow: isSelected
+                ? [
+                    BoxShadow(
+                      color: _accentColor.withOpacity(0.18),
+                      blurRadius: 14,
+                      offset: const Offset(0, 6),
+                    ),
+                  ]
+                : null,
           ),
           child: ListTile(
             dense: true,
@@ -399,16 +519,7 @@ class _ProfileListViewState extends State<ProfileListView> {
               backgroundColor: _surfaceColor,
               child: const Icon(Icons.public, size: 16, color: Colors.white70),
             ),
-            title: Text(
-              _formatVlessSummary(vlessUri),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 13,
-                color: Colors.white,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-              ),
-            ),
+            title: _subscriptionProfileTitle(vlessUri, selected: true),
             onTap: () {
               final profile = VpnProfile(
                 name: _formatVlessSummary(vlessUri),

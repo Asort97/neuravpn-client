@@ -109,7 +109,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     with TrayListener, WindowListener, SingleTickerProviderStateMixin {
   static const String _updateOwner = 'Asort97';
   static const String _updateRepo = 'neuravpn-client';
-  static const String _appInstallerAssetName = 'neuravpn.appinstaller';
   static const String _updateDismissedTagKey = 'update_dismissed_tag';
   static const String _updateLastCheckKey = 'update_last_check_ms';
 
@@ -150,6 +149,10 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _isExitingApp = false;
   bool _isConnecting = false;
   bool _hasSubscriptions = false;
+  bool _trayPopupMode = false;
+  OverlayEntry? _trayOverlayEntry;
+  Rect? _trayRestoreBounds;
+  bool _trayRestoreWasVisible = false;
   late final AnimationController _connectGlowController;
   late final Animation<double> _connectGlowAnimation;
   bool _androidAppsLoaded = false;
@@ -160,6 +163,8 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _splitConfigPrefsKey = 'split_tunnel_state_v2';
   static const String _legacySplitConfigKey = 'split_tunnel_config_v1';
   static const String _trayShowKey = 'show';
+  static const String _trayConnectKey = 'connect';
+  static const String _trayDisconnectKey = 'disconnect';
   static const String _trayExitKey = 'exit';
   static const String _noPresetValue = '__none__';
   static const String _splitToggleKey = 'split_tunnel_enabled';
@@ -346,12 +351,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
   }
 
-  Uri _appInstallerUrl() {
-    return Uri.parse(
-      'https://github.com/$_updateOwner/$_updateRepo/releases/latest/download/$_appInstallerAssetName',
-    );
-  }
-
   void _showUpdateDialog(UpdateCheckResult result) {
     if (!mounted) return;
     showDialog(
@@ -424,7 +423,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                   const Spacer(),
                   FilledButton(
                     onPressed: () {
-                      _openUrl(_appInstallerUrl().toString());
+                      _openUrl(result.releaseUrl.toString());
                       Navigator.of(ctx).pop();
                     },
                     style: FilledButton.styleFrom(
@@ -438,7 +437,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                    child: const Text('\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c'),
+                    child: const Text('\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437'),
                   ),
                 ],
               ),
@@ -702,6 +701,18 @@ class _VlessHomePageState extends State<VlessHomePage>
       }
     }
     selected ??= profiles.isNotEmpty ? profiles.first : null;
+    if (selected == null && subscriptions.isNotEmpty) {
+      final firstSub = subscriptions.first;
+      final uri = firstSub.selectedProfile ??
+          (firstSub.profiles.isNotEmpty ? firstSub.profiles.first : null);
+      if (uri != null && uri.isNotEmpty) {
+        final autoName = _deriveProfileNameFromUri(uri);
+        selected = VpnProfile(
+          name: autoName.isEmpty ? _deriveSubscriptionNameFromUrl(firstSub.url) : autoName,
+          uri: uri,
+        );
+      }
+    }
 
     final storedHasKey = prefs.getBool(_hasEverAddedKeyKey) ?? false;
     _hasEverAddedKey = storedHasKey || profiles.isNotEmpty || subscriptions.isNotEmpty;
@@ -1044,20 +1055,143 @@ class _VlessHomePageState extends State<VlessHomePage>
       ],
     );
     await _trayManager.setContextMenu(menu);
+    await _updateTrayMenu();
     _trayInitialized = true;
+  }
+
+  Future<void> _updateTrayMenu() async {
+    if (!_isDesktopPlatform) return;
+
+    final canConnect =
+        !_isConnecting && !_isRunning && _controller.text.trim().isNotEmpty;
+    final canDisconnect = !_isConnecting && _isRunning;
+
+    final statusLabel = _isConnecting
+        ? 'Статус: подключается…'
+        : _isRunning
+            ? 'Статус: подключено'
+            : 'Статус: не подключено';
+
+    final actionItem = canConnect
+        ? MenuItem(key: _trayConnectKey, label: 'Подключиться')
+        : canDisconnect
+            ? MenuItem(key: _trayDisconnectKey, label: 'Отключиться')
+            : MenuItem(
+                label: _isConnecting
+                    ? 'Подключается…'
+                    : _controller.text.trim().isEmpty
+                        ? 'Нет профиля для подключения'
+                        : _isRunning
+                            ? 'Подключено'
+                            : 'Готово',
+                disabled: true,
+              );
+
+    final menu = Menu(
+      items: [
+        MenuItem(label: statusLabel, disabled: true),
+        MenuItem.separator(),
+        actionItem,
+        MenuItem.separator(),
+        MenuItem(key: _trayShowKey, label: 'Показать окно'),
+        MenuItem.separator(),
+        MenuItem(key: _trayExitKey, label: 'Выход'),
+      ],
+    );
+
+    await _trayManager.setContextMenu(menu);
   }
 
   Future<String> _prepareTrayIconFile() async {
     final tmpDir = await getTemporaryDirectory();
-    final localIco = File('windows/runner/resources/hc_icon.ico');
-    if (await localIco.exists()) {
-      return localIco.absolute.path;
+    const primaryAssetKey = 'windows/runner/resources/hc_icon.ico';
+    const fallbackAssetKey = 'windows/runner/resources/app_icon.ico';
+    ByteData icoData;
+    try {
+      icoData = await rootBundle.load(primaryAssetKey);
+    } catch (_) {
+      icoData = await rootBundle.load(fallbackAssetKey);
     }
-    const icoAssetKey = 'windows/runner/resources/hc_icon.ico';
-    final icoData = await rootBundle.load(icoAssetKey);
     final icoFile = File('${tmpDir.path}/neuravpn_tray.ico');
     await icoFile.writeAsBytes(icoData.buffer.asUint8List(), flush: true);
     return icoFile.path;
+  }
+
+  Future<void> _hideToTray({bool showHint = false}) async {
+    if (!_isDesktopPlatform) return;
+    await windowManager.hide();
+    if (showHint && mounted) {
+      _showFastSnack('Свернуто в трей');
+    }
+  }
+
+  String get _trayStatusLabel {
+    if (_isConnecting) return 'Статус: подключается…';
+    if (_isRunning) return 'Статус: подключено';
+    return 'Статус: не подключено';
+  }
+
+  Future<void> _hideTrayPopup({bool restoreMainWindow = false}) async {
+    if (!_isDesktopPlatform) return;
+
+    _trayOverlayEntry?.remove();
+    _trayOverlayEntry = null;
+
+    if (!_trayPopupMode) return;
+
+    setState(() => _trayPopupMode = false);
+    await windowManager.setAlwaysOnTop(false);
+    await windowManager.setSkipTaskbar(false);
+
+    await windowManager.hide();
+
+    if (_trayRestoreWasVisible) {
+      final bounds = _trayRestoreBounds;
+      if (bounds != null) {
+        await windowManager.setSize(bounds.size);
+        await windowManager.setPosition(bounds.topLeft);
+      } else if (Platform.isWindows) {
+        await _fitWindowToDisplay();
+      }
+      await windowManager.show();
+      await windowManager.focus();
+    } else if (Platform.isWindows) {
+      unawaited(_fitWindowToDisplay());
+    }
+
+    _trayRestoreBounds = null;
+    _trayRestoreWasVisible = false;
+  }
+
+  Future<void> _showTrayMenu() async {
+    if (!_isDesktopPlatform) return;
+
+    final isVisible = await windowManager.isVisible();
+    _trayRestoreWasVisible = isVisible;
+    _trayRestoreBounds = isVisible ? await windowManager.getBounds() : null;
+
+    if (isVisible) {
+      await windowManager.hide();
+    }
+
+    final cursor = _getCursorPosition();
+    const menuWidth = 220.0;
+    const menuHeight = 168.0;
+    final x = math.max(0.0, cursor.dx - menuWidth + 12);
+    final y = math.max(0.0, cursor.dy - menuHeight - 8.0);
+
+    setState(() => _trayPopupMode = true);
+
+    await windowManager.setSize(const Size(menuWidth, menuHeight));
+    await windowManager.setPosition(Offset(x, y));
+    await windowManager.setSkipTaskbar(true);
+    await windowManager.setAlwaysOnTop(true);
+    await windowManager.show();
+    await windowManager.focus();
+  }
+
+  Offset _getCursorPosition() {
+    return Offset.zero;
   }
 
   Future<void> _restoreWindowFromTray() async {
@@ -1096,6 +1230,18 @@ class _VlessHomePageState extends State<VlessHomePage>
       case _trayShowKey:
         unawaited(_restoreWindowFromTray());
         break;
+      case _trayConnectKey:
+        unawaited(() async {
+          await _start();
+          await _updateTrayMenu();
+        }());
+        break;
+      case _trayDisconnectKey:
+        unawaited(() async {
+          await _stop();
+          await _updateTrayMenu();
+        }());
+        break;
       case _trayExitKey:
         unawaited(_handleTrayExit());
         break;
@@ -1107,7 +1253,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_isExitingApp) {
       return;
     }
-    unawaited(windowManager.hide());
+    unawaited(_hideToTray());
   }
 
   Future<void> _promptSavePreset() async {
@@ -1351,6 +1497,15 @@ class _VlessHomePageState extends State<VlessHomePage>
         );
         await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
+
+        if (!mounted) return;
+        final uri = profiles.first;
+        final autoName = _deriveProfileNameFromUri(uri);
+        final profile = VpnProfile(
+          name: autoName.isEmpty ? _deriveSubscriptionNameFromUrl(url) : autoName,
+          uri: uri,
+        );
+        await _selectCurrentProfile(profile);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Не удалось добавить: ссылка уже есть')),
@@ -1503,6 +1658,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _isConnecting = true;
       _logLines.clear();
     });
+    unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
 
@@ -1514,6 +1670,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = _mapStatus(value));
+        unawaited(_updateTrayMenu());
       },
       onLog: (line) => _appendLogs([line]),
     );
@@ -1525,6 +1682,7 @@ class _VlessHomePageState extends State<VlessHomePage>
         _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
         _isConnecting = false;
       });
+      unawaited(_updateTrayMenu());
       _updateConnectGlowTicker();
       _stopTrafficMonitor();
       return;
@@ -1536,6 +1694,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
       _isConnecting = false;
     });
+    unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
     unawaited(_applyDpiEvasionInjector());
@@ -1548,6 +1707,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = _mapStatus(value));
+        unawaited(_updateTrayMenu());
       },
       onLog: (line) => _appendLogs([line]),
     );
@@ -1557,6 +1717,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
       _isConnecting = false;
     });
+    unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _stopTrafficMonitor();
   }
@@ -1947,7 +2108,7 @@ class _VlessHomePageState extends State<VlessHomePage>
             _buildWindowButton(
               icon: Icons.close,
               hoverColor: _neuraRed.withOpacity(0.2),
-              onPressed: _handleTrayExit,
+              onPressed: () => unawaited(_hideToTray(showHint: true)),
             ),
           ],
         ),
@@ -4886,5 +5047,198 @@ class _TrafficGraphPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _TrafficGraphPainter oldDelegate) {
     return oldDelegate.samples != samples;
+  }
+}
+
+class _NeuraTrayMenu extends StatelessWidget {
+  const _NeuraTrayMenu({
+    required this.status,
+    required this.canConnect,
+    required this.canDisconnect,
+    required this.onConnect,
+    required this.onDisconnect,
+    required this.onShow,
+    required this.onExit,
+  });
+
+  final String status;
+  final bool canConnect;
+  final bool canDisconnect;
+  final VoidCallback onConnect;
+  final VoidCallback onDisconnect;
+  final VoidCallback onShow;
+  final VoidCallback onExit;
+
+  static const Color _card = Color(0xFF1A1A1A);
+  static const Color _surface = Color(0xFF2A2A2A);
+  static const Color _red = Color(0xFFEF4444);
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 110),
+      curve: Curves.easeOutCubic,
+      builder: (context, t, child) {
+        return Opacity(
+          opacity: t,
+          child: Transform.translate(
+            offset: Offset(0, (1 - t) * 6),
+            child: Transform.scale(
+              scale: 0.98 + (t * 0.02),
+              alignment: Alignment.topRight,
+              child: child,
+            ),
+          ),
+        );
+      },
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: _card,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withOpacity(0.10)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.40),
+              blurRadius: 18,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _MenuHeader(text: status),
+              _MenuDivider(),
+              if (canConnect)
+                _MenuItem(
+                  icon: Icons.power_settings_new,
+                  label: 'Подключиться',
+                  accent: _red,
+                  onTap: onConnect,
+                )
+              else if (canDisconnect)
+                _MenuItem(
+                  icon: Icons.power_off,
+                  label: 'Отключиться',
+                  accent: _red,
+                  onTap: onDisconnect,
+                )
+              else
+                _MenuItem(
+                  icon: Icons.hourglass_bottom,
+                  label: 'Недоступно',
+                  disabled: true,
+                  onTap: () {},
+                ),
+              _MenuDivider(),
+              _MenuItem(
+                icon: Icons.open_in_new,
+                label: 'Показать окно',
+                onTap: onShow,
+              ),
+              _MenuDivider(),
+              _MenuItem(
+                icon: Icons.logout,
+                label: 'Выход',
+                onTap: onExit,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MenuHeader extends StatelessWidget {
+  const _MenuHeader({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      color: _NeuraTrayMenu._surface,
+      child: Text(
+        text,
+        style: TextStyle(
+          color: Colors.white.withOpacity(0.85),
+          fontSize: 12.5,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+class _MenuDivider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Divider(height: 1, thickness: 1, color: Colors.white.withOpacity(0.06));
+  }
+}
+
+class _MenuItem extends StatefulWidget {
+  const _MenuItem({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.accent,
+    this.disabled = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final Color? accent;
+  final bool disabled;
+
+  @override
+  State<_MenuItem> createState() => _MenuItemState();
+}
+
+class _MenuItemState extends State<_MenuItem> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = !widget.disabled;
+    final bg = _hover && enabled ? Colors.white.withOpacity(0.06) : Colors.transparent;
+    final fg = enabled ? Colors.white.withOpacity(0.9) : Colors.white.withOpacity(0.35);
+    final iconColor = widget.accent ?? fg;
+
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Material(
+        color: bg,
+        child: InkWell(
+          onTap: enabled ? widget.onTap : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            child: Row(
+              children: [
+                Icon(widget.icon, size: 18, color: iconColor),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    widget.label,
+                    style: TextStyle(
+                      color: fg,
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
