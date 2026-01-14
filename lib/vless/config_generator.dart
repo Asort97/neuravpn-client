@@ -69,8 +69,8 @@ String generateSingBoxConfig(
       if (alpn.isNotEmpty) 'alpn': alpn,
       'utls': {'enabled': true, 'fingerprint': fingerprint},
     };
-    tls['fragment'] = dpiEvasionConfig.enableTlsFragment;
-    tls['record_fragment'] = dpiEvasionConfig.enableTlsRecordFragment;
+    // Отключаем TLS handshake fragmentation: в текущей версии ломает соединения.
+    tls['fragment'] = false;
     if (isReality) {
       final shortIdList = (realityShortId ?? '')
           .split(',')
@@ -93,26 +93,21 @@ String generateSingBoxConfig(
   if (transport != null) {
     outbound['transport'] = transport;
   }
-  if (dpiEvasionConfig.enableFragmentation && useTls) {
+  if (dpiEvasionConfig.enableFragmentation &&
+      dpiEvasionConfig.enableTlsFragment &&
+      useTls) {
     _applyFragmentation(outbound, transportType);
   }
 
+  // Multiplex: включаем smux без padding, чтобы не рвать сессии.
   if (dpiEvasionConfig.enableMultiplexPadding) {
     outbound['multiplex'] = {
       'enabled': true,
-      'padding': true,
+      'protocol': 'smux',
+      'padding': false,
     };
   }
 
-  if (dpiEvasionConfig.enableTrafficNoise) {
-    outbound['dialer'] = {
-      'noise': {
-        'noise_count': 3,
-        'noise_size': 120,
-        'noise_delay': 20,
-      },
-    };
-  }
 
   final appRules = enableApplicationRules
       ? _buildApplicationRules(splitConfig, vpnTag)
