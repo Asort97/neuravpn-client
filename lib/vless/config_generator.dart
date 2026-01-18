@@ -31,7 +31,8 @@ String generateSingBoxConfig(
   final alpn = p['alpn'] != null
       ? p['alpn']!.split(',')
       : (useTls ? <String>['h2', 'http/1.1'] : <String>[]);
-  final flow = p['flow'];
+  final flow = p['flow'] ?? '';
+  final isVision = flow.contains('vision');
   final fingerprint = p['fp'] ?? 'chrome';
   final path = p['path'];
   final realityPublicKey = p['pbk'];
@@ -50,10 +51,9 @@ String generateSingBoxConfig(
     'domain_resolver': 'dns-remote',
   };
 
-  if (flow != null && flow.isNotEmpty) {
+  if (flow.isNotEmpty) {
     outbound['flow'] = flow;
-    if ((packetEncoding == null || packetEncoding.isEmpty) &&
-        flow.contains('vision')) {
+    if ((packetEncoding == null || packetEncoding.isEmpty) && isVision) {
       outbound['packet_encoding'] = 'xudp';
     }
   }
@@ -88,10 +88,12 @@ String generateSingBoxConfig(
     outbound['tls'] = tls;
   }
 
-  // transportType=tcp в sing-box не задаётся как отдельный transport.
-  final transport = _buildTransport(transportType, link, p, path, serverName);
-  if (transport != null) {
-    outbound['transport'] = transport;
+  // transport: для vision/Reality убираем; иначе обычное построение
+  if (!isVision && !isReality) {
+    final transport = _buildTransport(transportType, link, p, path, serverName);
+    if (transport != null) {
+      outbound['transport'] = transport;
+    }
   }
   if (dpiEvasionConfig.enableFragmentation &&
       dpiEvasionConfig.enableTlsFragment &&
@@ -400,6 +402,7 @@ Map<String, dynamic>? _buildTransport(
         if (params['mode'] != null && params['mode']!.isNotEmpty)
           'mode': params['mode'],
       };
+    case 'xhttp':
     case 'http':
     case 'h2':
       return _buildHttpTransport(params, path, headerHost, serverName);

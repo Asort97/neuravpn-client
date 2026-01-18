@@ -74,6 +74,8 @@ flutter:
     - assets/bin/sing-box.exe
     - assets/bin/WinDivert.dll
     - assets/bin/WinDivert64.sys
+    - assets/zapret/bin/
+    - assets/zapret/lists/
     - windows/runner/resources/app_icon.ico
     - windows/runner/resources/hc_icon.ico
     - assets/images/logo.png

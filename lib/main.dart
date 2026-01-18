@@ -27,6 +27,7 @@ import 'services/singbox_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
+import 'package:happycat_vpnclient/services/zapret_runner.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
@@ -34,6 +35,7 @@ import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
 import 'widgets/loading_screen.dart';
+import 'package:happycat_vpnclient/services/zapret_runner.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -192,12 +194,21 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _dpiMultiplexPaddingKey = 'dpi_multiplex_padding_enabled';
   static const String _dpiTcpWindowClampKey = 'dpi_tcp_window_clamp_enabled';
   static const String _dpiSniRandomizationKey = 'dpi_sni_randomization_enabled';
+  static const String _zapretEnabledKey = 'zapret_enabled';
+  static const String _zapretModeKey = 'zapret_mode';
+  static const String _zapretProfileKey = 'zapret_profile';
+  static const String _zapretAutoUpdateKey = 'zapret_auto_update';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
   final ConnectivityTester _connectivityTester = ConnectivityTester();
   late final List<ConnectivityTestTarget> _connectivityTargets =
       buildDefaultConnectivityTargets();
   final DpiEvasionManager _dpiEvasionManager = DpiEvasionManager();
   DpiEvasionConfig _dpiEvasionConfig = DpiEvasionConfig.balanced;
+  final ZapretRunner _zapretRunner = ZapretRunner();
+  bool _zapretEnabled = false;
+  bool _zapretAutoUpdate = true;
+  ZapretMode _zapretMode = ZapretMode.off;
+  ZapretProfile _zapretProfile = ZapretProfile.basic;
   final Map<String, ConnectivityTestResult> _connectivityResults = {};
   bool _isConnectivityTesting = false;
   int _connectivityCompleted = 0;
@@ -225,7 +236,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   String get _pingLabel => _pingInProgress
-      ? 'Измерение...'
+      ? 'РР·РјРµСЂРµРЅРёРµ...'
       : (_pingMs != null ? '$_pingMs мс' : '--');
   SplitTunnelConfig get _activeSplitConfig =>
       _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
@@ -859,6 +870,9 @@ class _VlessHomePageState extends State<VlessHomePage>
       if (fallbackUri != null && fallbackUri.isNotEmpty) {
         _controller.text = fallbackUri;
       }
+    }
+    if (_zapretEnabled && _zapretMode == ZapretMode.zapretOnly) {
+      unawaited(_startZapret(forVpnStart: false));
     }
   }
 
@@ -1715,6 +1729,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
+    await _startZapret(forVpnStart: true);
 
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
@@ -1777,6 +1792,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       onLog: (line) => _appendLogs([line]),
     );
     await _dpiEvasionManager.stopNativeInjector();
+    await _stopZapretIfNeeded();
     if (!mounted) return;
     setState(() {
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -1857,6 +1873,87 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
   }
 
+
+  Future<void> _persistZapretSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_zapretEnabledKey, _zapretEnabled);
+    await prefs.setBool(_zapretAutoUpdateKey, _zapretAutoUpdate);
+    await prefs.setInt(_zapretModeKey, _zapretMode.index);
+    await prefs.setInt(_zapretProfileKey, _zapretProfile.index);
+  }
+
+  Future<void> _startZapret({required bool forVpnStart}) async {
+    if (!Platform.isWindows) return;
+    if (!_zapretEnabled || _zapretMode == ZapretMode.off) return;
+    if (_zapretMode == ZapretMode.vpnPlusZapret && !forVpnStart && !_isRunning) {
+      return;
+    }
+    if (_zapretAutoUpdate) {
+      unawaited(_zapretRunner.updateListsFromUrls(
+        generalUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/list-general.txt'),
+        excludeUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/list-exclude.txt'),
+        ipsetUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/ipset-all.txt'),
+        ipsetExcludeUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/ipset-exclude.txt'),
+      ));
+    }
+    final useGameFilter = _effectiveSplitConfig.smartRouting;
+    final extraIpExcludes = useGameFilter
+        ? _smartRouteEngine.exportLegacyRuleEntries()
+        : const <String>[];
+    await _zapretRunner.start(
+      profile: _zapretProfile,
+      useGameFilter: useGameFilter,
+      extraIpExcludes: extraIpExcludes,
+      extraHostExcludes: const <String>[],
+    );
+  }
+
+  Future<void> _stopZapretIfNeeded() async {
+    if (!Platform.isWindows) return;
+    if (!_zapretRunner.isRunning) return;
+    if (_zapretMode == ZapretMode.zapretOnly && _zapretEnabled) {
+      return;
+    }
+    await _zapretRunner.stop();
+  }
+
+  Future<void> _setZapretEnabled(bool enabled) async {
+    if (_zapretEnabled == enabled) return;
+    setState(() => _zapretEnabled = enabled);
+    await _persistZapretSettings();
+    if (!enabled) {
+      await _zapretRunner.stop();
+      return;
+    }
+    await _startZapret(forVpnStart: _isRunning);
+  }
+
+  Future<void> _setZapretMode(ZapretMode mode) async {
+    if (_zapretMode == mode) return;
+    setState(() => _zapretMode = mode);
+    await _persistZapretSettings();
+    if (!_zapretEnabled || mode == ZapretMode.off) {
+      await _zapretRunner.stop();
+      return;
+    }
+    await _startZapret(forVpnStart: _isRunning || mode == ZapretMode.zapretOnly);
+  }
+
+  Future<void> _setZapretProfile(ZapretProfile profile) async {
+    if (_zapretProfile == profile) return;
+    setState(() => _zapretProfile = profile);
+    await _persistZapretSettings();
+    if (_zapretRunner.isRunning) {
+      await _startZapret(forVpnStart: _isRunning || _zapretMode == ZapretMode.zapretOnly);
+    }
+  }
+
+  Future<void> _setZapretAutoUpdate(bool enabled) async {
+    if (_zapretAutoUpdate == enabled) return;
+    setState(() => _zapretAutoUpdate = enabled);
+    await _persistZapretSettings();
+  }
+
   void _appendLogs(Iterable<String> entries) {
     final iterable = entries.where((e) => e.trim().isNotEmpty).toList();
     if (iterable.isEmpty) return;
@@ -1876,7 +1973,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       });
     });
   }
-
 
   void _showConfigDialog(BuildContext context) {
     showDialog(
@@ -2550,8 +2646,100 @@ class _VlessHomePageState extends State<VlessHomePage>
           ),
         ),
         const SizedBox(height: 16),
+        _buildZapretSettingsCard(),
+        const SizedBox(height: 16),
         _buildWindowsLogPanel(),
       ],
+    );
+  }
+
+
+  Widget _buildZapretSettingsCard() {
+    final isWindows = Platform.isWindows;
+    final textColor = Colors.white.withOpacity(0.8);
+    return _neuraCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: _neuraSurface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                ),
+                child: const Icon(Icons.shield_outlined, color: _neuraRed, size: 18),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'Zapret (WinDivert)',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white,
+                  ),
+                ),
+              ),
+              Switch.adaptive(
+                value: _zapretEnabled,
+                onChanged: isWindows ? (value) => _setZapretEnabled(value) : null,
+                activeColor: _neuraRed,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<ZapretMode>(
+            decoration: const InputDecoration(labelText: 'Mode'),
+            value: _zapretMode,
+            onChanged: (_zapretEnabled && isWindows)
+                ? (value) {
+                    if (value != null) _setZapretMode(value);
+                  }
+                : null,
+            items: const [
+              DropdownMenuItem(value: ZapretMode.off, child: Text('Off')),
+              DropdownMenuItem(value: ZapretMode.zapretOnly, child: Text('Zapret only')),
+              DropdownMenuItem(value: ZapretMode.vpnPlusZapret, child: Text('VPN + Zapret')),
+            ],
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<ZapretProfile>(
+            decoration: const InputDecoration(labelText: 'Profile'),
+            value: _zapretProfile,
+            onChanged: (_zapretEnabled && isWindows)
+                ? (value) {
+                    if (value != null) _setZapretProfile(value);
+                  }
+                : null,
+            items: const [
+              DropdownMenuItem(value: ZapretProfile.basic, child: Text('basic (default)')),
+              DropdownMenuItem(value: ZapretProfile.alt10, child: Text('alt10')),
+              DropdownMenuItem(value: ZapretProfile.alt11, child: Text('alt11')),
+            ],
+          ),
+          const SizedBox(height: 12),
+          SwitchListTile.adaptive(
+            value: _zapretAutoUpdate,
+            onChanged: (_zapretEnabled && isWindows)
+                ? (value) => _setZapretAutoUpdate(value)
+                : null,
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            activeColor: _neuraRed,
+            title: const Text('Auto-update lists'),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            isWindows
+                ? 'Runs winws.exe with DPI bypass rules. In "VPN + Zapret" mode it starts together with VPN.'
+                : 'Zapret requires Windows.',
+            style: TextStyle(color: textColor, fontSize: 12),
+          ),
+        ],
+      ),
     );
   }
 
@@ -3828,7 +4016,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               value: _noPresetValue,
               child: buildTile(
                 title: 'Без пресета',
-                subtitle: 'Использовать текущие настройки',
+                subtitle: 'РСЃРїРѕР»СЊР·РѕРІР°С‚СЊ С‚РµРєСѓС‰РёРµ РЅР°СЃС‚СЂРѕР№РєРё',
                 selected: selectedValue == _noPresetValue,
                 icon: Icons.remove_circle_outline,
               ),
@@ -5339,3 +5527,11 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
+
+
+
+
+
+
+
+
