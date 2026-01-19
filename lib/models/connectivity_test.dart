@@ -9,6 +9,7 @@ class ConnectivityTestTarget {
 
 class ConnectivityTestResult {
   ConnectivityTestResult({
+    required this.domain,
     required this.status,
     this.error,
     this.durationMs,
@@ -17,6 +18,7 @@ class ConnectivityTestResult {
     this.httpStatus,
   });
 
+  final String domain;
   final String status;
   final String route;
   final DateTime timestamp;
@@ -25,6 +27,7 @@ class ConnectivityTestResult {
   final int? httpStatus;
 
   Map<String, dynamic> toJson() => {
+    'domain': domain,
     'status': status,
     'route': route,
     if (durationMs != null) 'time_ms': durationMs,

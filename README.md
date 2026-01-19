@@ -1,5 +1,16 @@
 # happycat_vpnclient
 
+
+## Smart Routing Zapret (cross-platform)
+- Adds a third path: `direct-evasion` (direct + evasion proxy) without IP change.
+- Live telemetry: local DNS proxy + direct-evasion SOCKS proxy for real traffic signals.
+- Auto-probe: local SOCKS probes through VPN/direct/direct-evasion, rate-limited.
+- Bootstrap suspects: uses zapret domain lists only as candidates for probing.
+- Learned decisions cached per network profile for 12h; resettable in advanced.
+- Legacy WinDivert-based mode is disabled by default.
+
+Limitations: relies on SNI/HTTP host classification and lightweight TLS fragmentation (no TTL tricks).
+
 VLESS VPN клиент на Flutter для Windows с полноценным TUN туннелем (wintun). UI принимает VLESS URI, генерирует конфиг для **sing-box** с TUN inbound, создаёт системный VPN туннель для всего устройства.
 
 ## Быстрый старт (Windows)

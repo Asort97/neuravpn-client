@@ -171,6 +171,7 @@ class ConnectivityTester {
     stopwatch.stop();
     final durationMs = stopwatch.elapsedMilliseconds;
     return ConnectivityTestResult(
+      domain: target.domain,
       status: status,
       error: error,
       durationMs: durationMs,

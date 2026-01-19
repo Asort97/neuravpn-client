@@ -9,9 +9,12 @@ import 'windows_tun_guard.dart';
 import 'windivert_manager.dart';
 import 'wintun_manager.dart';
 import '../services/smart_route_engine.dart';
+import 'domain_groups.dart';
+import 'routing_decision_engine.dart';
 import '../vless/config_generator.dart';
 import '../vless/vless_parser.dart';
 import 'dpi_evasion_config.dart';
+import 'live_telemetry_config.dart';
 
 class SingBoxStartResult {
   final bool success;
@@ -100,6 +103,13 @@ class SingBoxController {
     required String rawUri,
     required SplitTunnelConfig splitConfig,
     SmartRouteEngine? smartRouteEngine,
+    RoutingDecisionEngine? routingDecisionEngine,
+    DomainGroupResolver? domainGroupResolver,
+    bool enableSmartRoutingZapret = false,
+    bool smartRoutingZapretAggressive = false,
+    String? networkProfileId,
+    LiveTelemetryConfig? liveTelemetryConfig,
+    bool enableLegacyWinDivert = false,
     DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
     void Function(String status)? onStatus,
     void Function(String log)? onLog,
@@ -120,6 +130,7 @@ class SingBoxController {
       return SingBoxStartResult.failure('Ошибка: неверный формат VLESS URI');
     }
     _parsedLink = parsed;
+    final vpnTag = parsed.tag ?? 'vless-out';
 
     if (!Platform.isWindows && !Platform.isAndroid) {
       return SingBoxStartResult.failure('Платформа не поддерживается');
@@ -162,14 +173,16 @@ class SingBoxController {
               .then(_emitLogs),
         );
       }
-
-      _notifyStatus('Подготовка WinDivert');
-      winDivertPaths = await _winDivertManager.ensureAvailable();
-      if (winDivertPaths == null || !winDivertPaths.isReady) {
-        return SingBoxStartResult.failure(
-          'WinDivert не найден. Убедитесь, что WinDivert.dll и WinDivert64.sys добавлены в assets/bin.',
-        );
+      if (enableLegacyWinDivert) {
+        _notifyStatus('Preparing WinDivert (legacy)');
+        winDivertPaths = await _winDivertManager.ensureAvailable();
+        if (winDivertPaths == null || !winDivertPaths.isReady) {
+          return SingBoxStartResult.failure(
+            'WinDivert is not available. Copy WinDivert.dll and WinDivert64.sys into assets/bin.',
+          );
+        }
       }
+
     } else {
       _activeInterfaceName = null;
     }
@@ -180,6 +193,10 @@ class SingBoxController {
 
     _notifyStatus('Генерация конфига');
     final extraRouteRules = <Map<String, dynamic>>[];
+    final extraOutbounds = <Map<String, dynamic>>[];
+    final extraInbounds = <Map<String, dynamic>>[];
+    List<Map<String, dynamic>>? dnsServers;
+    String? dnsFinalTag;
     final useSmartEngineRules =
         smartRouteEngine != null && splitConfig.smartRouting;
     if (useSmartEngineRules) {
@@ -187,6 +204,132 @@ class SingBoxController {
         smartRouteEngine.buildRouteRules(outboundTag: 'direct'),
       );
     }
+    if (liveTelemetryConfig != null) {
+      if (liveTelemetryConfig.dnsPort != null) {
+        dnsServers = [
+          {
+            'type': 'udp',
+            'tag': 'dns-local',
+            'server': '127.0.0.1',
+            'server_port': liveTelemetryConfig.dnsPort,
+          },
+          {
+            'type': 'udp',
+            'tag': 'dns-remote',
+            'server': '8.8.8.8',
+            'server_port': 53,
+          },
+        ];
+        dnsFinalTag = 'dns-local';
+      } else {
+        dnsServers = null;
+        dnsFinalTag = null;
+      }
+
+      extraInbounds.addAll([
+        {
+          'type': 'socks',
+          'tag': 'probe-vpn',
+          'listen': '127.0.0.1',
+          'listen_port': liveTelemetryConfig.probeVpnPort,
+          'sniff': true,
+        },
+        {
+          'type': 'socks',
+          'tag': 'probe-direct',
+          'listen': '127.0.0.1',
+          'listen_port': liveTelemetryConfig.probeDirectPort,
+          'sniff': true,
+        },
+        {
+          'type': 'socks',
+          'tag': 'probe-evasion',
+          'listen': '127.0.0.1',
+          'listen_port': liveTelemetryConfig.probeEvasionPort,
+          'sniff': true,
+        },
+      ]);
+
+      extraRouteRules.addAll([
+        {'inbound': 'probe-vpn', 'outbound': vpnTag},
+        {'inbound': 'probe-direct', 'outbound': 'direct'},
+        {'inbound': 'probe-evasion', 'outbound': 'direct-evasion'},
+      ]);
+    }
+
+    if (enableSmartRoutingZapret &&
+        routingDecisionEngine != null &&
+        domainGroupResolver != null) {
+      final profileId = (networkProfileId == null || networkProfileId.isEmpty)
+          ? 'default'
+          : networkProfileId;
+      final learned =
+          await routingDecisionEngine.decisionsForProfile(profileId);
+      final learnedDomains = <Map<String, dynamic>>[];
+      for (final entry in learned.entries) {
+        if (entry.value.path == RoutingPath.vpn) continue;
+        final domains = entry.value.domains;
+        final resolvedDomains = <String>{};
+        if (domains.isNotEmpty) {
+          resolvedDomains.addAll(domains);
+        } else {
+          final group = domainGroupResolver.groupById(entry.key);
+          if (group != null) {
+            resolvedDomains.addAll(group.domains);
+          }
+        }
+        if (resolvedDomains.isEmpty) continue;
+        final domain = <String>[];
+        final suffix = <String>[];
+        for (final raw in resolvedDomains) {
+          final value = raw.trim();
+          if (value.isEmpty) continue;
+          if (value.startsWith('.')) {
+            suffix.add(value.substring(1));
+          } else if (!value.contains('.')) {
+            suffix.add(value);
+          } else {
+            domain.add(value);
+          }
+        }
+        if (domain.isEmpty && suffix.isEmpty) continue;
+        learnedDomains.add({
+          if (domain.isNotEmpty) 'domain': domain,
+          if (suffix.isNotEmpty) 'domain_suffix': suffix,
+          'outbound': entry.value.path == RoutingPath.direct
+              ? 'direct'
+              : 'direct-evasion',
+        });
+      }
+
+      if (learnedDomains.isNotEmpty) {
+        extraRouteRules.addAll(learnedDomains);
+      }
+
+      if (liveTelemetryConfig != null) {
+        extraOutbounds.add({
+          'type': 'socks',
+          'tag': 'direct-evasion',
+          'server': '127.0.0.1',
+          'server_port': liveTelemetryConfig.evasionProxyPort,
+          'version': '5',
+        });
+      } else {
+        extraOutbounds.add({
+          'type': 'direct',
+          'tag': 'direct-evasion',
+        });
+        extraRouteRules.add({
+          'network': 'tcp',
+          'outbound': 'direct-evasion',
+          'action': 'route-options',
+          'tls_fragment': true,
+          if (smartRoutingZapretAggressive)
+            'tls_fragment_fallback_delay': '500ms',
+        });
+      }
+    }
+
     if (dpiEvasionConfig.enableTlsFragment) {
       extraRouteRules.add(
         SmartRouteEngine.buildTlsFragmentRouteOptionsRule(
@@ -212,6 +355,10 @@ class SingBoxController {
           ? splitConfig.smartDomains
           : const <String>[],
       extraRouteRules: extraRouteRules,
+      extraOutbounds: extraOutbounds,
+      extraInbounds: extraInbounds,
+      dnsServers: dnsServers,
+      dnsFinalTag: dnsFinalTag,
       dpiEvasionConfig: dpiEvasionConfig,
       clashApiPort: Platform.isWindows ? _clashApiPort : null,
     );

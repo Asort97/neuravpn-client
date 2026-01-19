@@ -20,6 +20,7 @@ void main() {
 
     final results = <String, ConnectivityTestResult>{
       'example.com': ConnectivityTestResult(
+        domain: 'example.com',
         status: 'ok',
         route: 'vpn',
         durationMs: 120,
@@ -27,6 +28,7 @@ void main() {
         timestamp: now,
       ),
       'example.org': ConnectivityTestResult(
+        domain: 'example.org',
         status: 'timeout',
         route: 'vpn',
         error: 'timeout',

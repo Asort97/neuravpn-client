@@ -19,6 +19,10 @@ String generateSingBoxConfig(
   bool smartRouting = false,
   List<String> smartDomains = const <String>[],
   List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  List<Map<String, dynamic>> extraOutbounds = const <Map<String, dynamic>>[],
+  List<Map<String, dynamic>> extraInbounds = const <Map<String, dynamic>>[],
+  List<Map<String, dynamic>>? dnsServers,
+  String? dnsFinalTag,
   DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
   int? clashApiPort,
 }) {
@@ -122,7 +126,7 @@ String generateSingBoxConfig(
   final config = {
     'log': {'level': 'debug', 'timestamp': true, 'output': 'stderr'},
     'dns': {
-      'servers': [
+      'servers': dnsServers ?? [
         {
           // Avoid DNS loopback with TUN by sending DNS traffic via direct.
           'type': 'udp',
@@ -137,7 +141,7 @@ String generateSingBoxConfig(
           'server_port': 53,
         },
       ],
-      'final': 'dns-remote',
+      'final': dnsFinalTag ?? 'dns-remote',
       'strategy': 'prefer_ipv4',
       'independent_cache': true,
       'disable_cache': false,
@@ -159,14 +163,16 @@ String generateSingBoxConfig(
         'sniff': true,
         'sniff_override_destination': false,
       },
+      ...extraInbounds,
     ],
     'outbounds': [
       _optimizeOutbound(outbound, vpnTag),
       {'type': 'direct', 'tag': 'direct'},
+      ...extraOutbounds,
     ],
     'route': {
       'auto_detect_interface': autoDetectInterface,
-      'default_domain_resolver': 'dns-remote',
+      'default_domain_resolver': dnsFinalTag ?? 'dns-remote',
       'final': _getDefaultOutbound(
         splitConfig,
         vpnTag,
@@ -176,8 +182,8 @@ String generateSingBoxConfig(
         // Hijack DNS queries using rule action instead of legacy dns outbound
         {'protocol': 'dns', 'action': 'hijack-dns'},
 
-        ...extraRouteRules,
         ...smartRules,
+        ...extraRouteRules,
         ..._buildRouteRules(splitConfig, vpnTag),
         ...appRules,
       ],

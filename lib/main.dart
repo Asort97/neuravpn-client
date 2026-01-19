@@ -23,11 +23,14 @@ import 'services/connectivity_tester.dart';
 import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/smart_route_engine.dart';
+import 'services/routing_decision_engine.dart';
+import 'services/domain_groups.dart';
 import 'services/singbox_controller.dart';
+import 'services/live_telemetry_config.dart';
+import 'services/live_telemetry.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
-import 'package:happycat_vpnclient/services/zapret_runner.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
@@ -36,6 +39,7 @@ import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
 import 'widgets/loading_screen.dart';
 import 'package:happycat_vpnclient/services/zapret_runner.dart';
+import 'services/port_allocator.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -164,6 +168,11 @@ class _VlessHomePageState extends State<VlessHomePage>
   List<Application> _androidInstalledApps = const <Application>[];
   Map<String, String> _androidAppLabels = {};
   static const String _splitConfigPrefsKey = 'split_tunnel_state_v2';
+  static const int _dnsProxyPort = 15353;
+  static const int _evasionProxyPort = 18080;
+  static const int _probeVpnPort = 18081;
+  static const int _probeDirectPort = 18082;
+  static const int _probeEvasionPort = 18083;
   static const String _legacySplitConfigKey = 'split_tunnel_config_v1';
   static const String _trayShowKey = 'show';
   static const String _trayConnectKey = 'connect';
@@ -172,10 +181,14 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _noPresetValue = '__none__';
   static const String _splitToggleKey = 'split_tunnel_enabled';
   static const String _smartRoutingKey = 'smart_routing_enabled';
+  static const String _smartRoutingZapretKey = 'smart_routing_zapret_enabled';
+  static const String _smartRoutingZapretAggressiveKey = 'smart_routing_zapret_aggressive';
   static const String _hasEverAddedKeyKey = 'has_added_key';
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
+  LiveTelemetryManager? _liveTelemetryManager;
+  LiveTelemetryConfig? _liveTelemetryConfig;
   bool _showPresetList = false;
   final Map<String, int> _profilePings = {};
   final List<String> _logLines = <String>[];
@@ -185,6 +198,8 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _profileCounterKey = 'vpn_profile_counter';
   bool _developerMode = false;
   bool _smartRouting = false;
+  bool _smartRoutingZapret = false;
+  bool _smartRoutingZapretAggressive = false;
   bool _hasEverAddedKey = false;
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
@@ -199,6 +214,10 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _zapretProfileKey = 'zapret_profile';
   static const String _zapretAutoUpdateKey = 'zapret_auto_update';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
+  final RoutingDecisionEngine _routingDecisionEngine = RoutingDecisionEngine();
+  final DomainGroupResolver _domainGroupResolver =
+      DomainGroupResolver(buildDefaultDomainGroups());
+  Map<String, RoutingDecisionRecord> _learnedRoutes = const {};
   final ConnectivityTester _connectivityTester = ConnectivityTester();
   late final List<ConnectivityTestTarget> _connectivityTargets =
       buildDefaultConnectivityTargets();
@@ -678,6 +697,9 @@ class _VlessHomePageState extends State<VlessHomePage>
     final restoredPings = <String, int>{};
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? true;
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
+    _smartRoutingZapret = prefs.getBool(_smartRoutingZapretKey) ?? false;
+    _smartRoutingZapretAggressive =
+        prefs.getBool(_smartRoutingZapretAggressiveKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
     final dpiBase =
@@ -820,6 +842,8 @@ class _VlessHomePageState extends State<VlessHomePage>
 
     if (!mounted) return;
     final smartRoutingFlag = _smartRouting;
+    final smartRoutingZapretFlag = _smartRoutingZapret;
+    final smartRoutingZapretAggressiveFlag = _smartRoutingZapretAggressive;
     setState(() {
       _profiles = profiles;
       _profileNameCounter = math.max(
@@ -829,6 +853,8 @@ class _VlessHomePageState extends State<VlessHomePage>
       _selectedProfile = selected;
       _syncMetricsFromProfile(selected);
       _smartRouting = smartRoutingFlag;
+      _smartRoutingZapret = smartRoutingZapretFlag;
+      _smartRoutingZapretAggressive = smartRoutingZapretAggressiveFlag;
       _dpiEvasionConfig = dpiBase.copyWith(
         enableFragmentation: dpiFragmentation,
         enableTlsFragment: dpiTlsFragment,
@@ -874,6 +900,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_zapretEnabled && _zapretMode == ZapretMode.zapretOnly) {
       unawaited(_startZapret(forVpnStart: false));
     }
+    unawaited(_refreshLearnedRoutes());
   }
 
   String _normalizeSplitMode(String? raw) {
@@ -959,6 +986,168 @@ class _VlessHomePageState extends State<VlessHomePage>
     await prefs.remove(_legacySplitConfigKey);
     await prefs.setBool(_splitToggleKey, _splitEnabled);
     await prefs.setBool(_smartRoutingKey, _smartRouting);
+  }
+
+
+  Future<void> _persistSmartRoutingZapretSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_smartRoutingZapretKey, _smartRoutingZapret);
+    await prefs.setBool(
+      _smartRoutingZapretAggressiveKey,
+      _smartRoutingZapretAggressive,
+    );
+  }
+
+  String _currentNetworkProfileId() {
+    final profile = _selectedProfile;
+    final link = _currentLink;
+    if (profile != null) {
+      return 'profile:${profile.name}:${link?.host ?? ''}:${link?.port ?? ''}';
+    }
+    if (link != null) return 'link:${link.host}:${link.port}';
+    return 'default';
+  }
+
+  Future<void> _refreshLearnedRoutes() async {
+    final profileId = _currentNetworkProfileId();
+    final decisions =
+        await _routingDecisionEngine.decisionsForProfile(profileId);
+    if (!mounted) return;
+    setState(() {
+      _learnedRoutes = decisions;
+    });
+  }
+
+  Future<void> _setSmartRoutingZapret(bool enabled) async {
+    if (_smartRoutingZapret == enabled) return;
+    setState(() => _smartRoutingZapret = enabled);
+    await _persistSmartRoutingZapretSettings();
+    if (enabled) {
+      await _refreshLearnedRoutes();
+      await _startLiveTelemetry();
+    } else {
+      await _stopLiveTelemetry();
+    }
+    if (_isRunning) {
+      unawaited(_restartWithUpdatedRouting());
+    }
+  }
+
+  Future<void> _setSmartRoutingZapretAggressive(bool enabled) async {
+    if (_smartRoutingZapretAggressive == enabled) return;
+    setState(() => _smartRoutingZapretAggressive = enabled);
+    await _persistSmartRoutingZapretSettings();
+    if (_smartRoutingZapret) {
+      await _stopLiveTelemetry();
+      await _startLiveTelemetry();
+      if (_isRunning) {
+        unawaited(_restartWithUpdatedRouting());
+      }
+    }
+  }
+
+  Future<void> _setDeveloperMode(bool enabled) async {
+    if (_developerMode == enabled) return;
+    setState(() => _developerMode = enabled);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('developer_mode', enabled);
+    if (enabled) {
+      unawaited(_refreshLearnedRoutes());
+    }
+  }
+
+  Future<void> _resetSmartRoutingZapretLearned() async {
+    final profileId = _currentNetworkProfileId();
+    await _routingDecisionEngine.clear(networkProfileId: profileId);
+    await _refreshLearnedRoutes();
+    if (_smartRoutingZapret) {
+      await _stopLiveTelemetry();
+      await _startLiveTelemetry();
+      if (_isRunning) {
+        unawaited(_restartWithUpdatedRouting());
+      }
+    }
+  }
+
+  Future<LiveTelemetryConfig> _buildLiveTelemetryConfig() async {
+    final used = <int>{};
+
+    Future<int> pickTcp(int preferred) async {
+      var port = await PortAllocator.findFreeTcpPort(preferred: preferred);
+      var attempts = 0;
+      while (used.contains(port) && attempts < 4) {
+        port = await PortAllocator.findFreeTcpPort();
+        attempts++;
+      }
+      used.add(port);
+      return port;
+    }
+
+    // DNS proxy is disabled for stability on some Windows setups.
+    final int? dnsPort = null;
+    final evasionPort = await pickTcp(_evasionProxyPort);
+    final probeVpnPort = await pickTcp(_probeVpnPort);
+    final probeDirectPort = await pickTcp(_probeDirectPort);
+    final probeEvasionPort = await pickTcp(_probeEvasionPort);
+
+    return LiveTelemetryConfig(
+      dnsPort: dnsPort,
+      evasionProxyPort: evasionPort,
+      probeVpnPort: probeVpnPort,
+      probeDirectPort: probeDirectPort,
+      probeEvasionPort: probeEvasionPort,
+    );
+  }
+
+  Future<void> _startLiveTelemetry() async {
+    if (!_smartRoutingZapret) return;
+    try {
+      _liveTelemetryConfig ??= await _buildLiveTelemetryConfig();
+      _liveTelemetryManager ??= LiveTelemetryManager(
+        routingDecisionEngine: _routingDecisionEngine,
+        config: _liveTelemetryConfig!,
+        smartRoutingZapretAggressive: _smartRoutingZapretAggressive,
+        policyEngine: _smartRouteEngine,
+        onDecisionChanged: () {
+          unawaited(_refreshLearnedRoutes());
+          if (_isRunning) {
+            unawaited(_restartWithUpdatedRouting());
+          }
+        },
+      );
+      final started = await _liveTelemetryManager!.start(
+        networkProfileId: _currentNetworkProfileId(),
+      );
+      if (!started) {
+        _appendLogs(['[telemetry] disabled: dns proxy unavailable']);
+        await _stopLiveTelemetry();
+        if (mounted) {
+          setState(() => _smartRoutingZapret = false);
+          await _persistSmartRoutingZapretSettings();
+        }
+      }
+    } catch (e) {
+      _appendLogs(['[telemetry] failed to start: $e']);
+      await _stopLiveTelemetry();
+      if (mounted) {
+        setState(() => _smartRoutingZapret = false);
+        await _persistSmartRoutingZapretSettings();
+      }
+    }
+  }
+
+  Future<void> _stopLiveTelemetry() async {
+    await _liveTelemetryManager?.stop();
+    _liveTelemetryManager = null;
+    _liveTelemetryConfig = null;
+  }
+
+  Future<void> _restartWithUpdatedRouting() async {
+    if (_isConnecting) return;
+    await _stop();
+    await Future.delayed(const Duration(milliseconds: 400));
+    if (!mounted) return;
+    await _start();
   }
 
   void _updateActiveSplitConfig(SplitTunnelConfig config) {
@@ -1713,6 +1902,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_profiles.any((p) => p.name == profile.name)) {
       await _persistSelectedProfile();
     }
+    await _refreshLearnedRoutes();
   }
 
   Future<void> _start() async {
@@ -1730,12 +1920,20 @@ class _VlessHomePageState extends State<VlessHomePage>
     _updateConnectGlowTicker();
     _startTrafficMonitor();
     await _startZapret(forVpnStart: true);
+    await _startLiveTelemetry();
 
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
       smartRouteEngine: _smartRouteEngine,
       dpiEvasionConfig: _dpiEvasionConfig,
+      enableSmartRoutingZapret: _smartRoutingZapret,
+      routingDecisionEngine: _routingDecisionEngine,
+      domainGroupResolver: _domainGroupResolver,
+      smartRoutingZapretAggressive: _smartRoutingZapretAggressive,
+      networkProfileId: _currentNetworkProfileId(),
+      liveTelemetryConfig: _liveTelemetryConfig,
+      enableLegacyWinDivert: false,
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = _mapStatus(value));
@@ -1745,6 +1943,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     );
 
     if (!result.success) {
+      await _stopLiveTelemetry();
       if (!mounted) return;
       if (result.requiresAdmin && Platform.isWindows) {
         _showFastSnack('Запустите приложение от имени администратора');
@@ -1793,6 +1992,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     );
     await _dpiEvasionManager.stopNativeInjector();
     await _stopZapretIfNeeded();
+    await _stopLiveTelemetry();
     if (!mounted) return;
     setState(() {
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -2021,6 +2221,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       unawaited(_trayManager.destroy());
     }
     unawaited(_singBoxController.dispose());
+    _routingDecisionEngine.dispose();
     unawaited(_dpiEvasionManager.stopNativeInjector());
     super.dispose();
   }
@@ -2646,8 +2847,54 @@ class _VlessHomePageState extends State<VlessHomePage>
           ),
         ),
         const SizedBox(height: 16),
-        _buildZapretSettingsCard(),
+        _neuraCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: _neuraSurface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: const Icon(
+                      Icons.code,
+                      color: _neuraRed,
+                      size: 18,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Developer mode',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  Switch.adaptive(
+                    value: _developerMode,
+                    activeColor: _neuraRed,
+                    onChanged: (value) => _setDeveloperMode(value),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Show advanced diagnostics and learned routes.',
+                style: TextStyle(color: Colors.white.withOpacity(0.7)),
+              ),
+            ],
+          ),
+        ),
         const SizedBox(height: 16),
+        if (_developerMode) _buildZapretSettingsCard(),
+        if (_developerMode) const SizedBox(height: 16),
         _buildWindowsLogPanel(),
       ],
     );
@@ -3211,8 +3458,121 @@ class _VlessHomePageState extends State<VlessHomePage>
               ),
             ],
           ),
+          if (_smartRouting) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'Smart Routing Zapret',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+                Switch.adaptive(
+                  value: _smartRoutingZapret,
+                  activeColor: _neuraRed,
+                  onChanged: (value) => _setSmartRoutingZapret(value),
+                ),
+              ],
+            ),
+            if (_smartRoutingZapret) ...[
+              const SizedBox(height: 8),
+              _buildSmartZapretAdvanced(context),
+            ],
+          ],
         ],
       ),
+    );
+  }
+
+  Widget _buildSmartZapretAdvanced(BuildContext context) {
+    final theme = Theme.of(context);
+    final textTheme = theme.textTheme;
+    final entries = _learnedRoutes.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    final showLearned = _developerMode;
+    final visibleEntries = showLearned ? entries.take(8).toList() : const <MapEntry<String, RoutingDecisionRecord>>[];
+    final extraCount = showLearned ? entries.length - visibleEntries.length : 0;
+
+    String labelFor(RoutingPath path) {
+      switch (path) {
+        case RoutingPath.vpn:
+          return 'VPN';
+        case RoutingPath.direct:
+          return 'Direct';
+        case RoutingPath.directEvasion:
+          return 'Direct + evasion';
+      }
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: const [
+                  Text(
+                    'Aggressive evasion',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    'Stronger fragmentation for direct-evasion only.',
+                  ),
+                ],
+              ),
+            ),
+            Switch.adaptive(
+              value: _smartRoutingZapretAggressive,
+              onChanged: (value) => _setSmartRoutingZapretAggressive(value),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Reset learned routes cache.',
+                style: textTheme.bodySmall,
+              ),
+            ),
+            TextButton.icon(
+              onPressed: _resetSmartRoutingZapretLearned,
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('Reset'),
+            ),
+          ],
+        ),
+        if (showLearned) ...[
+          const SizedBox(height: 8),
+          Text('Learned routes', style: textTheme.labelLarge),
+          const SizedBox(height: 4),
+          if (entries.isEmpty) ...[
+            Text(
+              'No learned routes yet. Run connectivity tests or use apps to collect data.',
+              style: textTheme.bodySmall?.copyWith(color: theme.hintColor),
+            ),
+          ] else ...[
+            for (final entry in visibleEntries)
+              Text(
+                '${entry.key}: ${labelFor(entry.value.path)}${entry.value.reason == null ? '' : ' (' + entry.value.reason! + ')'}',
+                style: textTheme.bodySmall,
+              ),
+            if (extraCount > 0)
+              Text(
+                '+$extraCount more...',
+                style: textTheme.bodySmall?.copyWith(color: theme.hintColor),
+              ),
+          ],
+        ],
+      ],
     );
   }
 
@@ -3835,6 +4195,73 @@ class _VlessHomePageState extends State<VlessHomePage>
                   ),
                 if (!_splitEnabled) const SizedBox(height: 12),
                 _buildPresetPicker(context),
+                const SizedBox(height: 16),
+                Card(
+                  color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+                  elevation: 0,
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: const [
+                                  Text(
+                                    'Smart Routing (Level 3)',
+                                    style: TextStyle(fontWeight: FontWeight.w600),
+                                  ),
+                                  SizedBox(height: 4),
+                                  Text(
+                                    'Automatically bypass Russian sites and networks while keeping foreign services via VPN.',
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Switch.adaptive(
+                              value: _smartRouting,
+                              onChanged: (value) {
+                                setState(() => _smartRouting = value);
+                                unawaited(_persistSplitState());
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: const [
+                                  Text(
+                                    'Smart Routing Zapret',
+                                    style: TextStyle(fontWeight: FontWeight.w600),
+                                  ),
+                                  SizedBox(height: 4),
+                                  Text(
+                                    'Adds a direct + evasion path for problematic domains without changing IP.',
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Switch.adaptive(
+                              value: _smartRoutingZapret,
+                              onChanged: (value) => _setSmartRoutingZapret(value),
+                            ),
+                          ],
+                        ),
+                        if (_smartRoutingZapret) ...[
+                          const SizedBox(height: 8),
+                          _buildSmartZapretAdvanced(context),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 16),
                 Card(
                   color: Theme.of(
@@ -4526,6 +4953,34 @@ class _VlessHomePageState extends State<VlessHomePage>
                 ),
               ],
             ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: const [
+                      Text(
+                        'Smart Routing Zapret',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Adds a direct + evasion path for problematic domains without changing IP.',
+                      ),
+                    ],
+                  ),
+                ),
+                Switch.adaptive(
+                  value: _smartRoutingZapret,
+                  onChanged: (value) => _setSmartRoutingZapret(value),
+                ),
+              ],
+            ),
+            if (_smartRoutingZapret) ...[
+              const SizedBox(height: 8),
+              _buildSmartZapretAdvanced(context),
+            ],
             const SizedBox(height: 8),
             DpiEvasionWidget(
               manager: _dpiEvasionManager,
@@ -4907,6 +5362,18 @@ class _VlessHomePageState extends State<VlessHomePage>
       _cancelConnectivity = false;
       _connectivityLastRun = DateTime.now();
     });
+    if (_smartRoutingZapret) {
+      final profileId = _currentNetworkProfileId();
+      await _routingDecisionEngine.ingestConnectivityResults(
+        networkProfileId: profileId,
+        results: results.values,
+        resolver: _domainGroupResolver,
+      );
+      await _refreshLearnedRoutes();
+      if (_isRunning) {
+        unawaited(_restartWithUpdatedRouting());
+      }
+    }
   }
 
   void _cancelConnectivityTests() {
