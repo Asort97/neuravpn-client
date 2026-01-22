@@ -87,13 +87,16 @@ class AutoProbeManager {
     final request = _queue.removeAt(0);
     _windowCount++;
 
-    final best = await _runProbe(request.domain);
+    final best = await _runProbe(request.domain, request.reason);
     if (best != null && best.success) {
       onDecision(request.clusterId, best.path, request.reason);
     }
   }
 
-  Future<ProbeResultSummary?> _runProbe(String domain) async {
+  Future<ProbeResultSummary?> _runProbe(
+    String domain,
+    String reason,
+  ) async {
     final vpnClient = SocksClient(host: '127.0.0.1', port: config.vpnPort);
     final directClient = SocksClient(host: '127.0.0.1', port: config.directPort);
     final evasionClient = SocksClient(host: '127.0.0.1', port: config.evasionPort);
@@ -114,6 +117,33 @@ class AutoProbeManager {
       ..sort((a, b) => a.value.latency.compareTo(b.value.latency));
 
     if (successes.isEmpty) return null;
+
+    if (reason == 'vpn_degrade') {
+      final evasion = mapping[RoutingPath.directEvasion]!;
+      final direct = mapping[RoutingPath.direct]!;
+
+      if (evasion.success) {
+        return ProbeResultSummary(
+          path: RoutingPath.directEvasion,
+          success: true,
+          latency: evasion.latency,
+        );
+      }
+      if (direct.success) {
+        return ProbeResultSummary(
+          path: RoutingPath.direct,
+          success: true,
+          latency: direct.latency,
+        );
+      }
+      // Force evasion as last resort under vpn_degrade even if probe failed,
+      // to avoid sticking on degraded VPN path.
+      return ProbeResultSummary(
+        path: RoutingPath.directEvasion,
+        success: true,
+        latency: Duration.zero,
+      );
+    }
 
     final best = successes.first;
     return ProbeResultSummary(

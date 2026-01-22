@@ -262,7 +262,9 @@ class RoutingDecisionEngine {
     final now = _clock();
     final map = _cache.putIfAbsent(networkProfileId, () => {});
     final existing = map[clusterId];
-    final expiry = now.add(ttlOverride ?? _ttl);
+    final ttl = ttlOverride ??
+        (reason == 'bootstrap' ? const Duration(hours: 2) : _ttl);
+    final expiry = now.add(ttl);
     if (existing != null && existing.path == path) {
       map[clusterId] = RoutingDecisionRecord(
         path: existing.path,

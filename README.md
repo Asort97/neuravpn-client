@@ -1,15 +1,9 @@
 # happycat_vpnclient
 
 
-## Smart Routing Zapret (cross-platform)
-- Adds a third path: `direct-evasion` (direct + evasion proxy) without IP change.
-- Live telemetry: local DNS proxy + direct-evasion SOCKS proxy for real traffic signals.
-- Auto-probe: local SOCKS probes through VPN/direct/direct-evasion, rate-limited.
-- Bootstrap suspects: uses zapret domain lists only as candidates for probing.
-- Learned decisions cached per network profile for 12h; resettable in advanced.
-- Legacy WinDivert-based mode is disabled by default.
+## Overview
+VPN client with split tunneling and a simple smart routing layer (RU domains direct, others via VPN). Zapret/WinDivert path has been removed; only VPN and direct remain.
 
-Limitations: relies on SNI/HTTP host classification and lightweight TLS fragmentation (no TTL tricks).
 
 VLESS VPN клиент на Flutter для Windows с полноценным TUN туннелем (wintun). UI принимает VLESS URI, генерирует конфиг для **sing-box** с TUN inbound, создаёт системный VPN туннель для всего устройства.
 
@@ -19,7 +13,6 @@ VLESS VPN клиент на Flutter для Windows с полноценным TUN
 - Windows 10/11 (x64)
 - sing-box.exe
 - wintun.dll (опционально, можно в assets)
-- WinDivert.dll + WinDivert64.sys (для split tunneling приложений)
 
 ### Установка
 
@@ -42,18 +35,13 @@ flutter pub get
 flutter run -d windows
 ```
 
-4. **(Опционально) Добавьте WinDivert для split tunneling приложений**  
-   - Скачайте драйвер с https://reqrypt.org/windivert.html (релиз `WinDivert-2.x-A.zip`)
-   - Поместите `WinDivert.dll` и `WinDivert64.sys` в `assets/bin/`
-   - Приложение автоматически извлечёт и подключит драйвер при запуске (нужны права администратора)
-
-5. **Введите VLESS URI**  
+4. **Введите VLESS URI**  
    Формат (Reality example):
 ```
 vless://UUID@host:443?type=tcp&security=reality&sni=example.com&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&flow=xtls-rprx-vision#tag
 ```
 
-6. **Подключитесь**  
+5. **Подключитесь**  
    Нажмите `Start`. Статус изменится на «Подключено (TUN: wintun0)».  
    Весь трафик системы теперь идёт через VPN туннель.
 

@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path/path.dart' as path;
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:intl/date_symbol_data_local.dart';
@@ -23,11 +24,7 @@ import 'services/connectivity_tester.dart';
 import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/smart_route_engine.dart';
-import 'services/routing_decision_engine.dart';
-import 'services/domain_groups.dart';
 import 'services/singbox_controller.dart';
-import 'services/live_telemetry_config.dart';
-import 'services/live_telemetry.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
@@ -38,8 +35,6 @@ import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
 import 'widgets/loading_screen.dart';
-import 'package:happycat_vpnclient/services/zapret_runner.dart';
-import 'services/port_allocator.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -167,12 +162,14 @@ class _VlessHomePageState extends State<VlessHomePage>
   String? _androidAppLoadError;
   List<Application> _androidInstalledApps = const <Application>[];
   Map<String, String> _androidAppLabels = {};
+  List<_WindowsAppEntry> _windowsInstalledApps = <_WindowsAppEntry>[];
+  Map<String, String> _windowsAppLabels = {};
+  Map<String, String> _windowsAppIcons = {};
+  bool _windowsAppsLoaded = false;
+  bool _windowsAppsLoading = false;
+  Completer<void>? _windowsAppsLoadCompleter;
+  String? _windowsAppLoadError;
   static const String _splitConfigPrefsKey = 'split_tunnel_state_v2';
-  static const int _dnsProxyPort = 15353;
-  static const int _evasionProxyPort = 18080;
-  static const int _probeVpnPort = 18081;
-  static const int _probeDirectPort = 18082;
-  static const int _probeEvasionPort = 18083;
   static const String _legacySplitConfigKey = 'split_tunnel_config_v1';
   static const String _trayShowKey = 'show';
   static const String _trayConnectKey = 'connect';
@@ -181,14 +178,10 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _noPresetValue = '__none__';
   static const String _splitToggleKey = 'split_tunnel_enabled';
   static const String _smartRoutingKey = 'smart_routing_enabled';
-  static const String _smartRoutingZapretKey = 'smart_routing_zapret_enabled';
-  static const String _smartRoutingZapretAggressiveKey = 'smart_routing_zapret_aggressive';
   static const String _hasEverAddedKeyKey = 'has_added_key';
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
-  LiveTelemetryManager? _liveTelemetryManager;
-  LiveTelemetryConfig? _liveTelemetryConfig;
   bool _showPresetList = false;
   final Map<String, int> _profilePings = {};
   final List<String> _logLines = <String>[];
@@ -198,8 +191,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _profileCounterKey = 'vpn_profile_counter';
   bool _developerMode = false;
   bool _smartRouting = false;
-  bool _smartRoutingZapret = false;
-  bool _smartRoutingZapretAggressive = false;
   bool _hasEverAddedKey = false;
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
@@ -209,25 +200,12 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _dpiMultiplexPaddingKey = 'dpi_multiplex_padding_enabled';
   static const String _dpiTcpWindowClampKey = 'dpi_tcp_window_clamp_enabled';
   static const String _dpiSniRandomizationKey = 'dpi_sni_randomization_enabled';
-  static const String _zapretEnabledKey = 'zapret_enabled';
-  static const String _zapretModeKey = 'zapret_mode';
-  static const String _zapretProfileKey = 'zapret_profile';
-  static const String _zapretAutoUpdateKey = 'zapret_auto_update';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
-  final RoutingDecisionEngine _routingDecisionEngine = RoutingDecisionEngine();
-  final DomainGroupResolver _domainGroupResolver =
-      DomainGroupResolver(buildDefaultDomainGroups());
-  Map<String, RoutingDecisionRecord> _learnedRoutes = const {};
   final ConnectivityTester _connectivityTester = ConnectivityTester();
   late final List<ConnectivityTestTarget> _connectivityTargets =
       buildDefaultConnectivityTargets();
   final DpiEvasionManager _dpiEvasionManager = DpiEvasionManager();
   DpiEvasionConfig _dpiEvasionConfig = DpiEvasionConfig.balanced;
-  final ZapretRunner _zapretRunner = ZapretRunner();
-  bool _zapretEnabled = false;
-  bool _zapretAutoUpdate = true;
-  ZapretMode _zapretMode = ZapretMode.off;
-  ZapretProfile _zapretProfile = ZapretProfile.basic;
   final Map<String, ConnectivityTestResult> _connectivityResults = {};
   bool _isConnectivityTesting = false;
   int _connectivityCompleted = 0;
@@ -558,6 +536,264 @@ class _VlessHomePageState extends State<VlessHomePage>
     _addApplication('package:$package');
   }
 
+  Future<void> _loadWindowsApps({bool force = false}) async {
+    if (!Platform.isWindows) return;
+    if (_windowsAppsLoading) {
+      await (_windowsAppsLoadCompleter?.future ?? Future.value());
+      return;
+    }
+    if (_windowsAppsLoaded && !force) return;
+    if (!mounted) return;
+    setState(() {
+      _windowsAppsLoading = true;
+      if (force) {
+        _windowsAppLoadError = null;
+      }
+    });
+    _windowsAppsLoadCompleter = Completer<void>();
+
+    final supportDir = await getApplicationSupportDirectory();
+    final iconDir = Directory('${supportDir.path}/app_icons');
+    if (!iconDir.existsSync()) {
+      iconDir.createSync(recursive: true);
+    }
+    final safeIconDir = iconDir.path.replaceAll("'", "''");
+    final script = r'''
+$paths = @(
+  "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+  "$env:AppData\Microsoft\Windows\Start Menu\Programs"
+)
+$iconDir = ''' + "'$safeIconDir'\n" + r'''
+New-Item -ItemType Directory -Force -Path $iconDir | Out-Null
+$iconEnabled = $true
+try {
+  Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+} catch {
+  $iconEnabled = $false
+}
+$shell = New-Object -ComObject WScript.Shell
+$items = foreach ($base in $paths) {
+  if (Test-Path $base) {
+    Get-ChildItem -Path $base -Recurse -Filter *.lnk | ForEach-Object {
+      try {
+        $target = $shell.CreateShortcut($_.FullName).TargetPath
+        if ($target -and (Test-Path $target) -and $target.ToLower().EndsWith(".exe")) {
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($target)
+          $sha1 = New-Object System.Security.Cryptography.SHA1Managed
+          $hash = [System.BitConverter]::ToString($sha1.ComputeHash($bytes)).Replace('-', '')
+          $iconPath = Join-Path $iconDir ($hash + ".png")
+          if ($iconEnabled -and !(Test-Path $iconPath)) {
+            try {
+              $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($target)
+              if ($icon -ne $null) {
+                $bmp = $icon.ToBitmap()
+                $bmp.Save($iconPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                $bmp.Dispose()
+                $icon.Dispose()
+              }
+            } catch {
+              # ignore icon extraction errors
+            }
+          }
+          $iconOut = ''
+          if (Test-Path $iconPath) { $iconOut = $iconPath }
+          [PSCustomObject]@{ name = $_.BaseName; path = $target; icon = $iconOut }
+        }
+      } catch {}
+    }
+  }
+}
+
+# Fallback: registry-installed apps (covers cases where Start Menu shortcuts are missing)
+$regPaths = @(
+  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+)
+$regItems = foreach ($rp in $regPaths) {
+  try {
+    Get-ItemProperty $rp -ErrorAction SilentlyContinue | ForEach-Object {
+      $name = $_.DisplayName
+      if (-not $name) { return }
+      $exe = $null
+      $icon = $_.DisplayIcon
+      if ($icon) {
+        # DisplayIcon can be: "C:\Path\App.exe,0"
+        $candidate = $icon.Split(',')[0].Trim('"')
+        if ($candidate -and (Test-Path $candidate) -and $candidate.ToLower().EndsWith(".exe")) {
+          $exe = $candidate
+        }
+      }
+      if (-not $exe) {
+        $uninstall = $_.UninstallString
+        if ($uninstall) {
+          # Try to extract first quoted path, or first token
+          $m = [regex]::Match($uninstall, '"([^"]+\.exe)"')
+          if ($m.Success) {
+            $candidate = $m.Groups[1].Value
+            if ($candidate -and (Test-Path $candidate)) { $exe = $candidate }
+          } else {
+            $candidate = $uninstall.Split(' ')[0].Trim('"')
+            if ($candidate -and (Test-Path $candidate) -and $candidate.ToLower().EndsWith(".exe")) {
+              $exe = $candidate
+            }
+          }
+        }
+      }
+      if ($exe) {
+        [PSCustomObject]@{ name = $name; path = $exe; icon = '' }
+      }
+    }
+  } catch {}
+}
+
+($items + $regItems) | Where-Object { $_ -ne $null } | Sort-Object -Property path -Unique | ConvertTo-Json -Compress
+''';
+
+    Directory? tempDir;
+    File? scriptFile;
+    try {
+      tempDir = await Directory.systemTemp.createTemp('neura_apps_');
+      scriptFile = File('${tempDir.path}/apps.ps1');
+      await scriptFile.writeAsString(script);
+
+      final result = await Process.run(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptFile.path],
+      );
+      if (result.exitCode != 0) {
+        throw Exception(result.stderr?.toString().trim().isNotEmpty == true
+            ? result.stderr.toString().trim()
+            : 'Failed to enumerate Windows apps');
+      }
+
+      final stdout = (result.stdout ?? '').toString().trim();
+      final apps = <_WindowsAppEntry>[];
+      final icons = <String, String>{};
+      if (stdout.isNotEmpty && stdout != 'null') {
+        final decoded = jsonDecode(stdout);
+        final rows = decoded is List ? decoded : [decoded];
+        for (final row in rows) {
+          if (row is Map) {
+            final name = row['name']?.toString().trim() ?? '';
+            final path = row['path']?.toString().trim() ?? '';
+            final icon = row['icon']?.toString().trim() ?? '';
+            if (name.isNotEmpty && path.isNotEmpty) {
+              apps.add(_WindowsAppEntry(name: name, path: path, iconPath: icon));
+              if (icon.isNotEmpty && File(icon).existsSync()) {
+                icons[path] = icon;
+              }
+            }
+          }
+        }
+      }
+
+      apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      if (!mounted) return;
+      setState(() {
+        _windowsInstalledApps = apps;
+        _windowsAppLabels = {for (final app in apps) app.path: app.name};
+        _windowsAppIcons = icons;
+        _windowsAppsLoaded = true;
+        _windowsAppsLoading = false;
+        _windowsAppLoadError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _windowsAppsLoading = false;
+        _windowsAppLoadError = e.toString();
+      });
+    } finally {
+      _windowsAppsLoadCompleter?.complete();
+      _windowsAppsLoadCompleter = null;
+      try {
+        if (scriptFile != null && await scriptFile.exists()) {
+          await scriptFile.delete();
+        }
+      } catch (_) {}
+      try {
+        if (tempDir != null && await tempDir.exists()) {
+          await tempDir.delete(recursive: true);
+        }
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _showWindowsAppPicker() async {
+    if (!Platform.isWindows) return;
+    // Avoid nuking a previously-good cache on a transient PowerShell failure.
+    if (!_windowsAppsLoaded || _windowsInstalledApps.isEmpty) {
+      await _loadWindowsApps(force: true);
+    } else {
+      await _loadWindowsApps();
+    }
+    if (!mounted) return;
+    final apps = _windowsInstalledApps;
+    final path = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withOpacity(0.55),
+      builder: (ctx) => _WindowsAppPickerSheet(
+        apps: apps,
+        errorMessage: _windowsAppLoadError,
+      ),
+    );
+    if (path == null || path.isEmpty) return;
+    _addApplication(path);
+  }
+
+  Widget _buildWindowsAppActions(ThemeData theme) {
+    final canPick = _windowsAppsLoaded || !_windowsAppsLoading;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 12,
+          runSpacing: 8,
+          children: [
+            TextButton.icon(
+              onPressed: canPick ? _showWindowsAppPicker : null,
+              icon: const Icon(Icons.apps_outlined),
+              label: const Text('Выбрать приложение из списка'),
+            ),
+            TextButton.icon(
+              onPressed: _windowsAppsLoading
+                  ? null
+                  : () => _loadWindowsApps(force: true),
+              icon: const Icon(Icons.refresh_outlined),
+              label: const Text('Обновить список'),
+            ),
+            if (_windowsAppsLoading)
+              const Padding(
+                padding: EdgeInsets.only(left: 4),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        if (_windowsAppLoadError != null)
+          Text(
+            'Не удалось загрузить приложения: $_windowsAppLoadError',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.error,
+            ),
+          )
+        else
+          Text(
+            'Список приложений готов. Можно выбрать из списка или ввести путь вручную.',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+      ],
+    );
+  }
+
   Widget _buildAndroidAppActions(ThemeData theme) {
     final canPick = _androidAppsLoaded || !_androidAppsLoading;
     return Column(
@@ -616,7 +852,39 @@ class _VlessHomePageState extends State<VlessHomePage>
       }
       return package;
     }
+    final windowsLabel = _windowsAppLabels[value];
+    if (windowsLabel != null && windowsLabel.isNotEmpty) {
+      return windowsLabel;
+    }
+    if (value.toLowerCase().endsWith('.exe')) {
+      final fallbackName = path.basenameWithoutExtension(value);
+      if (fallbackName.isNotEmpty) {
+        return fallbackName;
+      }
+    }
     return value;
+  }
+
+  Widget _buildWindowsAppIcon(String value, {double size = 20}) {
+    if (!Platform.isWindows) {
+      return Icon(Icons.apps_outlined, size: size, color: _neuraRed);
+    }
+    final iconPath = _windowsAppIcons[value];
+    if (iconPath != null && iconPath.isNotEmpty) {
+      final file = File(iconPath);
+      if (file.existsSync()) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.file(
+            file,
+            width: size,
+            height: size,
+            fit: BoxFit.cover,
+          ),
+        );
+      }
+    }
+    return Icon(Icons.apps_outlined, size: size, color: _neuraRed);
   }
 
   void _showFastSnack(String message) {
@@ -697,9 +965,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     final restoredPings = <String, int>{};
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? true;
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
-    _smartRoutingZapret = prefs.getBool(_smartRoutingZapretKey) ?? false;
-    _smartRoutingZapretAggressive =
-        prefs.getBool(_smartRoutingZapretAggressiveKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
     final dpiBase =
@@ -842,8 +1107,6 @@ class _VlessHomePageState extends State<VlessHomePage>
 
     if (!mounted) return;
     final smartRoutingFlag = _smartRouting;
-    final smartRoutingZapretFlag = _smartRoutingZapret;
-    final smartRoutingZapretAggressiveFlag = _smartRoutingZapretAggressive;
     setState(() {
       _profiles = profiles;
       _profileNameCounter = math.max(
@@ -853,8 +1116,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       _selectedProfile = selected;
       _syncMetricsFromProfile(selected);
       _smartRouting = smartRoutingFlag;
-      _smartRoutingZapret = smartRoutingZapretFlag;
-      _smartRoutingZapretAggressive = smartRoutingZapretAggressiveFlag;
       _dpiEvasionConfig = dpiBase.copyWith(
         enableFragmentation: dpiFragmentation,
         enableTlsFragment: dpiTlsFragment,
@@ -897,10 +1158,6 @@ class _VlessHomePageState extends State<VlessHomePage>
         _controller.text = fallbackUri;
       }
     }
-    if (_zapretEnabled && _zapretMode == ZapretMode.zapretOnly) {
-      unawaited(_startZapret(forVpnStart: false));
-    }
-    unawaited(_refreshLearnedRoutes());
   }
 
   String _normalizeSplitMode(String? raw) {
@@ -988,166 +1245,11 @@ class _VlessHomePageState extends State<VlessHomePage>
     await prefs.setBool(_smartRoutingKey, _smartRouting);
   }
 
-
-  Future<void> _persistSmartRoutingZapretSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_smartRoutingZapretKey, _smartRoutingZapret);
-    await prefs.setBool(
-      _smartRoutingZapretAggressiveKey,
-      _smartRoutingZapretAggressive,
-    );
-  }
-
-  String _currentNetworkProfileId() {
-    final profile = _selectedProfile;
-    final link = _currentLink;
-    if (profile != null) {
-      return 'profile:${profile.name}:${link?.host ?? ''}:${link?.port ?? ''}';
-    }
-    if (link != null) return 'link:${link.host}:${link.port}';
-    return 'default';
-  }
-
-  Future<void> _refreshLearnedRoutes() async {
-    final profileId = _currentNetworkProfileId();
-    final decisions =
-        await _routingDecisionEngine.decisionsForProfile(profileId);
-    if (!mounted) return;
-    setState(() {
-      _learnedRoutes = decisions;
-    });
-  }
-
-  Future<void> _setSmartRoutingZapret(bool enabled) async {
-    if (_smartRoutingZapret == enabled) return;
-    setState(() => _smartRoutingZapret = enabled);
-    await _persistSmartRoutingZapretSettings();
-    if (enabled) {
-      await _refreshLearnedRoutes();
-      await _startLiveTelemetry();
-    } else {
-      await _stopLiveTelemetry();
-    }
-    if (_isRunning) {
-      unawaited(_restartWithUpdatedRouting());
-    }
-  }
-
-  Future<void> _setSmartRoutingZapretAggressive(bool enabled) async {
-    if (_smartRoutingZapretAggressive == enabled) return;
-    setState(() => _smartRoutingZapretAggressive = enabled);
-    await _persistSmartRoutingZapretSettings();
-    if (_smartRoutingZapret) {
-      await _stopLiveTelemetry();
-      await _startLiveTelemetry();
-      if (_isRunning) {
-        unawaited(_restartWithUpdatedRouting());
-      }
-    }
-  }
-
   Future<void> _setDeveloperMode(bool enabled) async {
     if (_developerMode == enabled) return;
     setState(() => _developerMode = enabled);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('developer_mode', enabled);
-    if (enabled) {
-      unawaited(_refreshLearnedRoutes());
-    }
-  }
-
-  Future<void> _resetSmartRoutingZapretLearned() async {
-    final profileId = _currentNetworkProfileId();
-    await _routingDecisionEngine.clear(networkProfileId: profileId);
-    await _refreshLearnedRoutes();
-    if (_smartRoutingZapret) {
-      await _stopLiveTelemetry();
-      await _startLiveTelemetry();
-      if (_isRunning) {
-        unawaited(_restartWithUpdatedRouting());
-      }
-    }
-  }
-
-  Future<LiveTelemetryConfig> _buildLiveTelemetryConfig() async {
-    final used = <int>{};
-
-    Future<int> pickTcp(int preferred) async {
-      var port = await PortAllocator.findFreeTcpPort(preferred: preferred);
-      var attempts = 0;
-      while (used.contains(port) && attempts < 4) {
-        port = await PortAllocator.findFreeTcpPort();
-        attempts++;
-      }
-      used.add(port);
-      return port;
-    }
-
-    // DNS proxy is disabled for stability on some Windows setups.
-    final int? dnsPort = null;
-    final evasionPort = await pickTcp(_evasionProxyPort);
-    final probeVpnPort = await pickTcp(_probeVpnPort);
-    final probeDirectPort = await pickTcp(_probeDirectPort);
-    final probeEvasionPort = await pickTcp(_probeEvasionPort);
-
-    return LiveTelemetryConfig(
-      dnsPort: dnsPort,
-      evasionProxyPort: evasionPort,
-      probeVpnPort: probeVpnPort,
-      probeDirectPort: probeDirectPort,
-      probeEvasionPort: probeEvasionPort,
-    );
-  }
-
-  Future<void> _startLiveTelemetry() async {
-    if (!_smartRoutingZapret) return;
-    try {
-      _liveTelemetryConfig ??= await _buildLiveTelemetryConfig();
-      _liveTelemetryManager ??= LiveTelemetryManager(
-        routingDecisionEngine: _routingDecisionEngine,
-        config: _liveTelemetryConfig!,
-        smartRoutingZapretAggressive: _smartRoutingZapretAggressive,
-        policyEngine: _smartRouteEngine,
-        onDecisionChanged: () {
-          unawaited(_refreshLearnedRoutes());
-          if (_isRunning) {
-            unawaited(_restartWithUpdatedRouting());
-          }
-        },
-      );
-      final started = await _liveTelemetryManager!.start(
-        networkProfileId: _currentNetworkProfileId(),
-      );
-      if (!started) {
-        _appendLogs(['[telemetry] disabled: dns proxy unavailable']);
-        await _stopLiveTelemetry();
-        if (mounted) {
-          setState(() => _smartRoutingZapret = false);
-          await _persistSmartRoutingZapretSettings();
-        }
-      }
-    } catch (e) {
-      _appendLogs(['[telemetry] failed to start: $e']);
-      await _stopLiveTelemetry();
-      if (mounted) {
-        setState(() => _smartRoutingZapret = false);
-        await _persistSmartRoutingZapretSettings();
-      }
-    }
-  }
-
-  Future<void> _stopLiveTelemetry() async {
-    await _liveTelemetryManager?.stop();
-    _liveTelemetryManager = null;
-    _liveTelemetryConfig = null;
-  }
-
-  Future<void> _restartWithUpdatedRouting() async {
-    if (_isConnecting) return;
-    await _stop();
-    await Future.delayed(const Duration(milliseconds: 400));
-    if (!mounted) return;
-    await _start();
   }
 
   void _updateActiveSplitConfig(SplitTunnelConfig config) {
@@ -1902,7 +2004,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_profiles.any((p) => p.name == profile.name)) {
       await _persistSelectedProfile();
     }
-    await _refreshLearnedRoutes();
   }
 
   Future<void> _start() async {
@@ -1919,31 +2020,22 @@ class _VlessHomePageState extends State<VlessHomePage>
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
-    await _startZapret(forVpnStart: true);
-    await _startLiveTelemetry();
-
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
       smartRouteEngine: _smartRouteEngine,
       dpiEvasionConfig: _dpiEvasionConfig,
-      enableSmartRoutingZapret: _smartRoutingZapret,
-      routingDecisionEngine: _routingDecisionEngine,
-      domainGroupResolver: _domainGroupResolver,
-      smartRoutingZapretAggressive: _smartRoutingZapretAggressive,
-      networkProfileId: _currentNetworkProfileId(),
-      liveTelemetryConfig: _liveTelemetryConfig,
-      enableLegacyWinDivert: false,
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = _mapStatus(value));
         unawaited(_updateTrayMenu());
       },
-      onLog: (line) => _appendLogs([line]),
+      onLog: (line) {
+        _appendLogs([line]);
+      },
     );
 
     if (!result.success) {
-      await _stopLiveTelemetry();
       if (!mounted) return;
       if (result.requiresAdmin && Platform.isWindows) {
         _showFastSnack('Запустите приложение от имени администратора');
@@ -1991,8 +2083,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       onLog: (line) => _appendLogs([line]),
     );
     await _dpiEvasionManager.stopNativeInjector();
-    await _stopZapretIfNeeded();
-    await _stopLiveTelemetry();
     if (!mounted) return;
     setState(() {
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -2074,86 +2164,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
 
-  Future<void> _persistZapretSettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_zapretEnabledKey, _zapretEnabled);
-    await prefs.setBool(_zapretAutoUpdateKey, _zapretAutoUpdate);
-    await prefs.setInt(_zapretModeKey, _zapretMode.index);
-    await prefs.setInt(_zapretProfileKey, _zapretProfile.index);
-  }
-
-  Future<void> _startZapret({required bool forVpnStart}) async {
-    if (!Platform.isWindows) return;
-    if (!_zapretEnabled || _zapretMode == ZapretMode.off) return;
-    if (_zapretMode == ZapretMode.vpnPlusZapret && !forVpnStart && !_isRunning) {
-      return;
-    }
-    if (_zapretAutoUpdate) {
-      unawaited(_zapretRunner.updateListsFromUrls(
-        generalUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/list-general.txt'),
-        excludeUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/list-exclude.txt'),
-        ipsetUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/ipset-all.txt'),
-        ipsetExcludeUrl: Uri.parse('https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/lists/ipset-exclude.txt'),
-      ));
-    }
-    final useGameFilter = _effectiveSplitConfig.smartRouting;
-    final extraIpExcludes = useGameFilter
-        ? _smartRouteEngine.exportLegacyRuleEntries()
-        : const <String>[];
-    await _zapretRunner.start(
-      profile: _zapretProfile,
-      useGameFilter: useGameFilter,
-      extraIpExcludes: extraIpExcludes,
-      extraHostExcludes: const <String>[],
-    );
-  }
-
-  Future<void> _stopZapretIfNeeded() async {
-    if (!Platform.isWindows) return;
-    if (!_zapretRunner.isRunning) return;
-    if (_zapretMode == ZapretMode.zapretOnly && _zapretEnabled) {
-      return;
-    }
-    await _zapretRunner.stop();
-  }
-
-  Future<void> _setZapretEnabled(bool enabled) async {
-    if (_zapretEnabled == enabled) return;
-    setState(() => _zapretEnabled = enabled);
-    await _persistZapretSettings();
-    if (!enabled) {
-      await _zapretRunner.stop();
-      return;
-    }
-    await _startZapret(forVpnStart: _isRunning);
-  }
-
-  Future<void> _setZapretMode(ZapretMode mode) async {
-    if (_zapretMode == mode) return;
-    setState(() => _zapretMode = mode);
-    await _persistZapretSettings();
-    if (!_zapretEnabled || mode == ZapretMode.off) {
-      await _zapretRunner.stop();
-      return;
-    }
-    await _startZapret(forVpnStart: _isRunning || mode == ZapretMode.zapretOnly);
-  }
-
-  Future<void> _setZapretProfile(ZapretProfile profile) async {
-    if (_zapretProfile == profile) return;
-    setState(() => _zapretProfile = profile);
-    await _persistZapretSettings();
-    if (_zapretRunner.isRunning) {
-      await _startZapret(forVpnStart: _isRunning || _zapretMode == ZapretMode.zapretOnly);
-    }
-  }
-
-  Future<void> _setZapretAutoUpdate(bool enabled) async {
-    if (_zapretAutoUpdate == enabled) return;
-    setState(() => _zapretAutoUpdate = enabled);
-    await _persistZapretSettings();
-  }
-
   void _appendLogs(Iterable<String> entries) {
     final iterable = entries.where((e) => e.trim().isNotEmpty).toList();
     if (iterable.isEmpty) return;
@@ -2172,6 +2182,97 @@ class _VlessHomePageState extends State<VlessHomePage>
         _pendingLogLines.clear();
       });
     });
+  }
+
+  Future<void> _openFullLogView() async {
+    final logText = _logLines.isEmpty
+        ? 'Лог пуст. Подключитесь к VPN для просмотра сообщений.'
+        : _logLines.join('\n');
+    final controller = ScrollController();
+    await showDialog(
+      context: context,
+      builder: (ctx) {
+        final theme = Theme.of(ctx);
+        return Dialog(
+          insetPadding: const EdgeInsets.all(16),
+          backgroundColor:
+              theme.colorScheme.surfaceContainerHighest.withOpacity(0.9),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 1100, maxHeight: 720),
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.notes_rounded),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'Лог подключения — полноэкранно',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Скопировать лог',
+                        onPressed: () async {
+                          await Clipboard.setData(ClipboardData(text: logText));
+                          if (mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Лог скопирован в буфер'),
+                                duration: Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                        },
+                        icon: const Icon(Icons.copy_all_outlined),
+                      ),
+                      IconButton(
+                        tooltip: 'Закрыть',
+                        onPressed: () => Navigator.of(ctx).pop(),
+                        icon: const Icon(Icons.close_rounded),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: theme.colorScheme.surface.withOpacity(0.4),
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Scrollbar(
+                          thumbVisibility: true,
+                          controller: controller,
+                          child: SingleChildScrollView(
+                            controller: controller,
+                            child: SelectableText(
+                              logText,
+                              style: const TextStyle(
+                                fontFamily: 'monospace',
+                                fontSize: 13,
+                                height: 1.25,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
   }
 
   void _showConfigDialog(BuildContext context) {
@@ -2221,7 +2322,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       unawaited(_trayManager.destroy());
     }
     unawaited(_singBoxController.dispose());
-    _routingDecisionEngine.dispose();
     unawaited(_dpiEvasionManager.stopNativeInjector());
     super.dispose();
   }
@@ -2375,6 +2475,10 @@ class _VlessHomePageState extends State<VlessHomePage>
                                     final view = _windowsViewAt(index);
                                     if (_windowsView != view) {
                                       setState(() => _windowsView = view);
+                                    }
+                                    if (view == _WindowsView.splitTunneling &&
+                                        Platform.isWindows) {
+                                      _loadWindowsApps();
                                     }
                                   },
                                   children: [
@@ -2886,109 +2990,18 @@ class _VlessHomePageState extends State<VlessHomePage>
               ),
               const SizedBox(height: 10),
               Text(
-                'Show advanced diagnostics and learned routes.',
+                'Show advanced diagnostics.',
                 style: TextStyle(color: Colors.white.withOpacity(0.7)),
               ),
             ],
           ),
         ),
         const SizedBox(height: 16),
-        if (_developerMode) _buildZapretSettingsCard(),
-        if (_developerMode) const SizedBox(height: 16),
         _buildWindowsLogPanel(),
       ],
     );
   }
 
-
-  Widget _buildZapretSettingsCard() {
-    final isWindows = Platform.isWindows;
-    final textColor = Colors.white.withOpacity(0.8);
-    return _neuraCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: _neuraSurface,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white.withOpacity(0.08)),
-                ),
-                child: const Icon(Icons.shield_outlined, color: _neuraRed, size: 18),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'Zapret (WinDivert)',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-              Switch.adaptive(
-                value: _zapretEnabled,
-                onChanged: isWindows ? (value) => _setZapretEnabled(value) : null,
-                activeColor: _neuraRed,
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<ZapretMode>(
-            decoration: const InputDecoration(labelText: 'Mode'),
-            value: _zapretMode,
-            onChanged: (_zapretEnabled && isWindows)
-                ? (value) {
-                    if (value != null) _setZapretMode(value);
-                  }
-                : null,
-            items: const [
-              DropdownMenuItem(value: ZapretMode.off, child: Text('Off')),
-              DropdownMenuItem(value: ZapretMode.zapretOnly, child: Text('Zapret only')),
-              DropdownMenuItem(value: ZapretMode.vpnPlusZapret, child: Text('VPN + Zapret')),
-            ],
-          ),
-          const SizedBox(height: 12),
-          DropdownButtonFormField<ZapretProfile>(
-            decoration: const InputDecoration(labelText: 'Profile'),
-            value: _zapretProfile,
-            onChanged: (_zapretEnabled && isWindows)
-                ? (value) {
-                    if (value != null) _setZapretProfile(value);
-                  }
-                : null,
-            items: const [
-              DropdownMenuItem(value: ZapretProfile.basic, child: Text('basic (default)')),
-              DropdownMenuItem(value: ZapretProfile.alt10, child: Text('alt10')),
-              DropdownMenuItem(value: ZapretProfile.alt11, child: Text('alt11')),
-            ],
-          ),
-          const SizedBox(height: 12),
-          SwitchListTile.adaptive(
-            value: _zapretAutoUpdate,
-            onChanged: (_zapretEnabled && isWindows)
-                ? (value) => _setZapretAutoUpdate(value)
-                : null,
-            dense: true,
-            contentPadding: EdgeInsets.zero,
-            activeColor: _neuraRed,
-            title: const Text('Auto-update lists'),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            isWindows
-                ? 'Runs winws.exe with DPI bypass rules. In "VPN + Zapret" mode it starts together with VPN.'
-                : 'Zapret requires Windows.',
-            style: TextStyle(color: textColor, fontSize: 12),
-          ),
-        ],
-      ),
-    );
-  }
 
   Widget _buildWindowsFooter() {
     return const Center(
@@ -3458,121 +3471,8 @@ class _VlessHomePageState extends State<VlessHomePage>
               ),
             ],
           ),
-          if (_smartRouting) ...[
-            const SizedBox(height: 12),
-            Row(
-              children: [
-                const Expanded(
-                  child: Text(
-                    'Smart Routing Zapret',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-                Switch.adaptive(
-                  value: _smartRoutingZapret,
-                  activeColor: _neuraRed,
-                  onChanged: (value) => _setSmartRoutingZapret(value),
-                ),
-              ],
-            ),
-            if (_smartRoutingZapret) ...[
-              const SizedBox(height: 8),
-              _buildSmartZapretAdvanced(context),
-            ],
-          ],
         ],
       ),
-    );
-  }
-
-  Widget _buildSmartZapretAdvanced(BuildContext context) {
-    final theme = Theme.of(context);
-    final textTheme = theme.textTheme;
-    final entries = _learnedRoutes.entries.toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
-    final showLearned = _developerMode;
-    final visibleEntries = showLearned ? entries.take(8).toList() : const <MapEntry<String, RoutingDecisionRecord>>[];
-    final extraCount = showLearned ? entries.length - visibleEntries.length : 0;
-
-    String labelFor(RoutingPath path) {
-      switch (path) {
-        case RoutingPath.vpn:
-          return 'VPN';
-        case RoutingPath.direct:
-          return 'Direct';
-        case RoutingPath.directEvasion:
-          return 'Direct + evasion';
-      }
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: const [
-                  Text(
-                    'Aggressive evasion',
-                    style: TextStyle(fontWeight: FontWeight.w600),
-                  ),
-                  SizedBox(height: 4),
-                  Text(
-                    'Stronger fragmentation for direct-evasion only.',
-                  ),
-                ],
-              ),
-            ),
-            Switch.adaptive(
-              value: _smartRoutingZapretAggressive,
-              onChanged: (value) => _setSmartRoutingZapretAggressive(value),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: Text(
-                'Reset learned routes cache.',
-                style: textTheme.bodySmall,
-              ),
-            ),
-            TextButton.icon(
-              onPressed: _resetSmartRoutingZapretLearned,
-              icon: const Icon(Icons.refresh, size: 18),
-              label: const Text('Reset'),
-            ),
-          ],
-        ),
-        if (showLearned) ...[
-          const SizedBox(height: 8),
-          Text('Learned routes', style: textTheme.labelLarge),
-          const SizedBox(height: 4),
-          if (entries.isEmpty) ...[
-            Text(
-              'No learned routes yet. Run connectivity tests or use apps to collect data.',
-              style: textTheme.bodySmall?.copyWith(color: theme.hintColor),
-            ),
-          ] else ...[
-            for (final entry in visibleEntries)
-              Text(
-                '${entry.key}: ${labelFor(entry.value.path)}${entry.value.reason == null ? '' : ' (' + entry.value.reason! + ')'}',
-                style: textTheme.bodySmall,
-              ),
-            if (extraCount > 0)
-              Text(
-                '+$extraCount more...',
-                style: textTheme.bodySmall?.copyWith(color: theme.hintColor),
-              ),
-          ],
-        ],
-      ],
     );
   }
 
@@ -3888,18 +3788,19 @@ class _VlessHomePageState extends State<VlessHomePage>
                         onRemove: _removeDomainEntry,
                       ),
                       const SizedBox(height: 16),
-                      _buildSplitEntrySection(
-                        title: 'Приложения',
-                        icon: Icons.apps_outlined,
-                        items: activeApps,
-                        emptyLabel: 'Приложения не добавлены.',
-                        onAdd: () => _promptAddEntry(
-                          title: 'Добавить приложение',
-                          hint: 'C:/Program Files/App/app.exe',
-                          onSubmit: _addApplication,
-                        ),
-                        onRemove: _removeApplication,
-                      ),
+      _buildSplitEntrySection(
+        title: 'Приложения',
+        icon: Icons.apps_outlined,
+        items: activeApps,
+        emptyLabel: 'Приложения не добавлены.',
+        onAdd: _showWindowsAppPicker,
+        onRemove: _removeApplication,
+        labelBuilder: _describeApplicationEntry,
+        subtitleBuilder: (value) =>
+            _windowsAppLabels.containsKey(value) ? value : '',
+        leadingBuilder: (value) =>
+            _buildWindowsAppIcon(value, size: 18),
+      ),
                     ],
                   )
                 : const SizedBox.shrink(),
@@ -4012,6 +3913,9 @@ class _VlessHomePageState extends State<VlessHomePage>
     required String emptyLabel,
     required Future<void> Function() onAdd,
     required void Function(String value) onRemove,
+    String Function(String value)? labelBuilder,
+    String Function(String value)? subtitleBuilder,
+    Widget Function(String value)? leadingBuilder,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -4057,16 +3961,32 @@ class _VlessHomePageState extends State<VlessHomePage>
                 ),
                 child: Row(
                   children: [
-                    Icon(icon, size: 16, color: _neuraRed),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        entry,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(color: Colors.white70),
+                      leadingBuilder?.call(entry) ??
+                          Icon(icon, size: 16, color: _neuraRed),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              labelBuilder?.call(entry) ?? entry,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            if ((subtitleBuilder?.call(entry) ?? '').isNotEmpty)
+                              Text(
+                                subtitleBuilder!.call(entry),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white38,
+                                  fontSize: 12,
+                                ),
+                              ),
+                          ],
+                        ),
                       ),
-                    ),
                     IconButton(
                       onPressed: () => onRemove(entry),
                       icon: const Icon(Icons.delete, size: 16),
@@ -4231,33 +4151,6 @@ class _VlessHomePageState extends State<VlessHomePage>
                           ],
                         ),
                         const SizedBox(height: 12),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: const [
-                                  Text(
-                                    'Smart Routing Zapret',
-                                    style: TextStyle(fontWeight: FontWeight.w600),
-                                  ),
-                                  SizedBox(height: 4),
-                                  Text(
-                                    'Adds a direct + evasion path for problematic domains without changing IP.',
-                                  ),
-                                ],
-                              ),
-                            ),
-                            Switch.adaptive(
-                              value: _smartRoutingZapret,
-                              onChanged: (value) => _setSmartRoutingZapret(value),
-                            ),
-                          ],
-                        ),
-                        if (_smartRoutingZapret) ...[
-                          const SizedBox(height: 8),
-                          _buildSmartZapretAdvanced(context),
-                        ],
                       ],
                     ),
                   ),
@@ -4351,19 +4244,24 @@ class _VlessHomePageState extends State<VlessHomePage>
                   emptyPlaceholder: Platform.isAndroid
                       ? 'Приложений нет'
                       : 'Приложений нет',
-                  onAdd: () => _promptAddEntry(
-                    title: 'Добавить приложение',
-                    hint: Platform.isAndroid
-                        ? 'com.example.app'
-                        : 'C:/Program Files/App/app.exe',
-                    onSubmit: _addApplication,
-                  ),
+                  onAdd: Platform.isWindows
+                      ? _showWindowsAppPicker
+                      : () => _promptAddEntry(
+                            title: 'Р”РѕР±Р°РІРёС‚СЊ РїСЂРёР»РѕР¶РµРЅРёРµ',
+                            hint: Platform.isAndroid
+                                ? 'com.example.app'
+                                : 'C:/Program Files/App/app.exe',
+                            onSubmit: _addApplication,
+                          ),
                   onRemove: _removeApplication,
                   extraContent: Platform.isAndroid
                       ? _buildAndroidAppActions(Theme.of(context))
-                      : null,
-                  labelBuilder: Platform.isAndroid
-                      ? _describeApplicationEntry
+                      : (Platform.isWindows
+                          ? _buildWindowsAppActions(Theme.of(context))
+                          : null),
+                  labelBuilder: _describeApplicationEntry,
+                  avatarBuilder: Platform.isWindows
+                      ? (value) => _buildWindowsAppIcon(value, size: 18)
                       : null,
                 ),
                 const SizedBox(height: 12),
@@ -4954,33 +4852,6 @@ class _VlessHomePageState extends State<VlessHomePage>
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: const [
-                      Text(
-                        'Smart Routing Zapret',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
-                      SizedBox(height: 4),
-                      Text(
-                        'Adds a direct + evasion path for problematic domains without changing IP.',
-                      ),
-                    ],
-                  ),
-                ),
-                Switch.adaptive(
-                  value: _smartRoutingZapret,
-                  onChanged: (value) => _setSmartRoutingZapret(value),
-                ),
-              ],
-            ),
-            if (_smartRoutingZapret) ...[
-              const SizedBox(height: 8),
-              _buildSmartZapretAdvanced(context),
-            ],
             const SizedBox(height: 8),
             DpiEvasionWidget(
               manager: _dpiEvasionManager,
@@ -5058,6 +4929,11 @@ class _VlessHomePageState extends State<VlessHomePage>
                     style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
                   ),
                 ),
+                TextButton.icon(
+                  onPressed: _openFullLogView,
+                  icon: const Icon(Icons.open_in_full),
+                  label: const Text('Во весь экран'),
+                ),
                 IconButton(
                   tooltip: 'Очистить лог',
                   onPressed: _logLines.isEmpty
@@ -5082,7 +4958,6 @@ class _VlessHomePageState extends State<VlessHomePage>
                 child: Padding(
                   padding: const EdgeInsets.all(16),
                   child: Scrollbar(
-                    controller: _logScrollController,
                     thumbVisibility: true,
                     child: SingleChildScrollView(
                       controller: _logScrollController,
@@ -5116,6 +4991,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     Widget? extraContent,
     Widget? footer,
     String Function(String value)? labelBuilder,
+    Widget Function(String value)? avatarBuilder,
   }) {
     final theme = Theme.of(context);
     return Card(
@@ -5191,6 +5067,7 @@ class _VlessHomePageState extends State<VlessHomePage>
                 children: items.map((value) {
                   final label = labelBuilder?.call(value) ?? value;
                   return InputChip(
+                    avatar: avatarBuilder?.call(value),
                     label: Text(label),
                     onDeleted: () => onRemove(value),
                     backgroundColor: theme.colorScheme.surfaceContainerHighest
@@ -5362,18 +5239,6 @@ class _VlessHomePageState extends State<VlessHomePage>
       _cancelConnectivity = false;
       _connectivityLastRun = DateTime.now();
     });
-    if (_smartRoutingZapret) {
-      final profileId = _currentNetworkProfileId();
-      await _routingDecisionEngine.ingestConnectivityResults(
-        networkProfileId: profileId,
-        results: results.values,
-        resolver: _domainGroupResolver,
-      );
-      await _refreshLearnedRoutes();
-      if (_isRunning) {
-        unawaited(_restartWithUpdatedRouting());
-      }
-    }
   }
 
   void _cancelConnectivityTests() {
@@ -5657,6 +5522,180 @@ class _AndroidAppPickerSheetState extends State<_AndroidAppPickerSheet> {
                         );
                       },
                     ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _WindowsAppEntry {
+  const _WindowsAppEntry({
+    required this.name,
+    required this.path,
+    required this.iconPath,
+  });
+
+  final String name;
+  final String path;
+  final String iconPath;
+}
+
+class _WindowsAppPickerSheet extends StatefulWidget {
+  const _WindowsAppPickerSheet({required this.apps, this.errorMessage});
+
+  final List<_WindowsAppEntry> apps;
+  final String? errorMessage;
+
+  @override
+  State<_WindowsAppPickerSheet> createState() => _WindowsAppPickerSheetState();
+}
+
+class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
+  String _query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final normalizedQuery = _query.trim().toLowerCase();
+    final filtered = normalizedQuery.isEmpty
+        ? widget.apps
+        : widget.apps.where((app) {
+            final name = app.name.toLowerCase();
+            final path = app.path.toLowerCase();
+            return name.contains(normalizedQuery) ||
+                path.contains(normalizedQuery);
+          }).toList();
+
+    final height = MediaQuery.of(context).size.height * 0.7;
+    final theme = Theme.of(context);
+    const cardColor = Color(0xFF1A1A1A);
+    return SafeArea(
+      child: SizedBox(
+        height: height,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: cardColor,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white.withOpacity(0.08)),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.35),
+                      blurRadius: 18,
+                      offset: const Offset(0, 10),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  children: [
+                    const SizedBox(height: 6),
+                    Container(
+                      width: 38,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                    const ListTile(
+                      title: Text(
+                        'Выберите приложение',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: TextField(
+                        autofocus: true,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          labelText: 'Поиск',
+                          labelStyle: TextStyle(
+                            color: Colors.white.withOpacity(0.6),
+                          ),
+                          prefixIcon: const Icon(Icons.search, color: Colors.white54),
+                        ),
+                        onChanged: (value) => setState(() => _query = value),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      height: height * 0.6,
+                      child: filtered.isEmpty
+                          ? Center(
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 18,
+                                ),
+                                child: Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    const Text(
+                                      'Приложений не найдено',
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(color: Colors.white70),
+                                    ),
+                                    if (widget.errorMessage != null &&
+                                        widget.errorMessage!.trim().isNotEmpty)
+                                      Padding(
+                                        padding: const EdgeInsets.only(top: 10),
+                                        child: Text(
+                                          widget.errorMessage!,
+                                          textAlign: TextAlign.center,
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(
+                                            color: Colors.white54,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: filtered.length,
+                              itemBuilder: (context, index) {
+                                final app = filtered[index];
+                                final iconPath = app.iconPath;
+                                return ListTile(
+                                  leading: iconPath.isNotEmpty
+                                      ? ClipRRect(
+                                          borderRadius: BorderRadius.circular(6),
+                                          child: Image.file(
+                                            File(iconPath),
+                                            width: 24,
+                                            height: 24,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        )
+                                      : const Icon(Icons.apps_outlined),
+                                  title: Text(
+                                    app.name,
+                                    style: const TextStyle(color: Colors.white),
+                                  ),
+                                  subtitle: Text(
+                                    app.path,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white54,
+                                    ),
+                                  ),
+                                  onTap: () =>
+                                      Navigator.of(context).pop(app.path),
+                                );
+                              },
+                            ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                ),
+              ),
             ),
           ],
         ),
