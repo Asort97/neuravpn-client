@@ -1,4 +1,6 @@
 import 'dart:convert';
+import 'dart:io';
+import 'package:path/path.dart' as path;
 import 'vless_parser.dart';
 
 import '../models/split_tunnel_config.dart';
@@ -320,16 +322,26 @@ List<Map<String, dynamic>> _buildApplicationRules(
     return const <Map<String, dynamic>>[];
   }
 
-  final cleaned = config.applications
-      .map((path) => path.trim())
-      .where((path) => path.isNotEmpty)
-      .map(_parseApplicationRule)
-      .whereType<_ApplicationRule>()
-      .toList();
+  final cleaned = <_ApplicationRule>[];
+  for (final entry in config.applications) {
+    final value = entry.trim();
+    if (value.isEmpty) continue;
+    cleaned.addAll(_parseApplicationRules(value));
+  }
   if (cleaned.isEmpty) return const <Map<String, dynamic>>[];
 
+  // Deduplicate identical rules.
+  final seen = <String>{};
+  final unique = <_ApplicationRule>[];
+  for (final rule in cleaned) {
+    final key = '${rule.key}:${rule.value}';
+    if (seen.add(key)) {
+      unique.add(rule);
+    }
+  }
+
   final outbound = config.mode == 'whitelist' ? vpnTag : 'direct';
-  return cleaned
+  return unique
       .map((rule) => {rule.key: rule.value, 'outbound': outbound})
       .toList();
 }
@@ -341,17 +353,62 @@ class _ApplicationRule {
   final String value;
 }
 
-_ApplicationRule? _parseApplicationRule(String entry) {
-  if (entry.isEmpty) return null;
+List<_ApplicationRule> _parseApplicationRules(String entry) {
+  if (entry.isEmpty) return const <_ApplicationRule>[];
+
   if (entry.startsWith('package:')) {
     final pkg = entry.substring('package:'.length).trim();
-    if (pkg.isEmpty) return null;
-    return _ApplicationRule('package_name', pkg);
+    if (pkg.isEmpty) return const <_ApplicationRule>[];
+    return <_ApplicationRule>[_ApplicationRule('package_name', pkg)];
   }
 
   final normalized = entry.trim();
-  final key = _looksLikePath(normalized) ? 'process_path' : 'process_name';
-  return _ApplicationRule(key, normalized);
+  if (_looksLikePath(normalized)) {
+    final exeName = path.basename(normalized);
+    final rules = <_ApplicationRule>[
+      _ApplicationRule('process_path', normalized),
+    ];
+    if (exeName.isNotEmpty && exeName.contains('.')) {
+      rules.add(_ApplicationRule('process_name', exeName));
+    }
+
+    // Special-case Squirrel apps (Discord/Slack/etc): Update.exe -> add sibling real exe.
+    if (exeName.toLowerCase() == 'update.exe') {
+      final parentDir = File(normalized).parent;
+      if (parentDir.existsSync()) {
+        // Prefer Discord.exe / DiscordCanary.exe, else first non-Update exe.
+        final exes = parentDir
+            .listSync()
+            .whereType<File>()
+            .where((f) =>
+                f.path.toLowerCase().endsWith('.exe') &&
+                path.basename(f.path).toLowerCase() != 'update.exe')
+            .toList();
+        File? picked;
+        for (final name in ['discord.exe', 'discordcanary.exe']) {
+          picked = exes.firstWhere(
+            (f) => path.basename(f.path).toLowerCase() == name,
+            orElse: () => File(''),
+          );
+          if (picked.path.isNotEmpty) break;
+        }
+        picked ??= exes.isNotEmpty ? exes.first : null;
+        if (picked != null && picked.path.isNotEmpty) {
+          final realExe = picked.path;
+          final realName = path.basename(realExe);
+          rules.add(_ApplicationRule('process_path', realExe));
+          rules.add(_ApplicationRule('process_name', realName));
+        } else {
+          // Fallback: add common Discord binaries even if not found (covers cases with read-only or missing scan).
+          rules.add(const _ApplicationRule('process_name', 'Discord.exe'));
+          rules.add(const _ApplicationRule('process_name', 'DiscordCanary.exe'));
+        }
+      }
+    }
+    return rules;
+  }
+
+  return <_ApplicationRule>[_ApplicationRule('process_name', normalized)];
 }
 
 bool _looksLikePath(String value) {

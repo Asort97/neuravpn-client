@@ -576,15 +576,39 @@ $items = foreach ($base in $paths) {
   if (Test-Path $base) {
     Get-ChildItem -Path $base -Recurse -Filter *.lnk | ForEach-Object {
       try {
-        $target = $shell.CreateShortcut($_.FullName).TargetPath
+        $sc = $shell.CreateShortcut($_.FullName)
+        $target = $sc.TargetPath
+        $args = $sc.Arguments
+        # Handle Squirrel-style shortcuts (Discord/Slack/etc): Update.exe --processStart App.exe
+        if ($target -and $target.ToLower().EndsWith("\\update.exe") -and $args) {
+          $pattern = '--processStart(?:AndWait)?\\s+"?([^"\\s]+\\.exe)"?'
+          $m = [regex]::Match($args, $pattern, "IgnoreCase")
+          if ($m.Success) {
+            $exeName = $m.Groups[1].Value
+            $candidate = Join-Path (Split-Path $target -Parent) $exeName
+            if ($candidate -and (Test-Path $candidate)) {
+              $target = $candidate
+            }
+          }
+        }
+        $exeTargets = @()
         if ($target -and (Test-Path $target) -and $target.ToLower().EndsWith(".exe")) {
-          $bytes = [System.Text.Encoding]::UTF8.GetBytes($target)
+          $exeTargets += $target
+          # Fallback: if still Update.exe and no regex match, try sibling exe
+          if ($target.ToLower().EndsWith("\\update.exe")) {
+            $sibling = Get-ChildItem -Path (Split-Path $target -Parent) -Filter *.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -ne 'Update.exe' } | Select-Object -First 1
+            if ($sibling) { $exeTargets += $sibling.FullName }
+          }
+        }
+        foreach ($exe in $exeTargets | Select-Object -Unique) {
+          $bytes = [System.Text.Encoding]::UTF8.GetBytes($exe)
           $sha1 = New-Object System.Security.Cryptography.SHA1Managed
           $hash = [System.BitConverter]::ToString($sha1.ComputeHash($bytes)).Replace('-', '')
           $iconPath = Join-Path $iconDir ($hash + ".png")
           if ($iconEnabled -and !(Test-Path $iconPath)) {
             try {
-              $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($target)
+              $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
               if ($icon -ne $null) {
                 $bmp = $icon.ToBitmap()
                 $bmp.Save($iconPath, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -597,7 +621,7 @@ $items = foreach ($base in $paths) {
           }
           $iconOut = ''
           if (Test-Path $iconPath) { $iconOut = $iconPath }
-          [PSCustomObject]@{ name = $_.BaseName; path = $target; icon = $iconOut }
+          [PSCustomObject]@{ name = $_.BaseName; path = $exe; icon = $iconOut }
         }
       } catch {}
     }
@@ -5631,9 +5655,7 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                       child: filtered.isEmpty
                           ? Center(
                               child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 18,
-                                ),
+                                padding: const EdgeInsets.symmetric(horizontal: 18),
                                 child: Column(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
@@ -5648,9 +5670,10 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                                         padding: const EdgeInsets.only(top: 10),
                                         child: Text(
                                           widget.errorMessage!,
+                                          maxLines: 3,
+                                          overflow: TextOverflow.ellipsis,
                                           textAlign: TextAlign.center,
-                                          style: theme.textTheme.bodySmall
-                                              ?.copyWith(
+                                          style: theme.textTheme.bodySmall?.copyWith(
                                             color: Colors.white54,
                                           ),
                                         ),
