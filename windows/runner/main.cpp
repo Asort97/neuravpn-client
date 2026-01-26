@@ -7,6 +7,8 @@
 
 #include "flutter_window.h"
 #include "utils.h"
+#include "process_split_channel.h"
+#include "dpi_evasion_channel.h"
 
 namespace {
 bool ContainsNonAscii(const std::wstring& value) {

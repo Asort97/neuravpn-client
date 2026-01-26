@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:path/path.dart' as path;
 import 'vless_parser.dart';
+import '../services/domain_families.dart';
 
 import '../models/split_tunnel_config.dart';
 import '../services/dpi_evasion_config.dart';
@@ -264,7 +265,18 @@ List<Map<String, dynamic>> _buildRouteRules(
 
   if (config.domains.isEmpty) return rules;
 
-  final targets = _RouteTargets.fromEntries(config.domains);
+  // Expand domain families on-the-fly, чтобы в UI показывать исходные записи.
+  final expandedDomains = <String>[];
+  for (final entry in config.domains) {
+    final expanded = DomainFamilies.expand(entry);
+    if (expanded.isNotEmpty) {
+      expandedDomains.addAll(expanded);
+    } else {
+      expandedDomains.add(entry);
+    }
+  }
+
+  final targets = _RouteTargets.fromEntries(expandedDomains);
 
   if (config.mode == 'whitelist') {
     // Только указанные домены/IP через VPN, остальное direct

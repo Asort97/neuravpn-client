@@ -161,8 +161,21 @@ class SingBoxController {
       _activeInterfaceName = null;
     }
 
+    var effectiveSplitConfig = splitConfig;
+
+    // На Windows подмешиваем дочерние процессы с активными сетевыми соединениями.
+    if (Platform.isWindows && splitConfig.applications.isNotEmpty) {
+      final expanded =
+          await _expandWindowsAppProcesses(splitConfig.applications);
+      if (expanded.isNotEmpty) {
+        final merged = <String>{...splitConfig.applications, ...expanded};
+        effectiveSplitConfig =
+            splitConfig.copyWith(applications: merged.toList());
+      }
+    }
+
     final androidPackages = Platform.isAndroid
-        ? _extractAndroidPackages(splitConfig)
+        ? _extractAndroidPackages(effectiveSplitConfig)
         : <String>[];
 
     _notifyStatus('Генерация конфига');
@@ -190,7 +203,7 @@ class SingBoxController {
 
     final jsonConfig = generateSingBoxConfig(
       parsed,
-      splitConfig,
+      effectiveSplitConfig,
       inboundTag: inboundTag,
       interfaceName: interfaceName,
       addresses: interfaceAddresses,
@@ -639,5 +652,116 @@ class SingBoxController {
       packages.add(value);
     }
     return packages.toList();
+  }
+
+  /// Возвращает дополнительные exe на Windows, которые имеют активные TCP/UDP соединения
+  /// и являются дочерними/родственными для указанных приложений.
+  Future<List<String>> _expandWindowsAppProcesses(List<String> apps) async {
+    if (!Platform.isWindows) return const [];
+    if (apps.isEmpty) return const [];
+
+    try {
+      final paths = <String>[];
+      final names = <String>[];
+      final dirs = <String>[];
+
+      for (final entry in apps) {
+        final value = entry.trim();
+        if (value.isEmpty) continue;
+        if (value.contains('\\') || value.contains('/')) {
+          paths.add(value);
+          final dir = File(value).parent.path;
+          dirs.add(dir);
+          final name = value.split(RegExp(r'[\\/]+')).last;
+          if (name.isNotEmpty) names.add(name);
+        } else {
+          names.add(value);
+        }
+      }
+
+      if (paths.isEmpty && names.isEmpty) return const [];
+
+      final ps = StringBuffer();
+      ps.writeln(r'$targetsPaths = @(');
+      for (final p in paths) {
+        ps.writeln("  '$p'");
+      }
+      ps.writeln(');');
+      ps.writeln(r'$targetsNames = @(');
+      for (final n in names) {
+        ps.writeln("  '$n'");
+      }
+      ps.writeln(');');
+      ps.writeln(r'$targetDirs = @(');
+      for (final d in dirs) {
+        ps.writeln("  '$d'");
+      }
+      ps.writeln(');');
+
+      ps.writeln(r'$pids = @()');
+      ps.writeln(
+          r'try { $pids += (Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue).OwningProcess } catch {}');
+      ps.writeln(
+          r'try { $pids += (Get-NetUDPEndpoint -ErrorAction SilentlyContinue).OwningProcess } catch {}');
+      ps.writeln(r'$pids = $pids | Where-Object { $_ -ne $null } | Select-Object -Unique');
+
+      ps.writeln(r'$procs = @()');
+      ps.writeln(r'foreach ($pid in $pids) {');
+      ps.writeln(
+          r'  try { $procs += Get-Process -Id $pid -ErrorAction SilentlyContinue } catch {}');
+      ps.writeln(r'}');
+
+      ps.writeln(r'$rows = @()');
+      ps.writeln(r'foreach ($p in $procs) {');
+      ps.writeln(r'  $path = $null');
+      ps.writeln(r'  try { $path = $p.Path } catch {}');
+      ps.writeln(r'  if (-not $path) { continue }');
+      ps.writeln(r'  $name = $p.Name');
+      ps.writeln(r'  $ppid = $null');
+      ps.writeln(r'  try { $ppid = $p.Parent.Id } catch {}');
+      ps.writeln(
+          r'  $rows += [PSCustomObject]@{path=$path; name=$name; pid=$p.Id; ppid=$ppid }');
+      ps.writeln(r'}');
+
+      ps.writeln(r'$match = @()');
+      ps.writeln(r'foreach ($row in $rows) {');
+      ps.writeln(r'  $path = $row.path');
+      ps.writeln(r'  $dir = Split-Path $path -Parent');
+      ps.writeln(r'  $name = $row.name');
+      ps.writeln(
+          r'  $isTarget = ($targetsPaths -contains $path) -or ($targetsNames -contains $name) -or ($targetDirs | Where-Object { $dir -like "$_*" })');
+      ps.writeln(r'  if ($isTarget) { $match += $row; continue }');
+      ps.writeln(r'  if ($row.ppid) {');
+      ps.writeln(
+          r'    $parent = $rows | Where-Object { $_.pid -eq $row.ppid } | Select-Object -First 1');
+      ps.writeln(
+          r'    if ($parent) { $pdir = Split-Path $parent.path -Parent; $pname = $parent.name;');
+      ps.writeln(
+          r'      if (($targetsPaths -contains $parent.path) -or ($targetsNames -contains $pname) -or ($targetDirs | Where-Object { $pdir -like "$_*" })) {');
+      ps.writeln(r'        $match += $row; continue');
+      ps.writeln(r'      }');
+      ps.writeln(r'    }');
+      ps.writeln(r'  }');
+      ps.writeln(r'}');
+
+      ps.writeln(
+          r'$paths = $match | Select-Object -ExpandProperty path -Unique | Where-Object { $_ -and $_.ToLower().EndsWith(".exe") }');
+      ps.writeln(r'$paths | ConvertTo-Json -Compress');
+
+      final result = await Process.run(
+        'powershell',
+        ['-NoProfile', '-Command', ps.toString()],
+      );
+      if (result.exitCode != 0) return const [];
+      final stdout = (result.stdout ?? '').toString().trim();
+      if (stdout.isEmpty || stdout == 'null') return const [];
+      final decoded = jsonDecode(stdout);
+      if (decoded is List) {
+        return decoded.map((e) => e.toString()).where((e) => e.isNotEmpty).toList();
+      }
+      return const [];
+    } catch (_) {
+      return const [];
+    }
   }
 }

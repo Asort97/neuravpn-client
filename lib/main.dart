@@ -25,9 +25,11 @@ import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/smart_route_engine.dart';
 import 'services/singbox_controller.dart';
+import 'services/process_split_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
+import 'services/domain_families.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
@@ -162,6 +164,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   String? _androidAppLoadError;
   List<Application> _androidInstalledApps = const <Application>[];
   Map<String, String> _androidAppLabels = {};
+  final ProcessSplitController _processSplitController = ProcessSplitController();
   List<_WindowsAppEntry> _windowsInstalledApps = <_WindowsAppEntry>[];
   Map<String, String> _windowsAppLabels = {};
   Map<String, String> _windowsAppIcons = {};
@@ -1286,6 +1289,7 @@ $regItems = foreach ($rp in $regPaths) {
       }
     });
     unawaited(_persistSplitState());
+    _refreshProcessSplitChannel();
   }
 
   void _changeSplitMode(String mode) {
@@ -1304,12 +1308,14 @@ $regItems = foreach ($rp in $regPaths) {
       }
     });
     unawaited(_persistSplitState());
+    _refreshProcessSplitChannel();
   }
 
   Future<void> _setSplitEnabled(bool enabled) async {
     if (_splitEnabled == enabled) return;
     setState(() => _splitEnabled = enabled);
     await _persistSplitState();
+    _refreshProcessSplitChannel();
   }
 
   Future<void> _setSmartRouting(bool enabled) async {
@@ -2094,6 +2100,15 @@ $regItems = foreach ($rp in $regPaths) {
     _startTrafficMonitor();
     unawaited(_applyDpiEvasionInjector());
     unawaited(_refreshMetrics(silent: true));
+
+    // Запускаем нативный split через WinDivert канал (если реализован).
+    if (Platform.isWindows) {
+      final whitelist = _splitMode == 'whitelist';
+      unawaited(_processSplitController.start(
+        applications: _configForConnection.applications,
+        whitelist: whitelist,
+      ));
+    }
   }
 
   Future<void> _stop() async {
@@ -2115,6 +2130,10 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _stopTrafficMonitor();
+
+    if (Platform.isWindows) {
+      unawaited(_processSplitController.stop());
+    }
   }
 
   Future<void> _applyDpiEvasionInjector() async {
@@ -2133,6 +2152,16 @@ $regItems = foreach ($rp in $regPaths) {
       enableTcpWindowClamp: _dpiEvasionConfig.enableTcpWindowClamp,
       enableSniRandomization: _dpiEvasionConfig.enableSniCaseRandomization,
     );
+  }
+
+  void _refreshProcessSplitChannel() {
+    if (!Platform.isWindows) return;
+    if (!_isRunning) return;
+    final whitelist = _splitMode == 'whitelist';
+    unawaited(_processSplitController.update(
+      applications: _configForConnection.applications,
+      whitelist: whitelist,
+    ));
   }
 
   void _updateDpiConfig(DpiEvasionConfig config) {
@@ -5124,11 +5153,11 @@ $regItems = foreach ($rp in $regPaths) {
   void _addDomainEntry(String value) {
     final normalized = _normalizeEntry(value);
     if (normalized.isEmpty) return;
+
     final current = _activeSplitConfig;
-    final items = [...current.domains];
-    if (items.contains(normalized)) return;
+    final items = {...current.domains};
     items.add(normalized);
-    _updateActiveSplitConfig(current.copyWith(domains: items));
+    _updateActiveSplitConfig(current.copyWith(domains: items.toList()));
   }
 
   void _removeDomainEntry(String value) {
