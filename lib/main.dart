@@ -581,26 +581,45 @@ $items = foreach ($base in $paths) {
         $sc = $shell.CreateShortcut($_.FullName)
         $target = $sc.TargetPath
         $args = $sc.Arguments
-        # Handle Squirrel-style shortcuts (Discord/Slack/etc): Update.exe --processStart App.exe
-        if ($target -and $target.ToLower().EndsWith("\\update.exe") -and $args) {
+        # Handle launcher-style shortcuts: any target with --processStart App.exe args
+        $resolvedFromArgs = $null
+        if ($args) {
           $pattern = '--processStart(?:AndWait)?\\s+"?([^"\\s]+\\.exe)"?'
           $m = [regex]::Match($args, $pattern, "IgnoreCase")
           if ($m.Success) {
             $exeName = $m.Groups[1].Value
-            $candidate = Join-Path (Split-Path $target -Parent) $exeName
-            if ($candidate -and (Test-Path $candidate)) {
-              $target = $candidate
+            $searchRoots = @()
+            if ($target) {
+              $searchRoots += (Split-Path $target -Parent)
+            }
+            $searchRoots += (Split-Path $_.FullName -Parent)
+            foreach ($root in $searchRoots | Select-Object -Unique) {
+              if ($root -and (Test-Path $root)) {
+                $candidate = Get-ChildItem -Path $root -Filter $exeName -File -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+                if ($candidate -and (Test-Path $candidate)) {
+                  $resolvedFromArgs = $candidate
+                  break
+                }
+              }
             }
           }
+        }
+        if ($resolvedFromArgs) {
+          $target = $resolvedFromArgs
         }
         $exeTargets = @()
         if ($target -and (Test-Path $target) -and $target.ToLower().EndsWith(".exe")) {
           $exeTargets += $target
-          # Fallback: if still Update.exe and no regex match, try sibling exe
-          if ($target.ToLower().EndsWith("\\update.exe")) {
-            $sibling = Get-ChildItem -Path (Split-Path $target -Parent) -Filter *.exe -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -ne 'Update.exe' } | Select-Object -First 1
-            if ($sibling) { $exeTargets += $sibling.FullName }
+          # Generic fallback for launcher/updater wrappers:
+          # if processStart arg exists but exact target wasn't resolved, include a descendant exe too.
+          if ($args -and -not $resolvedFromArgs) {
+            $searchRoot = Split-Path $target -Parent
+            if ($searchRoot -and (Test-Path $searchRoot)) {
+              $childExe = Get-ChildItem -Path $searchRoot -Filter *.exe -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -ne $target } | Select-Object -First 1
+              if ($childExe) { $exeTargets += $childExe.FullName }
+            }
           }
         }
         foreach ($exe in $exeTargets | Select-Object -Unique) {

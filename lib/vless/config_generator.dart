@@ -372,38 +372,14 @@ List<_ApplicationRule> _parseApplicationRules(String entry) {
       rules.add(_ApplicationRule('process_name', exeName));
     }
 
-    // Special-case Squirrel apps (Discord/Slack/etc): Update.exe -> add sibling real exe.
-    if (exeName.toLowerCase() == 'update.exe') {
-      final parentDir = File(normalized).parent;
-      if (parentDir.existsSync()) {
-        // Prefer Discord.exe / DiscordCanary.exe, else first non-Update exe.
-        final exes = parentDir
-            .listSync()
-            .whereType<File>()
-            .where((f) =>
-                f.path.toLowerCase().endsWith('.exe') &&
-                path.basename(f.path).toLowerCase() != 'update.exe')
-            .toList();
-        File? picked;
-        for (final name in ['discord.exe', 'discordcanary.exe']) {
-          picked = exes.firstWhere(
-            (f) => path.basename(f.path).toLowerCase() == name,
-            orElse: () => File(''),
-          );
-          if (picked.path.isNotEmpty) break;
-        }
-        picked ??= exes.isNotEmpty ? exes.first : null;
-        if (picked != null && picked.path.isNotEmpty) {
-          final realExe = picked.path;
-          final realName = path.basename(realExe);
-          rules.add(_ApplicationRule('process_path', realExe));
-          rules.add(_ApplicationRule('process_name', realName));
-        } else {
-          // Fallback: add common Discord binaries even if not found (covers cases with read-only or missing scan).
-          rules.add(const _ApplicationRule('process_name', 'Discord.exe'));
-          rules.add(const _ApplicationRule('process_name', 'DiscordCanary.exe'));
-        }
-      }
+    // Universal parent->child process support:
+    // include descendant executables from the app directory so child processes
+    // spawned by launchers/updaters are routed too.
+    for (final childExe in _collectDescendantExecutables(normalized)) {
+      final childName = path.basename(childExe);
+      if (childName.isEmpty) continue;
+      rules.add(_ApplicationRule('process_path', childExe));
+      rules.add(_ApplicationRule('process_name', childName));
     }
     return rules;
   }
@@ -413,6 +389,43 @@ List<_ApplicationRule> _parseApplicationRules(String entry) {
 
 bool _looksLikePath(String value) {
   return value.contains(':') || value.contains('/') || value.contains('\\');
+}
+
+List<String> _collectDescendantExecutables(String selectedExePath) {
+  final selected = File(selectedExePath);
+  if (!selected.existsSync()) return const <String>[];
+
+  final root = selected.parent;
+  if (!root.existsSync()) return const <String>[];
+
+  const maxDepth = 3;
+  const maxCount = 32;
+  final selectedLower = selected.path.toLowerCase();
+  final discovered = <String>[];
+
+  List<FileSystemEntity> entities;
+  try {
+    entities = root.listSync(recursive: true, followLinks: false);
+  } catch (_) {
+    return const <String>[];
+  }
+
+  for (final entity in entities) {
+    if (discovered.length >= maxCount) break;
+    if (entity is! File) continue;
+
+    final fullPath = entity.path;
+    if (!fullPath.toLowerCase().endsWith('.exe')) continue;
+    if (fullPath.toLowerCase() == selectedLower) continue;
+
+    final relPath = path.relative(fullPath, from: root.path);
+    final depth = path.split(relPath).length - 1;
+    if (depth > maxDepth) continue;
+
+    discovered.add(fullPath);
+  }
+
+  return discovered;
 }
 
 Map<String, dynamic>? _buildTransport(
