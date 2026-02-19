@@ -150,6 +150,8 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _trayInitialized = false;
   bool _isExitingApp = false;
   bool _isConnecting = false;
+  bool _isDisconnecting = false;
+  bool _connectButtonHovered = false;
   bool _hasSubscriptions = false;
   bool _trayPopupMode = false;
   OverlayEntry? _trayOverlayEntry;
@@ -2031,6 +2033,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _start() async {
+    // Защита от спама - проверяем, не идёт ли уже подключение или отключение
+    if (_isConnecting || _isDisconnecting) return;
+    
     if (_isRunning) {
       await _stop();
       await Future.delayed(const Duration(seconds: 2));
@@ -2096,8 +2101,34 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_refreshMetrics(silent: true));
   }
 
+  void _onMainConnectButtonPressed({
+    required bool isEnabled,
+    required bool isRunning,
+  }) {
+    if (_isConnecting || _isDisconnecting) return;
+
+    if (isRunning) {
+      unawaited(_stop());
+      return;
+    }
+
+    if (!isEnabled) {
+      _showFastSnack('Добавьте профиль или вставьте VLESS-конфиг');
+      return;
+    }
+
+    unawaited(_start());
+  }
+
   Future<void> _stop() async {
+    // Защита от спама - проверяем, не идёт ли уже отключение или подключение
+    if (_isDisconnecting || _isConnecting) return;
     if (!_isRunning) return;
+    
+    setState(() {
+      _isDisconnecting = true;
+    });
+    
     await _singBoxController.disconnect(
       onStatus: (value) {
         if (!mounted) return;
@@ -2111,6 +2142,7 @@ $regItems = foreach ($rp in $regPaths) {
     setState(() {
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
       _isConnecting = false;
+      _isDisconnecting = false;
     });
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
@@ -3088,6 +3120,7 @@ $regItems = foreach ($rp in $regPaths) {
     final isRunning = _isRunning;
     final isEnabled =
         _selectedProfile != null || _controller.text.trim().isNotEmpty;
+    final canInteract = !_isConnecting && !_isDisconnecting;
     final statusColor = isRunning
         ? _neuraRed
         : _isConnecting
@@ -3191,9 +3224,19 @@ $regItems = foreach ($rp in $regPaths) {
               ),
               const SizedBox(height: 20),
               Center(
-                child: GestureDetector(
-                  onTap: isRunning ? _stop : (isEnabled ? _start : null),
-                  child: AnimatedBuilder(
+                child: MouseRegion(
+                  cursor: canInteract
+                      ? SystemMouseCursors.click
+                      : SystemMouseCursors.basic,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: canInteract
+                        ? () => _onMainConnectButtonPressed(
+                              isEnabled: isEnabled,
+                              isRunning: isRunning,
+                            )
+                        : null,
+                    child: AnimatedBuilder(
                     animation: _connectGlowAnimation,
                     builder: (context, child) {
                       final rotation = _connectGlowAnimation.value * 2 * math.pi;
@@ -3212,7 +3255,7 @@ $regItems = foreach ($rp in $regPaths) {
                         ),
                       );
                       return Opacity(
-                        opacity: isEnabled || isRunning ? 1 : 0.5,
+                        opacity: canInteract && (isEnabled || isRunning) ? 1 : 0.5,
                         child: Transform.scale(
                           scale: pulse,
                           child: Stack(
@@ -3259,6 +3302,7 @@ $regItems = foreach ($rp in $regPaths) {
                         ),
                       );
                     },
+                    ),
                   ),
                 ),
               ),
@@ -4579,9 +4623,35 @@ $regItems = foreach ($rp in $regPaths) {
     );
 
     final buttonSize = compact ? 140.0 : 170.0;
-    final connectButton = GestureDetector(
-      onTap: isRunning ? _stop : (isEnabled ? _start : null),
-      child: AnimatedBuilder(
+    final canInteract = !_isConnecting && !_isDisconnecting;
+    final connectButton = Material(
+      color: Colors.transparent,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        mouseCursor:
+            canInteract ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        onHover: (value) {
+          if (!canInteract) {
+            if (_connectButtonHovered) {
+              setState(() => _connectButtonHovered = false);
+            }
+            return;
+          }
+          if (_connectButtonHovered != value) {
+            setState(() => _connectButtonHovered = value);
+          }
+        },
+        onTap: canInteract
+            ? () => _onMainConnectButtonPressed(
+                  isEnabled: isEnabled,
+                  isRunning: isRunning,
+                )
+            : null,
+        child: AnimatedScale(
+          scale: _connectButtonHovered && canInteract ? 1.08 : 1.0,
+          duration: const Duration(milliseconds: 150),
+          child: AnimatedBuilder(
         animation: _connectGlowController,
         builder: (context, child) {
           final rotation = _connectGlowController.value * 6.283185307179586;
@@ -4606,7 +4676,7 @@ $regItems = foreach ($rp in $regPaths) {
 
           return AnimatedOpacity(
             duration: const Duration(milliseconds: 200),
-            opacity: isEnabled || isRunning ? 1.0 : 0.4,
+            opacity: (isEnabled || isRunning) && canInteract ? 1.0 : 0.4,
             child: Container(
               width: buttonSize,
               height: buttonSize,
@@ -4642,6 +4712,8 @@ $regItems = foreach ($rp in $regPaths) {
             ),
           );
         },
+      ),
+      ),
       ),
     );
 
