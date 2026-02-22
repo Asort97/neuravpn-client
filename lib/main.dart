@@ -23,6 +23,7 @@ import 'services/connectivity_targets.dart';
 import 'services/connectivity_tester.dart';
 import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
+import 'services/domain_rule_normalizer.dart';
 import 'services/smart_route_engine.dart';
 import 'services/singbox_controller.dart';
 import 'services/subscription_repository.dart';
@@ -39,6 +40,7 @@ import 'widgets/loading_screen.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ru_RU', null);
+  await DomainRuleNormalizer.initializeDefaultRules();
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
     final windowOptions = WindowOptions(
@@ -250,6 +252,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   late final List<ConnectivityTestTarget> _connectivityTargets =
       buildDefaultConnectivityTargets();
   final DpiEvasionManager _dpiEvasionManager = DpiEvasionManager();
+  final DomainRuleNormalizer _domainRuleNormalizer = DomainRuleNormalizer();
   DpiEvasionConfig _dpiEvasionConfig = DpiEvasionConfig.balanced;
   final Map<String, ConnectivityTestResult> _connectivityResults = {};
   bool _isConnectivityTesting = false;
@@ -303,8 +306,15 @@ class _VlessHomePageState extends State<VlessHomePage>
   
   SplitTunnelConfig get _configForConnection {
     final effective = _effectiveSplitConfig;
-    // Раскрываем домены с поддоменами под капотом
-    final expandedDomains = _expandDomainsWithSubdomains(effective.domains);
+    final normalizedDomains = _domainRuleNormalizer.normalizeForConnection(
+      mode: effective.mode,
+      entries: effective.domains,
+      onDebug: _developerMode
+          ? (message) => _appendLogs(['[domain-normalizer] $message'])
+          : null,
+    );
+    // Раскрываем домены с поддоменами под капотом.
+    final expandedDomains = _expandDomainsWithSubdomains(normalizedDomains);
     return effective.copyWith(
       domains: expandedDomains,
       smartRouting: _smartRouting,
@@ -5331,7 +5341,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _addDomainEntry(String value) {
-    final normalized = _normalizeEntry(value);
+    final normalized = _domainRuleNormalizer.sanitizeDomainEntry(
+      _normalizeEntry(value),
+    );
     if (normalized.isEmpty) return;
     final current = _activeSplitConfig;
     final items = [...current.domains];
@@ -5341,7 +5353,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _removeDomainEntry(String value) {
-    final normalized = _normalizeEntry(value);
+    final normalized = _domainRuleNormalizer.sanitizeDomainEntry(
+      _normalizeEntry(value),
+    );
     final current = _activeSplitConfig;
     final items = [...current.domains]..remove(normalized);
     _updateActiveSplitConfig(current.copyWith(domains: items));

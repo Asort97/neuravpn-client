@@ -44,6 +44,7 @@ dependencies:
   http: ^1.1.0
   intl: ^0.19.0
   package_info_plus: ^8.0.3
+  public_suffix: ^3.0.0
 
 dev_dependencies:
   flutter_test:
@@ -81,6 +82,7 @@ flutter:
     - windows/runner/resources/hc_icon.ico
     - assets/images/logo.png
     - assets/images/11zon_cropped.png
+    - assets/public_suffix/public_suffix_list.dat
 
 # Windows MSIX packaging (App Installer updates)
 msix_config:
