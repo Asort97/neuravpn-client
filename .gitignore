@@ -72,3 +72,4 @@ windows/certificates/*.pfx
 appinstaller/*.appinstaller
 appinstaller/*.cer
 appinstaller/*.msix
+DebugTEST

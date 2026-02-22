@@ -181,6 +181,49 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _splitToggleKey = 'split_tunnel_enabled';
   static const String _smartRoutingKey = 'smart_routing_enabled';
   static const String _hasEverAddedKeyKey = 'has_added_key';
+  static const Map<String, List<String>> _domainSubdomainsMap = {
+    'youtube.com': [
+      'youtube.com',
+      'youtubekids.com',
+      'youtube-nocookie.com',
+      'youtubeembeddedplayer.googleapis.com',
+      'youtubei.googleapis.com',
+      'youtu.be',
+      'yt-video-upload.l.google.com',
+      'ytimg.com',
+      'ytimg.l.google.com',
+      'yt3.ggpht.com',
+      'yt4.ggpht.com',
+      'yt3.googleusercontent.com',
+      'googlevideo.com',
+      'jnn-pa.googleapis.com',
+      'wide-youtube.l.google.com',
+      'youtube-ui.l.google.com',
+    ],
+    'discord.com': [
+      'discord.com',
+      'discord.app',
+      'discord.co',
+      'discord.design',
+      'discord.dev',
+      'discord.gift',
+      'discord.gifts',
+      'discord.gg',
+      'discord.media',
+      'discord.new',
+      'discord.store',
+      'discord.status',
+      'discordactivities.com',
+      'discordapp.com',
+      'discordapp.net',
+      'discordcdn.com',
+      'discordmerch.com',
+      'discordpartygames.com',
+      'discordsays.com',
+      'discordsez.com',
+      'discordstatus.com',
+    ],
+  };
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
@@ -241,10 +284,33 @@ class _VlessHomePageState extends State<VlessHomePage>
       _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
   SplitTunnelConfig get _effectiveSplitConfig =>
       _splitEnabled ? _activeSplitConfig : SplitTunnelConfig(mode: 'all');
-  SplitTunnelConfig get _configForConnection => _effectiveSplitConfig.copyWith(
-    smartRouting: _smartRouting,
-    smartDomains: _smartRouteEngine.exportLegacyRuleEntries(),
-  );
+  
+  /// Раскрывает домены с предопределенными поддоменами (youtube.com -> все поддомены YouTube)
+  List<String> _expandDomainsWithSubdomains(List<String> domains) {
+    final expanded = <String>[];
+    for (final domain in domains) {
+      final subdomains = _domainSubdomainsMap[domain];
+      if (subdomains != null) {
+        // Для известных доменов (youtube.com, discord.com) добавляем все поддомены
+        expanded.addAll(subdomains);
+      } else {
+        // Для остальных доменов добавляем как есть
+        expanded.add(domain);
+      }
+    }
+    return expanded;
+  }
+  
+  SplitTunnelConfig get _configForConnection {
+    final effective = _effectiveSplitConfig;
+    // Раскрываем домены с поддоменами под капотом
+    final expandedDomains = _expandDomainsWithSubdomains(effective.domains);
+    return effective.copyWith(
+      domains: expandedDomains,
+      smartRouting: _smartRouting,
+      smartDomains: _smartRouteEngine.exportLegacyRuleEntries(),
+    );
+  }
 
   int _windowsViewIndex(_WindowsView view) {
     return _windowsViewOrder.indexOf(view);
@@ -990,12 +1056,14 @@ $regItems = foreach ($rp in $regPaths) {
     });
   }
 
-  void _stopTrafficMonitor() {
+  Future<void> _stopTrafficMonitor() async {
     _trafficSub?.cancel();
     _trafficSub = null;
     _trafficFetchInProgress = false;
     _trafficHistory.clear();
-    unawaited(_singBoxController.stopTrafficStream());
+    await _singBoxController.stopTrafficStream();
+    // Даем немного времени для полной остановки
+    await Future.delayed(const Duration(milliseconds: 200));
   }
 
   bool get _isRunning => _singBoxController.isRunning;
@@ -2001,6 +2069,9 @@ $regItems = foreach ($rp in $regPaths) {
 
   String _mapStatus(String value) {
     final normalized = value.toLowerCase();
+    if (normalized.contains('попытка') || normalized.contains('attempt')) {
+      return value;
+    }
     if (normalized.contains('connect')) {
       return '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
     }
@@ -2010,7 +2081,7 @@ $regItems = foreach ($rp in $regPaths) {
     if (normalized.contains('disconnect')) {
       return '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
     }
-    return _status;
+    return value;
   }
 
   String _deriveProfileNameFromUri(String uri) {
@@ -2057,7 +2128,10 @@ $regItems = foreach ($rp in $regPaths) {
     
     if (_isRunning) {
       await _stop();
-      await Future.delayed(const Duration(seconds: 2));
+      // Проверяем что действительно отключилось
+      await _ensureDisconnected();
+      // Даем дополнительное время для полной очистки ресурсов
+      await Future.delayed(const Duration(seconds: 1));
     }
 
     setState(() {
@@ -2071,6 +2145,7 @@ $regItems = foreach ($rp in $regPaths) {
     final result = await _singBoxController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
+      developerMode: _developerMode,
       smartRouteEngine: _smartRouteEngine,
       dpiEvasionConfig: _dpiEvasionConfig,
       onStatus: (value) {
@@ -2096,7 +2171,15 @@ $regItems = foreach ($rp in $regPaths) {
         _stopTrafficMonitor();
         return;
       }
-      _showFastSnack(result.errorMessage ?? '\u041e\u0448\u0438\u0431\u043a\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f');
+      
+      // Проверка на ошибку TUN адаптера
+      final errorMsg = result.errorMessage ?? 'Ошибка подключения';
+      if (errorMsg.contains('TUN adapter') || errorMsg.contains('wintun') || errorMsg.toLowerCase().contains('interface')) {
+        _showFastSnack('Ошибка сети: WinTun адаптер не готов.');
+      } else {
+        _showFastSnack(errorMsg);
+      }
+      
       setState(() {
         _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
         _isConnecting = false;
@@ -2139,6 +2222,27 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_start());
   }
 
+  /// Дополнительная проверка полного отключения with retry logic
+  Future<void> _ensureDisconnected() async {
+    int retries = 0;
+    const maxRetries = 3;
+    
+    while (_isRunning && retries < maxRetries) {
+      await Future.delayed(const Duration(seconds: 1));
+      retries++;
+    }
+    
+    if (_isRunning) {
+      // Если после попыток еще подключено - попробуем еще раз отключить
+      await _singBoxController.disconnect(
+        onStatus: (_) {},
+        onLog: (_) {},
+      );
+      await Future.delayed(const Duration(seconds: 1));
+    }
+  }
+
+
   Future<void> _stop() async {
     // Защита от спама - проверяем, не идёт ли уже отключение или подключение
     if (_isDisconnecting || _isConnecting) return;
@@ -2148,6 +2252,13 @@ $regItems = foreach ($rp in $regPaths) {
       _isDisconnecting = true;
     });
     
+    // Сначала остановить мониторинг трафика
+    await _stopTrafficMonitor();
+    
+    // Остановить DPI injection
+    await _dpiEvasionManager.stopNativeInjector();
+    
+    // Затем отключить sing-box
     await _singBoxController.disconnect(
       onStatus: (value) {
         if (!mounted) return;
@@ -2156,7 +2267,10 @@ $regItems = foreach ($rp in $regPaths) {
       },
       onLog: (line) => _appendLogs([line]),
     );
-    await _dpiEvasionManager.stopNativeInjector();
+    
+    // Даем времени на полную очистку соединения
+    await Future.delayed(const Duration(milliseconds: 500));
+    
     if (!mounted) return;
     setState(() {
       _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -2165,7 +2279,6 @@ $regItems = foreach ($rp in $regPaths) {
     });
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
-    _stopTrafficMonitor();
   }
 
   Future<void> _applyDpiEvasionInjector() async {
@@ -2384,9 +2497,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   @override
+  @override
   void dispose() {
     _logFlushTimer?.cancel();
-    _stopTrafficMonitor();
     _connectGlowController.dispose();
     _windowsPageController.dispose();
     _controller.dispose();
@@ -2396,6 +2509,11 @@ $regItems = foreach ($rp in $regPaths) {
       _trayManager.removeListener(this);
       unawaited(_trayManager.destroy());
     }
+    // Убеждаемся что VPN отключен перед выходом
+    if (_isRunning) {
+      unawaited(_stop());
+    }
+    unawaited(_stopTrafficMonitor());
     unawaited(_singBoxController.dispose());
     unawaited(_dpiEvasionManager.stopNativeInjector());
     super.dispose();
@@ -3833,11 +3951,11 @@ $regItems = foreach ($rp in $regPaths) {
                         segments: const [
                           ButtonSegment(
                             value: 'whitelist',
-                            label: Text('Белый список'),
+                            label: Text('Через VPN'),
                           ),
                           ButtonSegment(
                             value: 'blacklist',
-                            label: Text('Чёрный список'),
+                            label: Text('В обход VPN'),
                           ),
                         ],
                         style: SegmentedButton.styleFrom(
@@ -3863,7 +3981,7 @@ $regItems = foreach ($rp in $regPaths) {
                       _buildWindowsPresetActionsBar(),
                       const SizedBox(height: 16),
                       _buildSplitEntrySection(
-                        title: 'Конфигурации',
+                        title: 'Сайты',
                         icon: Icons.public,
                         items: activeDomains,
                         emptyLabel: 'Домены не добавлены.',
@@ -4280,11 +4398,11 @@ $regItems = foreach ($rp in $regPaths) {
                           segments: const [
                             ButtonSegment(
                               value: 'whitelist',
-                              label: Text('Белый список'),
+                              label: Text('Через VPN'),
                             ),
                             ButtonSegment(
                               value: 'blacklist',
-                              label: Text('Чёрный список'),
+                              label: Text('В обход VPN'),
                             ),
                           ],
                           style: SegmentedButton.styleFrom(

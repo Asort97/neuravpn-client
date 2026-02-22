@@ -27,6 +27,7 @@ String generateSingBoxConfig(
   String? dnsFinalTag,
   DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
   int? clashApiPort,
+  String logLevel = 'info',
 }) {
   final p = link.params;
   final transportType = p['type']; // например ws, tcp, grpc, h2
@@ -126,7 +127,7 @@ String generateSingBoxConfig(
       : const <Map<String, dynamic>>[];
 
   final config = {
-    'log': {'level': 'debug', 'timestamp': true, 'output': 'stderr'},
+    'log': {'level': logLevel, 'timestamp': true, 'output': 'stderr'},
     'dns': {
       'servers': dnsServers ?? [
         {
@@ -155,13 +156,13 @@ String generateSingBoxConfig(
         'tag': inboundTag,
         'interface_name': interfaceName,
         'stack': tunStack,
-        'mtu': 1500,
+        'mtu': 1280,  // Уменьшено с 1500 - часто вызывает проблемы на Windows
         'address': addresses ?? const ['172.19.0.1/30'],
         'auto_route': true,
         // Windows: recommended to prevent multihomed DNS leaks and enforce routing.
         'strict_route': true,
         // Ensure both IPv4 and IPv6 default routes are captured.
-        'route_address': const ['0.0.0.0/1', '128.0.0.0/1', '::/1', '8000::/1'],
+        'route_address': const ['0.0.0.0/1', '128.0.0.0/1'],  // Убрали IPv6 для стабильности
         'sniff': true,
         'sniff_override_destination': false,
       },
