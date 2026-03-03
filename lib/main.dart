@@ -37,6 +37,9 @@ import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
 import 'widgets/loading_screen.dart';
 
+@visibleForTesting
+bool debugForceMobileShell = false;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ru_RU', null);
@@ -93,10 +96,10 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
 
   @override
   Set<PointerDeviceKind> get dragDevices => {
-        PointerDeviceKind.touch,
-        PointerDeviceKind.mouse,
-        PointerDeviceKind.trackpad,
-      };
+    PointerDeviceKind.touch,
+    PointerDeviceKind.mouse,
+    PointerDeviceKind.trackpad,
+  };
 }
 
 enum _WindowsView { connection, splitTunneling, settings }
@@ -116,9 +119,10 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _updateLastCheckKey = 'update_last_check_ms';
 
   final TextEditingController _controller = TextEditingController();
-  String _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+  String _status =
+      '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
   _WindowsView _windowsView = _WindowsView.connection;
-  bool _showLoadingScreen = Platform.isWindows;
+  bool _showLoadingScreen = Platform.isWindows && !debugForceMobileShell;
   late final PageController _windowsPageController;
   bool _singBoxWatchdogStarted = false;
   static const List<_WindowsView> _windowsViewOrder = [
@@ -242,7 +246,8 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
   static const String _dpiTlsFragmentKey = 'dpi_tls_fragment_enabled';
-  static const String _dpiTlsRecordFragmentKey = 'dpi_tls_record_fragment_enabled';
+  static const String _dpiTlsRecordFragmentKey =
+      'dpi_tls_record_fragment_enabled';
   static const String _dpiTrafficNoiseKey = 'dpi_traffic_noise_enabled';
   static const String _dpiMultiplexPaddingKey = 'dpi_multiplex_padding_enabled';
   static const String _dpiTcpWindowClampKey = 'dpi_tcp_window_clamp_enabled';
@@ -268,8 +273,11 @@ class _VlessHomePageState extends State<VlessHomePage>
       _parsed ?? parseVlessUri(_controller.text.trim());
   File? get _configFile => _singBoxController.configFile;
   String? get _generatedConfig => _singBoxController.generatedConfig;
+  bool get _isWindowsShellPlatform =>
+      Platform.isWindows && !debugForceMobileShell;
   bool get _isDesktopPlatform =>
-      Platform.isWindows || Platform.isLinux || Platform.isMacOS;
+      (Platform.isWindows || Platform.isLinux || Platform.isMacOS) &&
+      !debugForceMobileShell;
   bool get _hasActivePreset =>
       _activePresetName != null &&
       _splitPresets.any((preset) => preset.name == _activePresetName);
@@ -287,7 +295,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
   SplitTunnelConfig get _effectiveSplitConfig =>
       _splitEnabled ? _activeSplitConfig : SplitTunnelConfig(mode: 'all');
-  
+
   /// Раскрывает домены с предопределенными поддоменами (youtube.com -> все поддомены YouTube)
   List<String> _expandDomainsWithSubdomains(List<String> domains) {
     final expanded = <String>[];
@@ -303,7 +311,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
     return expanded;
   }
-  
+
   SplitTunnelConfig get _configForConnection {
     final effective = _effectiveSplitConfig;
     final normalizedDomains = _domainRuleNormalizer.normalizeForConnection(
@@ -332,6 +340,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
     return _windowsViewOrder[index];
   }
+
   @override
   void initState() {
     super.initState();
@@ -349,12 +358,14 @@ class _VlessHomePageState extends State<VlessHomePage>
     _updateConnectGlowTicker();
     _loadInitialData();
     unawaited(_initVersionAndUpdates());
-    _checkWintun();
+    if (_isWindowsShellPlatform) {
+      unawaited(_checkWintun());
+    }
     if (_isDesktopPlatform) {
       windowManager.addListener(this);
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
-      if (Platform.isWindows) {
+      if (_isWindowsShellPlatform) {
         unawaited(_startSingBoxWatchdog());
         WidgetsBinding.instance.addPostFrameCallback((_) {
           unawaited(_fitWindowToDisplay());
@@ -367,14 +378,17 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _checkWintun() async {
+    if (!_isWindowsShellPlatform) return;
     final available = await _singBoxController.isWintunAvailable();
     if (!available && mounted) {
-      _showFastSnack('wintun.dll \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d');
+      _showFastSnack(
+        'wintun.dll \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d',
+      );
     }
   }
 
   Future<void> _initVersionAndUpdates() async {
-    if (!Platform.isWindows) return;
+    if (!_isWindowsShellPlatform) return;
     try {
       final info = await PackageInfo.fromPlatform();
       if (!mounted) return;
@@ -388,7 +402,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _maybeCheckForUpdates({bool manual = false}) async {
-    if (!Platform.isWindows) return;
+    if (!_isWindowsShellPlatform) return;
     if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
         _updateRepo == 'YOUR_GITHUB_REPO') {
       return;
@@ -400,8 +414,11 @@ class _VlessHomePageState extends State<VlessHomePage>
       final prefs = await SharedPreferences.getInstance();
       final now = DateTime.now();
       final lastMs = prefs.getInt(_updateLastCheckKey);
-      final last = lastMs == null ? null : DateTime.fromMillisecondsSinceEpoch(lastMs);
-      final shouldSkip = !manual &&
+      final last = lastMs == null
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(lastMs);
+      final shouldSkip =
+          !manual &&
           last != null &&
           now.difference(last) < const Duration(hours: 12);
       if (shouldSkip) return;
@@ -414,7 +431,9 @@ class _VlessHomePageState extends State<VlessHomePage>
       );
       if (latest == null) {
         if (manual && mounted) {
-          _showFastSnack('\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f');
+          _showFastSnack(
+            '\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f',
+          );
         }
         return;
       }
@@ -431,7 +450,9 @@ class _VlessHomePageState extends State<VlessHomePage>
 
       if (!result.isUpdateAvailable) {
         if (manual) {
-          _showFastSnack('\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u044f\u044f \u0432\u0435\u0440\u0441\u0438\u044f');
+          _showFastSnack(
+            '\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u044f\u044f \u0432\u0435\u0440\u0441\u0438\u044f',
+          );
         }
         return;
       }
@@ -532,7 +553,9 @@ class _VlessHomePageState extends State<VlessHomePage>
                         borderRadius: BorderRadius.circular(12),
                       ),
                     ),
-                    child: const Text('\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437'),
+                    child: const Text(
+                      '\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437',
+                    ),
                   ),
                 ],
               ),
@@ -544,7 +567,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _openUrl(String url) async {
-    if (!Platform.isWindows) return;
+    if (!_isWindowsShellPlatform) return;
     try {
       await Process.start('cmd', ['/c', 'start', '', url], runInShell: true);
     } catch (_) {
@@ -597,10 +620,20 @@ class _VlessHomePageState extends State<VlessHomePage>
       await _loadAndroidApps();
     }
     if (!mounted) return;
-    final apps = _androidInstalledApps;
+    var apps = _androidInstalledApps;
+    if (apps.isEmpty && !_androidAppsLoading) {
+      await _loadAndroidApps(force: true);
+      if (!mounted) return;
+      apps = _androidInstalledApps;
+    }
     if (apps.isEmpty) {
       _showFastSnack(
-        'Список приложений пуст. Обновите список и попробуйте снова.',
+        'Не удалось получить список приложений. Введите package name вручную.',
+      );
+      await _promptAddEntry(
+        title: 'Добавить приложение',
+        hint: 'com.example.app',
+        onSubmit: _addApplication,
       );
       return;
     }
@@ -636,12 +669,15 @@ class _VlessHomePageState extends State<VlessHomePage>
       iconDir.createSync(recursive: true);
     }
     final safeIconDir = iconDir.path.replaceAll("'", "''");
-    final script = r'''
+    final script =
+        r'''
 $paths = @(
   "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
   "$env:AppData\Microsoft\Windows\Start Menu\Programs"
 )
-$iconDir = ''' + "'$safeIconDir'\n" + r'''
+$iconDir = ''' +
+        "'$safeIconDir'\n" +
+        r'''
 New-Item -ItemType Directory -Force -Path $iconDir | Out-Null
 $iconEnabled = $true
 try {
@@ -778,14 +814,19 @@ $regItems = foreach ($rp in $regPaths) {
       scriptFile = File('${tempDir.path}/apps.ps1');
       await scriptFile.writeAsString(script);
 
-      final result = await Process.run(
-        'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptFile.path],
-      );
+      final result = await Process.run('powershell', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        scriptFile.path,
+      ]);
       if (result.exitCode != 0) {
-        throw Exception(result.stderr?.toString().trim().isNotEmpty == true
-            ? result.stderr.toString().trim()
-            : 'Failed to enumerate Windows apps');
+        throw Exception(
+          result.stderr?.toString().trim().isNotEmpty == true
+              ? result.stderr.toString().trim()
+              : 'Failed to enumerate Windows apps',
+        );
       }
 
       final stdout = (result.stdout ?? '').toString().trim();
@@ -800,7 +841,9 @@ $regItems = foreach ($rp in $regPaths) {
             final path = row['path']?.toString().trim() ?? '';
             final icon = row['icon']?.toString().trim() ?? '';
             if (name.isNotEmpty && path.isNotEmpty) {
-              apps.add(_WindowsAppEntry(name: name, path: path, iconPath: icon));
+              apps.add(
+                _WindowsAppEntry(name: name, path: path, iconPath: icon),
+              );
               if (icon.isNotEmpty && File(icon).existsSync()) {
                 icons[path] = icon;
               }
@@ -996,12 +1039,7 @@ $regItems = foreach ($rp in $regPaths) {
       if (file.existsSync()) {
         return ClipRRect(
           borderRadius: BorderRadius.circular(6),
-          child: Image.file(
-            file,
-            width: size,
-            height: size,
-            fit: BoxFit.cover,
-          ),
+          child: Image.file(file, width: size, height: size, fit: BoxFit.cover),
         );
       }
     }
@@ -1050,6 +1088,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _startTrafficMonitor() {
+    if (!Platform.isWindows) return;
     if (_trafficSub != null) return;
     if (_trafficHistory.isEmpty) {
       _trafficHistory.addAll(List<double>.filled(20, 0));
@@ -1072,12 +1111,13 @@ $regItems = foreach ($rp in $regPaths) {
     _trafficFetchInProgress = false;
     _trafficHistory.clear();
     await _singBoxController.stopTrafficStream();
-    // Даем немного времени для полной остановки
-    await Future.delayed(const Duration(milliseconds: 200));
+    if (_isWindowsShellPlatform) {
+      // Даем немного времени для полной остановки Windows traffic stream.
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
   }
 
   bool get _isRunning => _singBoxController.isRunning;
-
 
   Future<void> _loadInitialData() async {
     final prefs = await SharedPreferences.getInstance();
@@ -1090,21 +1130,25 @@ $regItems = foreach ($rp in $regPaths) {
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
-    final dpiBase =
-        dpiAggressive ? DpiEvasionConfig.aggressive : DpiEvasionConfig.balanced;
+    final dpiBase = dpiAggressive
+        ? DpiEvasionConfig.aggressive
+        : DpiEvasionConfig.balanced;
     final dpiFragmentation =
         prefs.getBool(_dpiFragmentationKey) ?? dpiBase.enableFragmentation;
     final dpiTlsFragment =
         prefs.getBool(_dpiTlsFragmentKey) ?? dpiBase.enableTlsFragment;
-    final dpiTlsRecordFragment = prefs.getBool(_dpiTlsRecordFragmentKey) ??
+    final dpiTlsRecordFragment =
+        prefs.getBool(_dpiTlsRecordFragmentKey) ??
         dpiBase.enableTlsRecordFragment;
     final dpiTrafficNoise =
         prefs.getBool(_dpiTrafficNoiseKey) ?? dpiBase.enableTrafficNoise;
-    final dpiMultiplexPadding = prefs.getBool(_dpiMultiplexPaddingKey) ??
+    final dpiMultiplexPadding =
+        prefs.getBool(_dpiMultiplexPaddingKey) ??
         dpiBase.enableMultiplexPadding;
     final dpiTcpWindowClamp =
         prefs.getBool(_dpiTcpWindowClampKey) ?? dpiBase.enableTcpWindowClamp;
-    final dpiSniRandomization = prefs.getBool(_dpiSniRandomizationKey) ??
+    final dpiSniRandomization =
+        prefs.getBool(_dpiSniRandomizationKey) ??
         dpiBase.enableSniCaseRandomization;
 
     if (metricsRaw != null && metricsRaw.isNotEmpty) {
@@ -1149,19 +1193,23 @@ $regItems = foreach ($rp in $regPaths) {
     selected ??= profiles.isNotEmpty ? profiles.first : null;
     if (selected == null && subscriptions.isNotEmpty) {
       final firstSub = subscriptions.first;
-      final uri = firstSub.selectedProfile ??
+      final uri =
+          firstSub.selectedProfile ??
           (firstSub.profiles.isNotEmpty ? firstSub.profiles.first : null);
       if (uri != null && uri.isNotEmpty) {
         final autoName = _deriveProfileNameFromUri(uri);
         selected = VpnProfile(
-          name: autoName.isEmpty ? _deriveSubscriptionNameFromUrl(firstSub.url) : autoName,
+          name: autoName.isEmpty
+              ? _deriveSubscriptionNameFromUrl(firstSub.url)
+              : autoName,
           uri: uri,
         );
       }
     }
 
     final storedHasKey = prefs.getBool(_hasEverAddedKeyKey) ?? false;
-    _hasEverAddedKey = storedHasKey || profiles.isNotEmpty || subscriptions.isNotEmpty;
+    _hasEverAddedKey =
+        storedHasKey || profiles.isNotEmpty || subscriptions.isNotEmpty;
     if (_hasEverAddedKey && !storedHasKey) {
       await prefs.setBool(_hasEverAddedKeyKey, true);
     }
@@ -1281,6 +1329,22 @@ $regItems = foreach ($rp in $regPaths) {
         _controller.text = fallbackUri;
       }
     }
+
+    await _syncAndroidRuntimeState();
+  }
+
+  Future<void> _syncAndroidRuntimeState() async {
+    if (!Platform.isAndroid) return;
+    final running = await _singBoxController.syncRuntimeState();
+    if (!mounted) return;
+    setState(() {
+      _status = running
+          ? '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e'
+          : '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+      _isConnecting = false;
+      _isDisconnecting = false;
+    });
+    _updateConnectGlowTicker();
   }
 
   String _normalizeSplitMode(String? raw) {
@@ -1493,11 +1557,13 @@ $regItems = foreach ($rp in $regPaths) {
         'Start-Sleep -Milliseconds 200;'
         "Stop-Process -Name 'sing-box' -Force -ErrorAction SilentlyContinue";
     try {
-      await Process.start(
-        'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
-        mode: ProcessStartMode.detached,
-      );
+      await Process.start('powershell', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        command,
+      ], mode: ProcessStartMode.detached);
     } catch (_) {
       // Ignore: best-effort watchdog for forced app termination.
     }
@@ -1508,17 +1574,18 @@ $regItems = foreach ($rp in $regPaths) {
     const targetHeight = 720.0;
     final current = await windowManager.getSize();
     final nextWidth = current.width > targetWidth ? targetWidth : current.width;
-    final nextHeight =
-        current.height > targetHeight ? targetHeight : current.height;
-      await windowManager.setSize(Size(nextWidth, nextHeight));
-      await windowManager.setMinimumSize(const Size(420, 720));
-      await windowManager.setMaximumSize(const Size(420, 720));
-      await windowManager.setResizable(false);
-      await windowManager.center();
-      await windowManager.setTitleBarStyle(
-        TitleBarStyle.hidden,
-        windowButtonVisibility: false,
-      );
+    final nextHeight = current.height > targetHeight
+        ? targetHeight
+        : current.height;
+    await windowManager.setSize(Size(nextWidth, nextHeight));
+    await windowManager.setMinimumSize(const Size(420, 720));
+    await windowManager.setMaximumSize(const Size(420, 720));
+    await windowManager.setResizable(false);
+    await windowManager.center();
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.hidden,
+      windowButtonVisibility: false,
+    );
   }
 
   Future<void> _setupTrayIcon() async {
@@ -1548,23 +1615,23 @@ $regItems = foreach ($rp in $regPaths) {
     final statusLabel = _isConnecting
         ? 'Статус: подключается…'
         : _isRunning
-            ? 'Статус: подключено'
-            : 'Статус: не подключено';
+        ? 'Статус: подключено'
+        : 'Статус: не подключено';
 
     final actionItem = canConnect
         ? MenuItem(key: _trayConnectKey, label: 'Подключиться')
         : canDisconnect
-            ? MenuItem(key: _trayDisconnectKey, label: 'Отключиться')
-            : MenuItem(
-                label: _isConnecting
-                    ? 'Подключается…'
-                    : _controller.text.trim().isEmpty
-                        ? 'Нет профиля для подключения'
-                        : _isRunning
-                            ? 'Подключено'
-                            : 'Готово',
-                disabled: true,
-              );
+        ? MenuItem(key: _trayDisconnectKey, label: 'Отключиться')
+        : MenuItem(
+            label: _isConnecting
+                ? 'Подключается…'
+                : _controller.text.trim().isEmpty
+                ? 'Нет профиля для подключения'
+                : _isRunning
+                ? 'Подключено'
+                : 'Готово',
+            disabled: true,
+          );
 
     final menu = Menu(
       items: [
@@ -1874,7 +1941,9 @@ $regItems = foreach ($rp in $regPaths) {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
     final autoName = _deriveProfileNameFromUri(trimmedUri);
-    final uniqueName = _allocateProfileName(autoName.isEmpty ? _previewProfileName() : autoName);
+    final uniqueName = _allocateProfileName(
+      autoName.isEmpty ? _previewProfileName() : autoName,
+    );
     final profile = VpnProfile(name: uniqueName, uri: trimmedUri);
 
     setState(() {
@@ -1942,12 +2011,17 @@ $regItems = foreach ($rp in $regPaths) {
     final data = await Clipboard.getData('text/plain');
     final raw = data?.text?.trim() ?? '';
     if (raw.isEmpty) {
-      _showFastSnack('\u0411\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u043f\u0443\u0441\u0442');
+      _showFastSnack(
+        '\u0411\u0443\u0444\u0435\u0440 \u043e\u0431\u043c\u0435\u043d\u0430 \u043f\u0443\u0441\u0442',
+      );
       return;
     }
     if (raw.startsWith('vless://')) {
       final autoName = _deriveProfileNameFromUri(raw);
-      await _addProfile(autoName.isEmpty ? _previewProfileName() : autoName, raw);
+      await _addProfile(
+        autoName.isEmpty ? _previewProfileName() : autoName,
+        raw,
+      );
       return;
     }
     await _addSubscription(raw, _deriveSubscriptionNameFromUrl(raw));
@@ -1974,9 +2048,9 @@ $regItems = foreach ($rp in $regPaths) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_hasEverAddedKeyKey, true);
         setState(() => _hasEverAddedKey = true);
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Подписка добавлена')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('Подписка добавлена')));
         await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
 
@@ -1984,7 +2058,9 @@ $regItems = foreach ($rp in $regPaths) {
         final uri = profiles.first;
         final autoName = _deriveProfileNameFromUri(uri);
         final profile = VpnProfile(
-          name: autoName.isEmpty ? _deriveSubscriptionNameFromUrl(url) : autoName,
+          name: autoName.isEmpty
+              ? _deriveSubscriptionNameFromUrl(url)
+              : autoName,
           uri: uri,
         );
         await _selectCurrentProfile(profile);
@@ -1994,9 +2070,9 @@ $regItems = foreach ($rp in $regPaths) {
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
     }
   }
 
@@ -2135,7 +2211,11 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _start() async {
     // Защита от спама - проверяем, не идёт ли уже подключение или отключение
     if (_isConnecting || _isDisconnecting) return;
-    
+
+    if (Platform.isAndroid) {
+      await _singBoxController.syncRuntimeState();
+    }
+
     if (_isRunning) {
       await _stop();
       // Проверяем что действительно отключилось
@@ -2145,7 +2225,8 @@ $regItems = foreach ($rp in $regPaths) {
     }
 
     setState(() {
-      _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
+      _status =
+          '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
       _isConnecting = true;
       _logLines.clear();
     });
@@ -2173,7 +2254,8 @@ $regItems = foreach ($rp in $regPaths) {
       if (result.requiresAdmin && Platform.isWindows) {
         _showFastSnack('Запустите приложение от имени администратора');
         setState(() {
-          _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+          _status =
+              '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
           _isConnecting = false;
         });
         unawaited(_updateTrayMenu());
@@ -2181,17 +2263,20 @@ $regItems = foreach ($rp in $regPaths) {
         _stopTrafficMonitor();
         return;
       }
-      
-      // Проверка на ошибку TUN адаптера
+
       final errorMsg = result.errorMessage ?? 'Ошибка подключения';
-      if (errorMsg.contains('TUN adapter') || errorMsg.contains('wintun') || errorMsg.toLowerCase().contains('interface')) {
+      if (Platform.isWindows &&
+          (errorMsg.contains('TUN adapter') ||
+              errorMsg.contains('wintun') ||
+              errorMsg.toLowerCase().contains('interface'))) {
         _showFastSnack('Ошибка сети: WinTun адаптер не готов.');
       } else {
         _showFastSnack(errorMsg);
       }
-      
+
       setState(() {
-        _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+        _status =
+            '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
         _isConnecting = false;
       });
       unawaited(_updateTrayMenu());
@@ -2236,38 +2321,37 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _ensureDisconnected() async {
     int retries = 0;
     const maxRetries = 3;
-    
+
     while (_isRunning && retries < maxRetries) {
       await Future.delayed(const Duration(seconds: 1));
       retries++;
     }
-    
+
     if (_isRunning) {
       // Если после попыток еще подключено - попробуем еще раз отключить
-      await _singBoxController.disconnect(
-        onStatus: (_) {},
-        onLog: (_) {},
-      );
+      await _singBoxController.disconnect(onStatus: (_) {}, onLog: (_) {});
       await Future.delayed(const Duration(seconds: 1));
     }
   }
 
-
   Future<void> _stop() async {
     // Защита от спама - проверяем, не идёт ли уже отключение или подключение
     if (_isDisconnecting || _isConnecting) return;
+    if (Platform.isAndroid && !_isRunning) {
+      await _singBoxController.syncRuntimeState();
+    }
     if (!_isRunning) return;
-    
+
     setState(() {
       _isDisconnecting = true;
     });
-    
+
     // Сначала остановить мониторинг трафика
     await _stopTrafficMonitor();
-    
+
     // Остановить DPI injection
     await _dpiEvasionManager.stopNativeInjector();
-    
+
     // Затем отключить sing-box
     await _singBoxController.disconnect(
       onStatus: (value) {
@@ -2277,22 +2361,29 @@ $regItems = foreach ($rp in $regPaths) {
       },
       onLog: (line) => _appendLogs([line]),
     );
-    
-    // Даем времени на полную очистку соединения
-    await Future.delayed(const Duration(milliseconds: 500));
-    
+
+    final androidStillRunning = Platform.isAndroid
+        ? await _singBoxController.syncRuntimeState()
+        : false;
+
     if (!mounted) return;
     setState(() {
-      _status = '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+      _status = androidStillRunning
+          ? '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e'
+          : '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
       _isConnecting = false;
       _isDisconnecting = false;
     });
+    if (androidStillRunning) {
+      _showFastSnack('VPN сервис на Android еще активен, повторите отключение');
+    }
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
   }
 
   Future<void> _applyDpiEvasionInjector() async {
-    final shouldRunInjector = _dpiEvasionConfig.enableTtlPhantom ||
+    final shouldRunInjector =
+        _dpiEvasionConfig.enableTtlPhantom ||
         _dpiEvasionConfig.enableTcpWindowClamp ||
         _dpiEvasionConfig.enableSniCaseRandomization;
     if (!shouldRunInjector) {
@@ -2312,47 +2403,34 @@ $regItems = foreach ($rp in $regPaths) {
   void _updateDpiConfig(DpiEvasionConfig config) {
     setState(() => _dpiEvasionConfig = config);
     unawaited(
-      SharedPreferences.getInstance().then(
-        (prefs) async {
-          await prefs.setBool(
-            _dpiAggressiveKey,
-            config.profile == DpiEvasionProfile.aggressive,
-          );
-          await prefs.setBool(
-            _dpiFragmentationKey,
-            config.enableFragmentation,
-          );
-          await prefs.setBool(
-            _dpiTlsFragmentKey,
-            config.enableTlsFragment,
-          );
-          await prefs.setBool(
-            _dpiTlsRecordFragmentKey,
-            config.enableTlsRecordFragment,
-          );
-          await prefs.setBool(
-            _dpiTrafficNoiseKey,
-            config.enableTrafficNoise,
-          );
-          await prefs.setBool(
-            _dpiMultiplexPaddingKey,
-            config.enableMultiplexPadding,
-          );
-          await prefs.setBool(
-            _dpiTcpWindowClampKey,
-            config.enableTcpWindowClamp,
-          );
-          await prefs.setBool(
-            _dpiSniRandomizationKey,
-            config.enableSniCaseRandomization,
-          );
-        },
-      ),
+      SharedPreferences.getInstance().then((prefs) async {
+        await prefs.setBool(
+          _dpiAggressiveKey,
+          config.profile == DpiEvasionProfile.aggressive,
+        );
+        await prefs.setBool(_dpiFragmentationKey, config.enableFragmentation);
+        await prefs.setBool(_dpiTlsFragmentKey, config.enableTlsFragment);
+        await prefs.setBool(
+          _dpiTlsRecordFragmentKey,
+          config.enableTlsRecordFragment,
+        );
+        await prefs.setBool(_dpiTrafficNoiseKey, config.enableTrafficNoise);
+        await prefs.setBool(
+          _dpiMultiplexPaddingKey,
+          config.enableMultiplexPadding,
+        );
+        await prefs.setBool(_dpiTcpWindowClampKey, config.enableTcpWindowClamp);
+        await prefs.setBool(
+          _dpiSniRandomizationKey,
+          config.enableSniCaseRandomization,
+        );
+      }),
     );
     if (_isRunning) {
       unawaited(_applyDpiEvasionInjector());
     } else {
-      final shouldRunInjector = config.enableTtlPhantom ||
+      final shouldRunInjector =
+          config.enableTtlPhantom ||
           config.enableTcpWindowClamp ||
           config.enableSniCaseRandomization;
       if (!shouldRunInjector) {
@@ -2360,7 +2438,6 @@ $regItems = foreach ($rp in $regPaths) {
       }
     }
   }
-
 
   void _appendLogs(Iterable<String> entries) {
     final iterable = entries.where((e) => e.trim().isNotEmpty).toList();
@@ -2393,8 +2470,8 @@ $regItems = foreach ($rp in $regPaths) {
         final theme = Theme.of(ctx);
         return Dialog(
           insetPadding: const EdgeInsets.all(16),
-          backgroundColor:
-              theme.colorScheme.surfaceContainerHighest.withOpacity(0.9),
+          backgroundColor: theme.colorScheme.surfaceContainerHighest
+              .withOpacity(0.9),
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 1100, maxHeight: 720),
             child: Padding(
@@ -2532,39 +2609,138 @@ $regItems = foreach ($rp in $regPaths) {
   @override
   Widget build(BuildContext context) {
     final hasConnectable = _profiles.isNotEmpty || _hasSubscriptions;
-    if (Platform.isWindows) {
+    if (_isWindowsShellPlatform) {
       return _buildWindowsShell(hasConnectable);
     }
-    if (!hasConnectable) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('neuravpn'),
-        ),
-        body: _buildEmptyState(),
-      );
-    }
+    return _buildMobileNeuraShell(hasConnectable);
+  }
 
-    return DefaultTabController(
-      length: 3,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('neuravpn'),
-          bottom: TabBar(
-            isScrollable: true,
-            tabs: const [
-              Tab(text: '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435'),
-              Tab(text: '\u0420\u0430\u0437\u0434\u0435\u043b\u0435\u043d\u0438\u0435'),
-              Tab(text: '\u041f\u0440\u043e\u0432\u0435\u0440\u043a\u0430 \u0441\u0432\u044f\u0437\u0438'),
-            ],
+  Widget _buildMobileNeuraShell(bool hasConnectable) {
+    return Scaffold(
+      backgroundColor: _neuraBlack,
+      body: Stack(
+        children: [
+          const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
+          if (!kReleaseMode)
+            const Positioned.fill(child: NeuralBackground())
+          else
+            const Positioned.fill(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFF0A0A0A),
+                      Color(0xFF141018),
+                      Color(0xFF0A0A0A),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topCenter,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 720),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 6),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 38,
+                            height: 38,
+                            child: Image.asset(
+                              'assets/images/11zon_cropped.png',
+                              fit: BoxFit.contain,
+                              filterQuality: FilterQuality.high,
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          const Expanded(
+                            child: Text(
+                              'neuravpn',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 5,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withOpacity(0.06),
+                              borderRadius: BorderRadius.circular(999),
+                              border: Border.all(
+                                color: Colors.white.withOpacity(0.08),
+                              ),
+                            ),
+                            child: Text(
+                              _isRunning ? 'Подключено' : 'Отключено',
+                              style: TextStyle(
+                                color: _isRunning ? _neuraRed : Colors.white70,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    if (hasConnectable)
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                        child: _buildWindowsTabs(),
+                      ),
+                    Expanded(
+                      child: hasConnectable
+                          ? PageView(
+                              controller: _windowsPageController,
+                              physics: const PageScrollPhysics(),
+                              onPageChanged: (index) {
+                                final view = _windowsViewAt(index);
+                                if (_windowsView != view) {
+                                  setState(() => _windowsView = view);
+                                }
+                              },
+                              children: [
+                                _buildMobileNeuraPage(
+                                  _buildWindowsConnectionView(),
+                                ),
+                                _buildMobileNeuraPage(_buildWindowsSplitView()),
+                                _buildMobileSettingsTab(),
+                              ],
+                            )
+                          : SingleChildScrollView(
+                              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                              child: _buildWindowsEmptyState(),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ),
-        ),
-        body: TabBarView(
-          children: [
-            _buildConnectionTab(),
-            _buildSplitTunnelTab(),
-            _buildConnectivityTestTab(),
-          ],
-        ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMobileNeuraPage(Widget child) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [child, const SizedBox(height: 16), _buildWindowsFooter()],
       ),
     );
   }
@@ -2614,9 +2790,7 @@ $regItems = foreach ($rp in $regPaths) {
       backgroundColor: _neuraBlack,
       body: Stack(
         children: [
-          const Positioned.fill(
-            child: ColoredBox(color: _neuraBlack),
-          ),
+          const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
           if (!kReleaseMode)
             const Positioned.fill(child: NeuralBackground())
           else
@@ -2688,9 +2862,7 @@ $regItems = foreach ($rp in $regPaths) {
                                     _buildWindowsPage(
                                       _buildWindowsConnectionView(),
                                     ),
-                                    _buildWindowsPage(
-                                      _buildWindowsSplitView(),
-                                    ),
+                                    _buildWindowsPage(_buildWindowsSplitView()),
                                     _buildWindowsPage(
                                       _buildWindowsSettingsView(),
                                     ),
@@ -2737,9 +2909,7 @@ $regItems = foreach ($rp in $regPaths) {
       backgroundColor: _neuraBlack,
       body: Stack(
         children: [
-          const Positioned.fill(
-            child: ColoredBox(color: _neuraBlack),
-          ),
+          const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
           if (!kReleaseMode)
             const Positioned.fill(child: NeuralBackground())
           else
@@ -2763,9 +2933,7 @@ $regItems = foreach ($rp in $regPaths) {
             left: 0,
             right: 0,
             height: 56,
-            child: DragToMoveArea(
-              child: ColoredBox(color: Colors.transparent),
-            ),
+            child: DragToMoveArea(child: ColoredBox(color: Colors.transparent)),
           ),
           LoadingScreen(
             key: const ValueKey('loading'),
@@ -2869,9 +3037,13 @@ $regItems = foreach ($rp in $regPaths) {
       animation: _windowsPageController,
       builder: (context, child) {
         final fallback = _windowsViewIndex(_windowsView).toDouble();
-        final page =
-            _windowsPageController.hasClients ? (_windowsPageController.page ?? fallback) : fallback;
-        final currentIndex = page.round().clamp(0, _windowsViewOrder.length - 1);
+        final page = _windowsPageController.hasClients
+            ? (_windowsPageController.page ?? fallback)
+            : fallback;
+        final currentIndex = page.round().clamp(
+          0,
+          _windowsViewOrder.length - 1,
+        );
         final currentView = _windowsViewAt(currentIndex);
 
         return Column(
@@ -2915,7 +3087,9 @@ $regItems = foreach ($rp in $regPaths) {
                     height: size,
                     margin: const EdgeInsets.symmetric(horizontal: 8),
                     decoration: BoxDecoration(
-                      color: isActive ? _neuraRed : Colors.white.withOpacity(0.28),
+                      color: isActive
+                          ? _neuraRed
+                          : Colors.white.withOpacity(0.28),
                       shape: BoxShape.circle,
                       boxShadow: isActive
                           ? [
@@ -2967,24 +3141,19 @@ $regItems = foreach ($rp in $regPaths) {
       switchInCurve: Curves.easeOutCubic,
       switchOutCurve: Curves.easeInCubic,
       transitionBuilder: (child, animation) {
-        final slide = Tween<Offset>(
-          begin: const Offset(0, 0.04),
-          end: Offset.zero,
-        ).animate(
-          CurvedAnimation(
-            parent: animation,
-            curve: Curves.easeOutCubic,
-          ),
-        );
+        final slide =
+            Tween<Offset>(
+              begin: const Offset(0, 0.04),
+              end: Offset.zero,
+            ).animate(
+              CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
+            );
         return FadeTransition(
           opacity: animation,
           child: SlideTransition(position: slide, child: child),
         );
       },
-      child: KeyedSubtree(
-        key: ValueKey(_windowsView),
-        child: child,
-      ),
+      child: KeyedSubtree(key: ValueKey(_windowsView), child: child),
     );
   }
 
@@ -3004,9 +3173,7 @@ $regItems = foreach ($rp in $regPaths) {
   Widget _buildWindowsSplitView() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        _buildWindowsSplitModule(),
-      ],
+      children: [_buildWindowsSplitModule()],
     );
   }
 
@@ -3054,9 +3221,7 @@ $regItems = foreach ($rp in $regPaths) {
               ),
               const SizedBox(height: 10),
               Text(
-                _appVersion.isEmpty
-                    ? 'Версия: —'
-                    : 'Версия: $_appVersion',
+                _appVersion.isEmpty ? 'Версия: —' : 'Версия: $_appVersion',
                 style: TextStyle(color: Colors.white.withOpacity(0.6)),
               ),
               if (_updateResult?.isUpdateAvailable == true) ...[
@@ -3118,11 +3283,7 @@ $regItems = foreach ($rp in $regPaths) {
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: Colors.white.withOpacity(0.08)),
                     ),
-                    child: const Icon(
-                      Icons.tune,
-                      color: _neuraRed,
-                      size: 18,
-                    ),
+                    child: const Icon(Icons.tune, color: _neuraRed, size: 18),
                   ),
                   const SizedBox(width: 12),
                   const Expanded(
@@ -3168,11 +3329,7 @@ $regItems = foreach ($rp in $regPaths) {
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: Colors.white.withOpacity(0.08)),
                     ),
-                    child: const Icon(
-                      Icons.code,
-                      color: _neuraRed,
-                      size: 18,
-                    ),
+                    child: const Icon(Icons.code, color: _neuraRed, size: 18),
                   ),
                   const SizedBox(width: 12),
                   const Expanded(
@@ -3204,7 +3361,6 @@ $regItems = foreach ($rp in $regPaths) {
       ],
     );
   }
-
 
   Widget _buildWindowsFooter() {
     return const Center(
@@ -3287,8 +3443,9 @@ $regItems = foreach ($rp in $regPaths) {
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
     final link = _currentLink;
-    final protocolLabel =
-        link == null ? 'VLESS' : 'VLESS / ${(link.type ?? 'tcp').toUpperCase()}';
+    final protocolLabel = link == null
+        ? 'VLESS'
+        : 'VLESS / ${(link.type ?? 'tcp').toUpperCase()}';
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
 
     return _neuraCard(
@@ -3308,9 +3465,7 @@ $regItems = foreach ($rp in $regPaths) {
                     ),
                     BackdropFilter(
                       filter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
-                      child: Container(
-                        color: Colors.white.withOpacity(0.02),
-                      ),
+                      child: Container(color: Colors.white.withOpacity(0.02)),
                     ),
                   ],
                 ),
@@ -3327,9 +3482,7 @@ $regItems = foreach ($rp in $regPaths) {
                       progress: _connectGlowAnimation.value,
                       color: _neuraRed,
                     ),
-                    child: Container(
-                      color: Colors.white.withOpacity(0.02),
-                    ),
+                    child: Container(color: Colors.white.withOpacity(0.02)),
                   ),
                 ),
               ),
@@ -3379,76 +3532,78 @@ $regItems = foreach ($rp in $regPaths) {
                     behavior: HitTestBehavior.opaque,
                     onTap: canInteract
                         ? () => _onMainConnectButtonPressed(
-                              isEnabled: isEnabled,
-                              isRunning: isRunning,
-                            )
+                            isEnabled: isEnabled,
+                            isRunning: isRunning,
+                          )
                         : null,
                     child: AnimatedBuilder(
-                    animation: _connectGlowAnimation,
-                    builder: (context, child) {
-                      final rotation = _connectGlowAnimation.value * 2 * math.pi;
-                      final pulse = _isConnecting
-                          ? 1 + 0.04 * math.sin(rotation)
-                          : 1.0;
-                      final ring = Container(
-                        width: 140,
-                        height: 140,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: statusColor,
-                            width: 2,
+                      animation: _connectGlowAnimation,
+                      builder: (context, child) {
+                        final rotation =
+                            _connectGlowAnimation.value * 2 * math.pi;
+                        final pulse = _isConnecting
+                            ? 1 + 0.04 * math.sin(rotation)
+                            : 1.0;
+                        final ring = Container(
+                          width: 140,
+                          height: 140,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            border: Border.all(color: statusColor, width: 2),
                           ),
-                        ),
-                      );
-                      return Opacity(
-                        opacity: canInteract && (isEnabled || isRunning) ? 1 : 0.5,
-                        child: Transform.scale(
-                          scale: pulse,
-                          child: Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              if (_isConnecting)
-                                Transform.rotate(angle: rotation, child: ring)
-                              else
-                                ring,
-                              if (isRunning)
+                        );
+                        return Opacity(
+                          opacity: canInteract && (isEnabled || isRunning)
+                              ? 1
+                              : 0.5,
+                          child: Transform.scale(
+                            scale: pulse,
+                            child: Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                if (_isConnecting)
+                                  Transform.rotate(angle: rotation, child: ring)
+                                else
+                                  ring,
+                                if (isRunning)
+                                  Container(
+                                    width: 140,
+                                    height: 140,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      gradient: RadialGradient(
+                                        colors: [
+                                          _neuraRed.withOpacity(0.25),
+                                          Colors.transparent,
+                                        ],
+                                        stops: const [0.0, 0.7],
+                                      ),
+                                    ),
+                                  ),
                                 Container(
-                                  width: 140,
-                                  height: 140,
+                                  width: 104,
+                                  height: 104,
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
-                                    gradient: RadialGradient(
-                                      colors: [
-                                        _neuraRed.withOpacity(0.25),
-                                        Colors.transparent,
-                                      ],
-                                      stops: const [0.0, 0.7],
+                                    color: isRunning
+                                        ? _neuraRed
+                                        : _neuraSurface,
+                                  ),
+                                  child: Center(
+                                    child: Image.asset(
+                                      'assets/images/logo.png',
+                                      width: 48,
+                                      height: 48,
+                                      color: Colors.white,
+                                      filterQuality: FilterQuality.high,
                                     ),
                                   ),
                                 ),
-                              Container(
-                                width: 104,
-                                height: 104,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: isRunning ? _neuraRed : _neuraSurface,
-                                ),
-                                child: Center(
-                                  child: Image.asset(
-                                    'assets/images/logo.png',
-                                    width: 48,
-                                    height: 48,
-                                    color: Colors.white,
-                                    filterQuality: FilterQuality.high,
-                                  ),
-                                ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
-                      );
-                    },
+                        );
+                      },
                     ),
                   ),
                 ),
@@ -3939,7 +4094,9 @@ $regItems = foreach ($rp in $regPaths) {
                                             _activePresetName == preset.name,
                                         onTap: () {
                                           _handlePresetSelection(preset.name);
-                                          setState(() => _showPresetList = false);
+                                          setState(
+                                            () => _showPresetList = false,
+                                          );
                                         },
                                       ),
                                   ],
@@ -3977,7 +4134,9 @@ $regItems = foreach ($rp in $regPaths) {
                           selectedBackgroundColor: _neuraRed.withOpacity(0.22),
                           foregroundColor: Colors.white70,
                           selectedForegroundColor: Colors.white,
-                          side: BorderSide(color: Colors.white.withOpacity(0.18)),
+                          side: BorderSide(
+                            color: Colors.white.withOpacity(0.18),
+                          ),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(14),
                           ),
@@ -4003,19 +4162,27 @@ $regItems = foreach ($rp in $regPaths) {
                         onRemove: _removeDomainEntry,
                       ),
                       const SizedBox(height: 16),
-      _buildSplitEntrySection(
-        title: 'Приложения',
-        icon: Icons.apps_outlined,
-        items: activeApps,
-        emptyLabel: 'Приложения не добавлены.',
-        onAdd: _showWindowsAppPicker,
-        onRemove: _removeApplication,
-        labelBuilder: _describeApplicationEntry,
-        subtitleBuilder: (value) =>
-            _windowsAppLabels.containsKey(value) ? value : '',
-        leadingBuilder: (value) =>
-            _buildWindowsAppIcon(value, size: 18),
-      ),
+                      _buildSplitEntrySection(
+                        title: 'Приложения',
+                        icon: Icons.apps_outlined,
+                        items: activeApps,
+                        emptyLabel: 'Приложения не добавлены.',
+                        onAdd: Platform.isWindows
+                            ? _showWindowsAppPicker
+                            : (Platform.isAndroid
+                                  ? _showAndroidAppPicker
+                                  : () => _promptAddEntry(
+                                      title: 'Добавить приложение',
+                                      hint: 'com.example.app',
+                                      onSubmit: _addApplication,
+                                    )),
+                        onRemove: _removeApplication,
+                        labelBuilder: _describeApplicationEntry,
+                        subtitleBuilder: (value) =>
+                            _windowsAppLabels.containsKey(value) ? value : '',
+                        leadingBuilder: (value) =>
+                            _buildWindowsAppIcon(value, size: 18),
+                      ),
                     ],
                   )
                 : const SizedBox.shrink(),
@@ -4083,11 +4250,7 @@ $regItems = foreach ($rp in $regPaths) {
       );
     }
 
-    return Wrap(
-      spacing: 10,
-      runSpacing: 10,
-      children: buttons,
-    );
+    return Wrap(spacing: 10, runSpacing: 10, children: buttons);
   }
 
   Widget _buildPresetListItem({
@@ -4112,8 +4275,7 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
               ),
-              if (selected)
-                const Icon(Icons.check, size: 16, color: _neuraRed),
+              if (selected) const Icon(Icons.check, size: 16, color: _neuraRed),
             ],
           ),
         ),
@@ -4176,32 +4338,32 @@ $regItems = foreach ($rp in $regPaths) {
                 ),
                 child: Row(
                   children: [
-                      leadingBuilder?.call(entry) ??
-                          Icon(icon, size: 16, color: _neuraRed),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
+                    leadingBuilder?.call(entry) ??
+                        Icon(icon, size: 16, color: _neuraRed),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            labelBuilder?.call(entry) ?? entry,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(color: Colors.white70),
+                          ),
+                          if ((subtitleBuilder?.call(entry) ?? '').isNotEmpty)
                             Text(
-                              labelBuilder?.call(entry) ?? entry,
+                              subtitleBuilder!.call(entry),
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: Colors.white70),
-                            ),
-                            if ((subtitleBuilder?.call(entry) ?? '').isNotEmpty)
-                              Text(
-                                subtitleBuilder!.call(entry),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  color: Colors.white38,
-                                  fontSize: 12,
-                                ),
+                              style: const TextStyle(
+                                color: Colors.white38,
+                                fontSize: 12,
                               ),
-                          ],
-                        ),
+                            ),
+                        ],
                       ),
+                    ),
                     IconButton(
                       onPressed: () => onRemove(entry),
                       icon: const Icon(Icons.delete, size: 16),
@@ -4332,7 +4494,9 @@ $regItems = foreach ($rp in $regPaths) {
                 _buildPresetPicker(context),
                 const SizedBox(height: 16),
                 Card(
-                  color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
+                  color: theme.colorScheme.surfaceContainerHighest.withOpacity(
+                    0.25,
+                  ),
                   elevation: 0,
                   child: Padding(
                     padding: const EdgeInsets.all(20),
@@ -4347,7 +4511,9 @@ $regItems = foreach ($rp in $regPaths) {
                                 children: const [
                                   Text(
                                     'Smart Routing (Level 3)',
-                                    style: TextStyle(fontWeight: FontWeight.w600),
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w600,
+                                    ),
                                   ),
                                   SizedBox(height: 4),
                                   Text(
@@ -4461,19 +4627,19 @@ $regItems = foreach ($rp in $regPaths) {
                       : 'Приложений нет',
                   onAdd: Platform.isWindows
                       ? _showWindowsAppPicker
-                      : () => _promptAddEntry(
-                            title: 'Р”РѕР±Р°РІРёС‚СЊ РїСЂРёР»РѕР¶РµРЅРёРµ',
-                            hint: Platform.isAndroid
-                                ? 'com.example.app'
-                                : 'C:/Program Files/App/app.exe',
-                            onSubmit: _addApplication,
-                          ),
+                      : (Platform.isAndroid
+                            ? _showAndroidAppPicker
+                            : () => _promptAddEntry(
+                                title: 'Добавить приложение',
+                                hint: 'C:/Program Files/App/app.exe',
+                                onSubmit: _addApplication,
+                              )),
                   onRemove: _removeApplication,
                   extraContent: Platform.isAndroid
                       ? _buildAndroidAppActions(Theme.of(context))
                       : (Platform.isWindows
-                          ? _buildWindowsAppActions(Theme.of(context))
-                          : null),
+                            ? _buildWindowsAppActions(Theme.of(context))
+                            : null),
                   labelBuilder: _describeApplicationEntry,
                   avatarBuilder: Platform.isWindows
                       ? (value) => _buildWindowsAppIcon(value, size: 18)
@@ -4556,7 +4722,8 @@ $regItems = foreach ($rp in $regPaths) {
               value: _noPresetValue,
               child: buildTile(
                 title: 'Без пресета',
-                subtitle: 'РСЃРїРѕР»СЊР·РѕРІР°С‚СЊ С‚РµРєСѓС‰РёРµ РЅР°СЃС‚СЂРѕР№РєРё',
+                subtitle:
+                    'РСЃРїРѕР»СЊР·РѕРІР°С‚СЊ С‚РµРєСѓС‰РёРµ РЅР°СЃС‚СЂРѕР№РєРё',
                 selected: selectedValue == _noPresetValue,
                 icon: Icons.remove_circle_outline,
               ),
@@ -4776,8 +4943,9 @@ $regItems = foreach ($rp in $regPaths) {
       shape: const CircleBorder(),
       child: InkWell(
         customBorder: const CircleBorder(),
-        mouseCursor:
-            canInteract ? SystemMouseCursors.click : SystemMouseCursors.basic,
+        mouseCursor: canInteract
+            ? SystemMouseCursors.click
+            : SystemMouseCursors.basic,
         onHover: (value) {
           if (!canInteract) {
             if (_connectButtonHovered) {
@@ -4791,76 +4959,80 @@ $regItems = foreach ($rp in $regPaths) {
         },
         onTap: canInteract
             ? () => _onMainConnectButtonPressed(
-                  isEnabled: isEnabled,
-                  isRunning: isRunning,
-                )
+                isEnabled: isEnabled,
+                isRunning: isRunning,
+              )
             : null,
         child: AnimatedScale(
           scale: _connectButtonHovered && canInteract ? 1.08 : 1.0,
           duration: const Duration(milliseconds: 150),
           child: AnimatedBuilder(
-        animation: _connectGlowController,
-        builder: (context, child) {
-          final rotation = _connectGlowController.value * 6.283185307179586;
-          final showSpin = _isConnecting && !isRunning;
-          final ringGradient = showSpin
-              ? SweepGradient(
-                  colors: [
-                    scheme.primary,
-                    scheme.primary.withOpacity(0.05),
-                    scheme.primary,
-                  ],
-                  stops: const [0.0, 0.6, 1.0],
-                  transform: GradientRotation(rotation),
-                )
-              : SweepGradient(
-                  colors: [
-                    scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
-                    scheme.primary.withOpacity(0.02),
-                    scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
-                  ],
-                );
+            animation: _connectGlowController,
+            builder: (context, child) {
+              final rotation = _connectGlowController.value * 6.283185307179586;
+              final showSpin = _isConnecting && !isRunning;
+              final ringGradient = showSpin
+                  ? SweepGradient(
+                      colors: [
+                        scheme.primary,
+                        scheme.primary.withOpacity(0.05),
+                        scheme.primary,
+                      ],
+                      stops: const [0.0, 0.6, 1.0],
+                      transform: GradientRotation(rotation),
+                    )
+                  : SweepGradient(
+                      colors: [
+                        scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
+                        scheme.primary.withOpacity(0.02),
+                        scheme.primary.withOpacity(isRunning ? 0.6 : 0.12),
+                      ],
+                    );
 
-          return AnimatedOpacity(
-            duration: const Duration(milliseconds: 200),
-            opacity: (isEnabled || isRunning) && canInteract ? 1.0 : 0.4,
-            child: Container(
-              width: buttonSize,
-              height: buttonSize,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: ringGradient,
-                boxShadow: [
-                  BoxShadow(
-                    color: scheme.primary.withOpacity(isRunning ? 0.35 : 0.12),
-                    blurRadius: isRunning ? 28 : 18,
-                    spreadRadius: isRunning ? 2 : 0,
-                  ),
-                ],
-              ),
-              child: Center(
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 250),
-                  width: buttonSize * 0.7,
-                  height: buttonSize * 0.7,
+              return AnimatedOpacity(
+                duration: const Duration(milliseconds: 200),
+                opacity: (isEnabled || isRunning) && canInteract ? 1.0 : 0.4,
+                child: Container(
+                  width: buttonSize,
+                  height: buttonSize,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: isRunning
-                        ? scheme.primary
-                        : const Color(0xFF171820),
+                    gradient: ringGradient,
+                    boxShadow: [
+                      BoxShadow(
+                        color: scheme.primary.withOpacity(
+                          isRunning ? 0.35 : 0.12,
+                        ),
+                        blurRadius: isRunning ? 28 : 18,
+                        spreadRadius: isRunning ? 2 : 0,
+                      ),
+                    ],
                   ),
-                  child: Icon(
-                    isRunning ? Icons.stop_rounded : Icons.power_settings_new,
-                    size: buttonSize * 0.35,
-                    color: Colors.white,
+                  child: Center(
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 250),
+                      width: buttonSize * 0.7,
+                      height: buttonSize * 0.7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: isRunning
+                            ? scheme.primary
+                            : const Color(0xFF171820),
+                      ),
+                      child: Icon(
+                        isRunning
+                            ? Icons.stop_rounded
+                            : Icons.power_settings_new,
+                        size: buttonSize * 0.35,
+                        color: Colors.white,
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
-          );
-        },
-      ),
-      ),
+              );
+            },
+          ),
+        ),
       ),
     );
 
@@ -4886,9 +5058,7 @@ $regItems = foreach ($rp in $regPaths) {
         ? BoxDecoration(
             color: scheme.surfaceContainerHighest,
             borderRadius: BorderRadius.circular(24),
-            border: Border.all(
-              color: scheme.primary.withOpacity(0.15),
-            ),
+            border: Border.all(color: scheme.primary.withOpacity(0.15)),
           )
         : BoxDecoration(
             borderRadius: BorderRadius.circular(28),
@@ -4938,12 +5108,16 @@ $regItems = foreach ($rp in $regPaths) {
             children: [
               FilledButton(
                 onPressed: _showProfileDialog,
-                child: const Text('\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447'),
+                child: const Text(
+                  '\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447',
+                ),
               ),
               const SizedBox(height: 12),
               OutlinedButton(
                 onPressed: _pasteProfileFromClipboard,
-                child: const Text('\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430'),
+                child: const Text(
+                  '\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430',
+                ),
               ),
             ],
           ),
@@ -5093,15 +5267,6 @@ $regItems = foreach ($rp in $regPaths) {
                   },
                 ),
               ],
-            ),
-            const SizedBox(height: 12),
-            const SizedBox(height: 8),
-            DpiEvasionWidget(
-              manager: _dpiEvasionManager,
-              config: _dpiEvasionConfig,
-              serverHost: _currentLink?.host,
-              serverPort: _currentLink?.port,
-              onConfigChanged: _updateDpiConfig,
             ),
           ],
         ),
@@ -5504,6 +5669,75 @@ $regItems = foreach ($rp in $regPaths) {
     _showFastSnack('Results copied to clipboard');
   }
 
+  Widget _buildMobileSettingsTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _neuraCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 36,
+                      height: 36,
+                      decoration: BoxDecoration(
+                        color: _neuraSurface,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.08),
+                        ),
+                      ),
+                      child: const Icon(
+                        Icons.receipt_long,
+                        color: _neuraRed,
+                        size: 18,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Конфигурация sing-box',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  _generatedConfig == null
+                      ? 'Конфиг появится после подключения.'
+                      : 'Конфиг сгенерирован и готов к просмотру.',
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: _generatedConfig == null
+                      ? null
+                      : () => _showConfigDialog(context),
+                  icon: const Icon(Icons.receipt_long),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _neuraRed,
+                    foregroundColor: Colors.white,
+                  ),
+                  label: const Text('Открыть конфиг'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildWindowsFooter(),
+        ],
+      ),
+    );
+  }
+
   Widget _buildConnectivityTestTab() {
     final theme = Theme.of(context);
     final total = _connectivityTargets.length;
@@ -5867,7 +6101,10 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                           labelStyle: TextStyle(
                             color: Colors.white.withOpacity(0.6),
                           ),
-                          prefixIcon: const Icon(Icons.search, color: Colors.white54),
+                          prefixIcon: const Icon(
+                            Icons.search,
+                            color: Colors.white54,
+                          ),
                         ),
                         onChanged: (value) => setState(() => _query = value),
                       ),
@@ -5878,7 +6115,9 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                       child: filtered.isEmpty
                           ? Center(
                               child: Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: 18),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 18,
+                                ),
                                 child: Column(
                                   mainAxisAlignment: MainAxisAlignment.center,
                                   children: [
@@ -5896,9 +6135,8 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                                           maxLines: 3,
                                           overflow: TextOverflow.ellipsis,
                                           textAlign: TextAlign.center,
-                                          style: theme.textTheme.bodySmall?.copyWith(
-                                            color: Colors.white54,
-                                          ),
+                                          style: theme.textTheme.bodySmall
+                                              ?.copyWith(color: Colors.white54),
                                         ),
                                       ),
                                   ],
@@ -5913,7 +6151,9 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                                 return ListTile(
                                   leading: iconPath.isNotEmpty
                                       ? ClipRRect(
-                                          borderRadius: BorderRadius.circular(6),
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
                                           child: Image.file(
                                             File(iconPath),
                                             width: 24,
@@ -5951,10 +6191,7 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
 }
 
 class _ConnectionWavePainter extends CustomPainter {
-  _ConnectionWavePainter({
-    required this.progress,
-    required this.color,
-  });
+  _ConnectionWavePainter({required this.progress, required this.color});
 
   final double progress;
   final Color color;
@@ -5978,13 +6215,7 @@ class _ConnectionWavePainter extends CustomPainter {
     final topY = size.height * 0.22;
     final bottomY = size.height * 0.62;
 
-    _drawWave(
-      canvas,
-      size,
-      midY,
-      progress * 2 * math.pi,
-      basePaint,
-    );
+    _drawWave(canvas, size, midY, progress * 2 * math.pi, basePaint);
     _drawWave(
       canvas,
       size,
@@ -5993,13 +6224,7 @@ class _ConnectionWavePainter extends CustomPainter {
       dashedPaint,
       dash: true,
     );
-    _drawWave(
-      canvas,
-      size,
-      bottomY,
-      progress * 2 * math.pi + 2.2,
-      accentPaint,
-    );
+    _drawWave(canvas, size, bottomY, progress * 2 * math.pi + 2.2, accentPaint);
   }
 
   void _drawWave(
@@ -6177,11 +6402,7 @@ class _NeuraTrayMenu extends StatelessWidget {
                 onTap: onShow,
               ),
               _MenuDivider(),
-              _MenuItem(
-                icon: Icons.logout,
-                label: 'Выход',
-                onTap: onExit,
-              ),
+              _MenuItem(icon: Icons.logout, label: 'Выход', onTap: onExit),
             ],
           ),
         ),
@@ -6215,7 +6436,11 @@ class _MenuHeader extends StatelessWidget {
 class _MenuDivider extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return Divider(height: 1, thickness: 1, color: Colors.white.withOpacity(0.06));
+    return Divider(
+      height: 1,
+      thickness: 1,
+      color: Colors.white.withOpacity(0.06),
+    );
   }
 }
 
@@ -6244,8 +6469,12 @@ class _MenuItemState extends State<_MenuItem> {
   @override
   Widget build(BuildContext context) {
     final enabled = !widget.disabled;
-    final bg = _hover && enabled ? Colors.white.withOpacity(0.06) : Colors.transparent;
-    final fg = enabled ? Colors.white.withOpacity(0.9) : Colors.white.withOpacity(0.35);
+    final bg = _hover && enabled
+        ? Colors.white.withOpacity(0.06)
+        : Colors.transparent;
+    final fg = enabled
+        ? Colors.white.withOpacity(0.9)
+        : Colors.white.withOpacity(0.35);
     final iconColor = widget.accent ?? fg;
 
     return MouseRegion(
@@ -6279,11 +6508,3 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
-
-
-
-
-
-
-
-

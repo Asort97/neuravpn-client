@@ -26,6 +26,8 @@ String generateSingBoxConfig(
   List<Map<String, dynamic>>? dnsServers,
   String? dnsFinalTag,
   DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
+  bool allowLegacyTlsFragmentField = true,
+  bool allowTransportFragment = true,
   int? clashApiPort,
   String logLevel = 'info',
 }) {
@@ -76,8 +78,10 @@ String generateSingBoxConfig(
       if (alpn.isNotEmpty) 'alpn': alpn,
       'utls': {'enabled': true, 'fingerprint': fingerprint},
     };
-    // Отключаем TLS handshake fragmentation: в текущей версии ломает соединения.
-    tls['fragment'] = false;
+    // Older libbox builds may reject unknown tls.fragment field.
+    if (allowLegacyTlsFragmentField) {
+      tls['fragment'] = false;
+    }
     if (isReality) {
       final shortIdList = (realityShortId ?? '')
           .split(',')
@@ -102,7 +106,8 @@ String generateSingBoxConfig(
       outbound['transport'] = transport;
     }
   }
-  if (dpiEvasionConfig.enableFragmentation &&
+  if (allowTransportFragment &&
+      dpiEvasionConfig.enableFragmentation &&
       dpiEvasionConfig.enableTlsFragment &&
       useTls) {
     _applyFragmentation(outbound, transportType);
@@ -117,7 +122,6 @@ String generateSingBoxConfig(
     };
   }
 
-
   final appRules = enableApplicationRules
       ? _buildApplicationRules(splitConfig, vpnTag)
       : const <Map<String, dynamic>>[];
@@ -129,21 +133,23 @@ String generateSingBoxConfig(
   final config = {
     'log': {'level': logLevel, 'timestamp': true, 'output': 'stderr'},
     'dns': {
-      'servers': dnsServers ?? [
-        {
-          // Avoid DNS loopback with TUN by sending DNS traffic via direct.
-          'type': 'udp',
-          'tag': 'dns-remote',
-          'server': '8.8.8.8',
-          'server_port': 53,
-        },
-        {
-          'type': 'udp',
-          'tag': 'dns-backup',
-          'server': '1.1.1.1',
-          'server_port': 53,
-        },
-      ],
+      'servers':
+          dnsServers ??
+          [
+            {
+              // Avoid DNS loopback with TUN by sending DNS traffic via direct.
+              'type': 'udp',
+              'tag': 'dns-remote',
+              'server': '8.8.8.8',
+              'server_port': 53,
+            },
+            {
+              'type': 'udp',
+              'tag': 'dns-backup',
+              'server': '1.1.1.1',
+              'server_port': 53,
+            },
+          ],
       'final': dnsFinalTag ?? 'dns-remote',
       'strategy': 'prefer_ipv4',
       'independent_cache': true,
@@ -156,13 +162,16 @@ String generateSingBoxConfig(
         'tag': inboundTag,
         'interface_name': interfaceName,
         'stack': tunStack,
-        'mtu': 1280,  // Уменьшено с 1500 - часто вызывает проблемы на Windows
+        'mtu': 1280, // Уменьшено с 1500 - часто вызывает проблемы на Windows
         'address': addresses ?? const ['172.19.0.1/30'],
         'auto_route': true,
         // Windows: recommended to prevent multihomed DNS leaks and enforce routing.
         'strict_route': true,
         // Ensure both IPv4 and IPv6 default routes are captured.
-        'route_address': const ['0.0.0.0/1', '128.0.0.0/1'],  // Убрали IPv6 для стабильности
+        'route_address': const [
+          '0.0.0.0/1',
+          '128.0.0.0/1',
+        ], // Убрали IPv6 для стабильности
         'sniff': true,
         'sniff_override_destination': false,
       },
@@ -194,9 +203,7 @@ String generateSingBoxConfig(
   };
   if (clashApiPort != null) {
     config['experimental'] = {
-      'clash_api': {
-        'external_controller': '127.0.0.1:$clashApiPort',
-      },
+      'clash_api': {'external_controller': '127.0.0.1:$clashApiPort'},
     };
   }
   return const JsonEncoder.withIndent('  ').convert(config);

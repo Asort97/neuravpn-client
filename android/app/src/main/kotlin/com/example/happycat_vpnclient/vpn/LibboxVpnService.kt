@@ -63,7 +63,19 @@ class LibboxVpnService : VpnService(), PlatformInterface {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopSelf()
+                if (!stopInProgress.compareAndSet(false, true)) {
+                    Log.i(TAG, "ACTION_STOP ignored: stop already in progress")
+                    return START_NOT_STICKY
+                }
+                Log.i(TAG, "ACTION_STOP received")
+                executor.execute {
+                    try {
+                        stopLibbox()
+                        Log.i(TAG, "ACTION_STOP completed")
+                    } finally {
+                        stopInProgress.set(false)
+                    }
+                }
                 return START_NOT_STICKY
             }
         }
@@ -71,19 +83,29 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         val config = intent?.getStringExtra(EXTRA_CONFIG)
         if (config.isNullOrBlank()) {
             Log.w(TAG, "Missing config payload – ignoring start request")
+            runningState.set(false)
+            stopSelf()
             return START_NOT_STICKY
         }
 
         manualIncludePackages = intent.getStringArrayListExtra(EXTRA_INCLUDE_PACKAGES) ?: emptyList()
         manualExcludePackages = intent.getStringArrayListExtra(EXTRA_EXCLUDE_PACKAGES) ?: emptyList()
 
-        startForeground(NOTIFICATION_ID, buildNotification(getStatusLabel()))
-        executor.execute { startLibbox(config) }
-        return START_STICKY
+        return try {
+            startForeground(NOTIFICATION_ID, buildNotification(getStatusLabel()))
+            executor.execute { startLibbox(config) }
+            START_STICKY
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to enter foreground", t)
+            runningState.set(false)
+            stopSelf()
+            START_NOT_STICKY
+        }
     }
 
     override fun onDestroy() {
-        executor.execute { stopLibbox() }
+        stopLibbox(requestStopSelf = false)
+        stopInProgress.set(false)
         executor.shutdownNow()
         runningState.set(false)
         super.onDestroy()
@@ -91,7 +113,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
 
     private fun startLibbox(config: String) {
         try {
-            stopLibbox()
+            stopLibbox(requestStopSelf = false)
             val service = Libbox.newService(config, this)
             service.start()
             libboxService = service
@@ -105,7 +127,8 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    private fun stopLibbox() {
+    private fun stopLibbox(requestStopSelf: Boolean = true) {
+        Log.i(TAG, "stopLibbox begin")
         try {
             tunDescriptor?.close()
         } catch (_: IOException) {
@@ -120,7 +143,10 @@ class LibboxVpnService : VpnService(), PlatformInterface {
             stopForeground(true)
         }
         runningState.set(false)
-        stopSelf()
+        if (requestStopSelf) {
+            stopSelf()
+        }
+        Log.i(TAG, "stopLibbox end")
     }
 
     // region PlatformInterface implementation
@@ -547,13 +573,14 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         private const val TUN_SUBNET_PREFIX = "172.19.0."
         private val FALLBACK_DNS = listOf("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4")
         private val runningState = AtomicBoolean(false)
+        private val stopInProgress = AtomicBoolean(false)
         const val ACTION_STOP = "com.example.happycat_vpnclient.vpn.ACTION_STOP"
         const val EXTRA_CONFIG = "com.example.happycat_vpnclient.vpn.EXTRA_CONFIG"
         const val EXTRA_DEEPLINK = "com.example.happycat_vpnclient.vpn.EXTRA_DEEPLINK"
         const val EXTRA_INCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_INCLUDE_PACKAGES"
         const val EXTRA_EXCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_EXCLUDE_PACKAGES"
 
-        fun isRunning(): Boolean = runningState.get()
+        fun isRunning(): Boolean = runningState.get() || stopInProgress.get()
 
         fun start(
             context: Context,
@@ -574,7 +601,18 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, LibboxVpnService::class.java))
+            val stopIntent = Intent(context, LibboxVpnService::class.java).apply {
+                action = ACTION_STOP
+            }
+            val dispatched = runCatching {
+                context.startService(stopIntent)
+            }.onFailure {
+                Log.w(TAG, "Failed to dispatch ACTION_STOP, trying stopService fallback", it)
+            }.getOrNull() != null
+            if (!dispatched) {
+                runCatching { context.stopService(Intent(context, LibboxVpnService::class.java)) }
+                    .onFailure { Log.w(TAG, "stopService fallback failed", it) }
+            }
         }
     }
 }

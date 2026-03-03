@@ -125,10 +125,21 @@ class SingBoxController {
     return 'Android VPN';
   }
 
-  bool get isRunning =>
-      _isAndroid ? _androidConnected : _process != null;
+  bool get isRunning => _isAndroid ? _androidConnected : _process != null;
 
   Future<bool> isWintunAvailable() => _wintunManager.isWintunAvailable();
+
+  Future<bool> syncRuntimeState() async {
+    if (!_isAndroid) {
+      return isRunning;
+    }
+    try {
+      _androidConnected = await _androidController.isRunning();
+    } catch (_) {
+      _androidConnected = false;
+    }
+    return _androidConnected;
+  }
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
   bool get _isAndroid => _isAndroidOverride ?? Platform.isAndroid;
@@ -209,7 +220,14 @@ class SingBoxController {
       _generatedConfig = jsonConfig;
       _configFile = null;
       _notifyStatus('Запрос разрешения VPN');
-      final granted = await _androidController.prepareVpn();
+      bool granted;
+      try {
+        granted = await _androidController.prepareVpn();
+      } catch (e) {
+        return SingBoxStartResult.failure(
+          'Не удалось запросить разрешение VPN: $e',
+        );
+      }
       if (!granted) {
         return SingBoxStartResult.failure('Разрешение отклонено пользователем');
       }
@@ -222,12 +240,24 @@ class SingBoxController {
           : <String>[];
 
       _notifyStatus('Запуск Libbox сервиса');
-      await _androidController.startVpn(
-        jsonConfig,
-        includePackages: includePackages.isEmpty ? null : includePackages,
-        excludePackages: excludePackages.isEmpty ? null : excludePackages,
-      );
-      _androidConnected = true;
+      try {
+        await _androidController.startVpn(
+          jsonConfig,
+          includePackages: includePackages.isEmpty ? null : includePackages,
+          excludePackages: excludePackages.isEmpty ? null : excludePackages,
+        );
+      } catch (e) {
+        return SingBoxStartResult.failure(
+          'Не удалось запустить Android VPN сервис: $e',
+        );
+      }
+      final running = await _waitForAndroidServiceStartup();
+      _androidConnected = running;
+      if (!running) {
+        return SingBoxStartResult.failure(
+          'Android VPN сервис не запустился (проверьте совместимость конфигурации)',
+        );
+      }
       _notifyStatus('Libbox сервис запущен');
       unawaited(_warmupConnection());
       return SingBoxStartResult.success();
@@ -266,7 +296,10 @@ class SingBoxController {
     }
 
     if (_activeConnectionToken != null) {
-      await _cleanupSessionToken(_activeConnectionToken!, reason: 'pre-connect');
+      await _cleanupSessionToken(
+        _activeConnectionToken!,
+        reason: 'pre-connect',
+      );
     }
 
     await _terminateExistingProcesses();
@@ -280,7 +313,9 @@ class SingBoxController {
     ) {
       final token = ++_sessionEpoch;
       _activeConnectionToken = token;
-      _notifyStatus('Подключение... попытка $attempt/$_maxWindowsAutoRecoverAttempts');
+      _notifyStatus(
+        'Подключение... попытка $attempt/$_maxWindowsAutoRecoverAttempts',
+      );
       _appendConnectionLog(
         '\n=== New Connection Attempt ===\n'
         'token=$token\n'
@@ -319,7 +354,9 @@ class SingBoxController {
           );
           await _cleanupSessionToken(token, reason: 'stale-cleanup-failed');
           if (attempt < _maxWindowsAutoRecoverAttempts) {
-            _notifyStatus('Автовосстановление... попытка ${attempt + 1}/$_maxWindowsAutoRecoverAttempts');
+            _notifyStatus(
+              'Автовосстановление... попытка ${attempt + 1}/$_maxWindowsAutoRecoverAttempts',
+            );
             continue;
           }
           return SingBoxStartResult.failure(lastError);
@@ -357,11 +394,11 @@ class SingBoxController {
         'with interface=${plan.interfaceName}',
       );
       try {
-        final process = await _processStarter(
-          exePath,
-          ['run', '-c', cfgFile.path],
-          environment: environment,
-        );
+        final process = await _processStarter(exePath, [
+          'run',
+          '-c',
+          cfgFile.path,
+        ], environment: environment);
         _process = process;
         _attachProcessHandlers(process, plan.interfaceName, token);
         final startupError = await _verifyStartup(process, plan.interfaceName);
@@ -388,10 +425,7 @@ class SingBoxController {
 
         if (failureClass == _StartupFailureClass.requiresAdmin ||
             _accessDeniedDetected) {
-          return SingBoxStartResult.failure(
-            startupError,
-            requiresAdmin: true,
-          );
+          return SingBoxStartResult.failure(startupError, requiresAdmin: true);
         }
 
         if (failureClass == _StartupFailureClass.fatal ||
@@ -399,7 +433,9 @@ class SingBoxController {
           return SingBoxStartResult.failure(startupError);
         }
 
-        _notifyStatus('Автовосстановление... попытка ${attempt + 1}/$_maxWindowsAutoRecoverAttempts');
+        _notifyStatus(
+          'Автовосстановление... попытка ${attempt + 1}/$_maxWindowsAutoRecoverAttempts',
+        );
       } catch (e) {
         lastError = 'Ошибка запуска: $e';
         _appendConnectionLog('[token=$token] process start exception: $e');
@@ -451,9 +487,32 @@ class SingBoxController {
       dnsServers: dnsServers,
       dnsFinalTag: dnsFinalTag,
       dpiEvasionConfig: dpiEvasionConfig,
+      allowLegacyTlsFragmentField: !_isAndroid,
+      allowTransportFragment: !_isAndroid,
       clashApiPort: _isWindows ? _clashApiPort : null,
       logLevel: developerMode ? 'debug' : 'info',
     );
+  }
+
+  Future<bool> _waitForAndroidServiceStartup() async {
+    if (!_isAndroid) return true;
+    const attempts = 8;
+    for (var i = 0; i < attempts; i++) {
+      final running = await _androidController.isRunning();
+      if (running) return true;
+      await Future.delayed(const Duration(milliseconds: 250));
+    }
+    return false;
+  }
+
+  Future<bool> _waitForAndroidServiceStop({int attempts = 16}) async {
+    if (!_isAndroid) return true;
+    for (var i = 0; i < attempts; i++) {
+      final running = await _androidController.isRunning();
+      if (!running) return true;
+      await Future.delayed(const Duration(milliseconds: 250));
+    }
+    return false;
   }
 
   Future<void> _terminateExistingProcesses() async {
@@ -474,11 +533,32 @@ class SingBoxController {
     _logSink = onLog ?? _logSink;
 
     if (_isAndroid) {
-      if (!_androidConnected) return;
+      final running = await syncRuntimeState();
+      if (!running) {
+        _notifyStatus('Остановлено');
+        return;
+      }
       _notifyStatus('Остановка сервиса...');
-      await _androidController.stopVpn();
-      _androidConnected = false;
-      _notifyStatus('Остановлено');
+      const stopAttempts = 2;
+      var stopped = false;
+      for (var attempt = 1; attempt <= stopAttempts; attempt++) {
+        _logSink?.call('[DBG] Android stop attempt $attempt/$stopAttempts');
+        try {
+          await _androidController.stopVpn();
+        } catch (e) {
+          _logSink?.call('[ERR] stopVpn failed (attempt $attempt): $e');
+        }
+        stopped = await _waitForAndroidServiceStop();
+        if (stopped) {
+          break;
+        }
+      }
+      _androidConnected = !stopped;
+      if (stopped) {
+        _notifyStatus('Остановлено');
+      } else {
+        _notifyStatus('Android VPN сервис все еще активен');
+      }
       return;
     }
 
@@ -504,10 +584,24 @@ class SingBoxController {
 
   Future<void> forceTerminate() async {
     if (_isAndroid) {
-      if (_androidConnected) {
-        await _androidController.stopVpn();
-        _androidConnected = false;
+      final running = await syncRuntimeState();
+      if (running) {
+        const stopAttempts = 2;
+        for (var attempt = 1; attempt <= stopAttempts; attempt++) {
+          try {
+            await _androidController.stopVpn();
+          } catch (_) {
+            // Best-effort cleanup for Android service.
+          }
+          final stopped = await _waitForAndroidServiceStop();
+          if (stopped) {
+            _androidConnected = false;
+            return;
+          }
+        }
       }
+      final stopped = await _waitForAndroidServiceStop();
+      _androidConnected = !stopped;
       return;
     }
 
@@ -541,7 +635,11 @@ class SingBoxController {
     await _flushConnectionLog(force: true);
   }
 
-  void _attachProcessHandlers(Process process, String interfaceName, int token) {
+  void _attachProcessHandlers(
+    Process process,
+    String interfaceName,
+    int token,
+  ) {
     _stdoutSub?.cancel();
     _stderrSub?.cancel();
 
@@ -700,14 +798,17 @@ class SingBoxController {
       _connectionLogFlushTimer?.cancel();
       _connectionLogFlushTimer = null;
       final now = DateTime.now();
-      final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}_${now.hour.toString().padLeft(2, '0')}-${now.minute.toString().padLeft(2, '0')}-${now.second.toString().padLeft(2, '0')}';
+      final dateStr =
+          '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}_${now.hour.toString().padLeft(2, '0')}-${now.minute.toString().padLeft(2, '0')}-${now.second.toString().padLeft(2, '0')}';
       final logsDir = Directory('${Directory.systemTemp.path}/neuravpn_logs');
       if (!await logsDir.exists()) {
         await logsDir.create(recursive: true);
       }
       final logFile = File('${logsDir.path}/connection_$dateStr.txt');
       await logFile.create();
-      await logFile.writeAsString('=== Connection Attempt Log ===\nStart Time: $now\n\n');
+      await logFile.writeAsString(
+        '=== Connection Attempt Log ===\nStart Time: $now\n\n',
+      );
       _connectionLogFile = logFile;
       _appendConnectionLog('Log file created: ${logFile.path}');
     } catch (e) {
@@ -744,7 +845,8 @@ class SingBoxController {
     _connectionLogFlushInProgress = true;
     try {
       final lines = <String>[];
-      if (_connectionLogThrottleMarkerQueued && _droppedConnectionLogLines > 0) {
+      if (_connectionLogThrottleMarkerQueued &&
+          _droppedConnectionLogLines > 0) {
         lines.add(
           '... connection log throttled: '
           '$_droppedConnectionLogLines lines dropped ...',
@@ -793,7 +895,8 @@ class SingBoxController {
       return;
     }
     try {
-      final interfaceName = _sessionInterfaces[token] ??
+      final interfaceName =
+          _sessionInterfaces[token] ??
           (_activeConnectionToken == token ? _activeInterfaceName : null);
       _appendConnectionLog(
         '[token=$token] cleanup started reason=$reason interface=${interfaceName ?? 'unknown'}',
@@ -858,10 +961,13 @@ class SingBoxController {
         final exitCode = await process.exitCode.timeout(
           const Duration(milliseconds: 800),
         );
-        final hint = _lastStartError ??
+        final hint =
+            _lastStartError ??
             (_recentLogs.isNotEmpty ? _recentLogs.last : null);
         final suffix = hint == null ? '' : ' ($hint)';
-        _appendConnectionLog('ERROR: sing-box exited early (code $exitCode)$suffix');
+        _appendConnectionLog(
+          'ERROR: sing-box exited early (code $exitCode)$suffix',
+        );
         return 'sing-box exited early (code $exitCode)$suffix';
       } on TimeoutException {
         // Process is still alive. Continue with adapter check.
@@ -873,7 +979,8 @@ class SingBoxController {
           timeout: const Duration(seconds: 40),
         );
         if (!adapterUp) {
-          final hint = _lastStartError ??
+          final hint =
+              _lastStartError ??
               (_recentLogs.isNotEmpty ? _recentLogs.last : null);
           final suffix = hint == null ? '' : ' ($hint)';
           _appendConnectionLog('ERROR: TUN adapter did not come up$suffix');

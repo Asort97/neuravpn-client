@@ -11,8 +11,12 @@ class AndroidVpnController {
 
   Future<bool> prepareVpn() async {
     if (!isSupported) return false;
-    final granted = await _channel.invokeMethod<bool>('prepareVpn');
-    return granted ?? false;
+    try {
+      final granted = await _channel.invokeMethod<bool>('prepareVpn');
+      return granted ?? false;
+    } on PlatformException {
+      return false;
+    }
   }
 
   Future<void> startVpn(
@@ -21,21 +25,35 @@ class AndroidVpnController {
     List<String>? excludePackages,
   }) async {
     if (!isSupported) return;
-    await _channel.invokeMethod('startVpn', {
-      'config': config,
-      if (includePackages != null && includePackages.isNotEmpty) 'includePackages': includePackages,
-      if (excludePackages != null && excludePackages.isNotEmpty) 'excludePackages': excludePackages,
-    });
+    try {
+      await _channel.invokeMethod('startVpn', {
+        'config': config,
+        if (includePackages != null && includePackages.isNotEmpty)
+          'includePackages': includePackages,
+        if (excludePackages != null && excludePackages.isNotEmpty)
+          'excludePackages': excludePackages,
+      });
+    } on PlatformException catch (e) {
+      throw StateError(e.message ?? e.code);
+    }
   }
 
   Future<void> stopVpn() async {
     if (!isSupported) return;
-    await _channel.invokeMethod('stopVpn');
+    try {
+      await _channel.invokeMethod('stopVpn');
+    } on PlatformException catch (e) {
+      throw StateError(e.message ?? e.code);
+    }
   }
 
   Future<bool> isRunning() async {
     if (!isSupported) return false;
-    final running = await _channel.invokeMethod<bool>('getVpnStatus');
-    return running ?? false;
+    try {
+      final running = await _channel.invokeMethod<bool>('getVpnStatus');
+      return running ?? false;
+    } on PlatformException {
+      return false;
+    }
   }
 }

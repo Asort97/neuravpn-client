@@ -18,22 +18,34 @@ class MainActivity : FlutterActivity() {
 			when (call.method) {
 				METHOD_PREPARE -> handlePrepareVpn(result)
 				METHOD_START -> {
-					val config = call.argument<String>(ARG_CONFIG)
-					val includePackages = call.argument<List<String>>(ARG_INCLUDE_PACKAGES)
-					val excludePackages = call.argument<List<String>>(ARG_EXCLUDE_PACKAGES)
-					if (config.isNullOrBlank()) {
-						result.error("INVALID_CONFIG", "Config payload required", null)
-					} else {
-						LibboxVpnService.start(applicationContext, config, includePackages, excludePackages)
-						result.success(null)
+					try {
+						val config = call.argument<String>(ARG_CONFIG)
+						val includePackages = call.argument<List<String>>(ARG_INCLUDE_PACKAGES)
+						val excludePackages = call.argument<List<String>>(ARG_EXCLUDE_PACKAGES)
+						if (config.isNullOrBlank()) {
+							result.error("INVALID_CONFIG", "Config payload required", null)
+						} else {
+							LibboxVpnService.start(applicationContext, config, includePackages, excludePackages)
+							result.success(null)
+						}
+					} catch (t: Throwable) {
+						result.error("START_VPN_FAILED", t.message, null)
 					}
 				}
 				METHOD_STOP -> {
-					LibboxVpnService.stop(applicationContext)
-					result.success(null)
+					try {
+						LibboxVpnService.stop(applicationContext)
+						result.success(null)
+					} catch (t: Throwable) {
+						result.error("STOP_VPN_FAILED", t.message, null)
+					}
 				}
 				METHOD_STATUS -> {
-					result.success(LibboxVpnService.isRunning())
+					try {
+						result.success(LibboxVpnService.isRunning())
+					} catch (t: Throwable) {
+						result.error("STATUS_VPN_FAILED", t.message, null)
+					}
 				}
 				else -> result.notImplemented()
 			}
