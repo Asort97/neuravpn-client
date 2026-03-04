@@ -4,8 +4,8 @@ import 'lib/vless/config_generator.dart';
 import 'lib/models/split_tunnel_config.dart';
 
 void main() {
-  // Тестовый URI из подписки
-  const testUri = 'vless://5f5eb7bd-6509-4ec8-908a-f0096fd4653c@sub.staticdeliverycdn.com:10001?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=lRgGleThmoAL5mOh1WoeNObl9gEJzxxRoX_-l7WvBGU&security=reality&sid=42a92d1e&sni=web.max.ru&spx=%2FYHiQ65khcT5rysZ&type=tcp#web.max.ru-Asort97@mail.ru-746D,11H';
+  // Synthetic test URI only (no real infrastructure or credentials).
+  const testUri = 'vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&flow=xtls-rprx-vision&fp=chrome&pbk=TEST_PUBLIC_KEY_ONLY&security=reality&sid=deadbeef&sni=example.com&spx=%2F&type=tcp#example-test-profile';
   
   print('Парсинг VLESS URI...');
   final parsed = parseVlessUri(testUri);

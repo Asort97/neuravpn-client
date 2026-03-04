@@ -96,8 +96,8 @@ msix_config:
   # IMPORTANT:
   # - For public distribution you MUST use a trusted code-signing certificate.
   # - For GitHub Releases auto-updates you MUST keep the same Publisher/certificate across all versions.
+  # - Never commit certificate_password into git. Provide it at build time via CLI/env.
   certificate_path: windows/certificates/neuravpn.pfx
-  certificate_password: neuravpn-dev
   publisher: CN=neuravpn
 
   # To add assets to your application, add an assets section, like this:

@@ -54,8 +54,25 @@ windows/flutter/ephemeral/
 
 # Local environment files
 local.properties
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+secrets.*
+*.secret
+*.credentials
+android/key.properties
+android/**/google-services.json
+ios/**/GoogleService-Info.plist
+**/service-account*.json
 *.keystore
 *.jks
+*.p12
+*.pem
+*.key
+*.crt
+*.mobileprovision
 **/Generated.xcconfig
 **/GeneratedPluginRegistrant.*
 
