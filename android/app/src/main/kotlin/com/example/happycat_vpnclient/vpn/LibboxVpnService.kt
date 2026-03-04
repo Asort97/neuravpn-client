@@ -164,7 +164,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         check(pendingIntent == null) { "VPN permission not granted" }
 
         val builder = Builder()
-            .setSession(getStringLabel("Happycat VPN"))
+            .setSession(getStringLabel("neuravpn"))
             .setMtu(options.mtu)
 
         var hasIpv4Address = false
@@ -522,7 +522,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
 
     private fun buildNotification(state: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getStringLabel("Happycat VPN"))
+            .setContentTitle(getStringLabel("neuravpn"))
             .setContentText(state)
             .setSmallIcon(android.R.drawable.stat_sys_warning)
             .setOngoing(true)
@@ -545,7 +545,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(CHANNEL_ID, "Happycat VPN", NotificationManager.IMPORTANCE_LOW)
+        val channel = NotificationChannel(CHANNEL_ID, "neuravpn", NotificationManager.IMPORTANCE_LOW)
         manager.createNotificationChannel(channel)
     }
 
@@ -562,7 +562,7 @@ class LibboxVpnService : VpnService(), PlatformInterface {
 
     companion object {
         private const val TAG = "LibboxVpnService"
-        private const val CHANNEL_ID = "happycat_vpn"
+        private const val CHANNEL_ID = "neuravpn_vpn"
         private const val NOTIFICATION_ID = 37
         private const val DEFAULT_MTU = 1500
         private const val IFF_UP = 0x1
