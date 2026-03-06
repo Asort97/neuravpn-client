@@ -1,0 +1,10 @@
+{
+    "android":  {
+                    "buildName":  "1.0.3",
+                    "buildNumber":  3
+                },
+    "windows":  {
+                    "buildName":  "1.0.3",
+                    "buildNumber":  3
+                }
+}

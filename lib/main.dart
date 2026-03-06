@@ -45,6 +45,50 @@ const String _customWindowsUriScheme = 'neuravpn';
 const MethodChannel _windowsLaunchChannel = MethodChannel(
   'neuravpn/windows_launch',
 );
+const MethodChannel _androidLaunchChannel = MethodChannel(
+  'neuravpn/android_launch',
+);
+
+@visibleForTesting
+bool isSupportedLaunchImportValue(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return false;
+  }
+  if (trimmed.startsWith('vless://')) {
+    return true;
+  }
+  final parsed = Uri.tryParse(trimmed);
+  if (parsed == null) {
+    return false;
+  }
+  final scheme = parsed.scheme.toLowerCase();
+  return (scheme == 'http' || scheme == 'https') && parsed.host.isNotEmpty;
+}
+
+@visibleForTesting
+String? decodeSupportedLaunchImportValue(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty) {
+    return null;
+  }
+  if (isSupportedLaunchImportValue(trimmed)) {
+    return trimmed;
+  }
+  try {
+    final decoded = Uri.decodeComponent(trimmed);
+    if (isSupportedLaunchImportValue(decoded)) {
+      return decoded;
+    }
+  } on FormatException {
+    // Ignore malformed nested encoding and keep scanning other args.
+  }
+  return null;
+}
+
+bool _isSecureProfileUri(String uri) {
+  return isSecureVlessUri(uri);
+}
 
 @visibleForTesting
 String? extractImportedVlessFromLaunchArgs(List<String> args) {
@@ -58,35 +102,32 @@ String? extractImportedVlessFromLaunchArgs(List<String> args) {
     }
 
     final parsed = Uri.tryParse(candidate);
-    if (parsed == null ||
-        parsed.scheme.toLowerCase() != _customWindowsUriScheme) {
+    if (parsed == null) {
+      continue;
+    }
+    final scheme = parsed.scheme.toLowerCase();
+    if (scheme != _customWindowsUriScheme &&
+        scheme != 'http' &&
+        scheme != 'https') {
       continue;
     }
 
-    final routeTarget = parsed.host.isNotEmpty
-        ? parsed.host
-        : (parsed.pathSegments.isNotEmpty ? parsed.pathSegments.first : '');
-    if (routeTarget.toLowerCase() != 'import') {
-      continue;
+    if (scheme == _customWindowsUriScheme) {
+      final routeTarget = parsed.host.isNotEmpty
+          ? parsed.host
+          : (parsed.pathSegments.isNotEmpty ? parsed.pathSegments.first : '');
+      if (routeTarget.toLowerCase() != 'import') {
+        continue;
+      }
     }
 
     final encodedValue = parsed.queryParameters['v'];
     if (encodedValue == null || encodedValue.isEmpty) {
       continue;
     }
-
-    final decodedValue = encodedValue.trim();
-    if (decodedValue.startsWith('vless://')) {
-      return decodedValue;
-    }
-
-    try {
-      final decodedTwice = Uri.decodeComponent(decodedValue);
-      if (decodedTwice.startsWith('vless://')) {
-        return decodedTwice;
-      }
-    } on FormatException {
-      // Ignore malformed nested encoding and keep scanning other args.
+    final decodedPayload = decodeSupportedLaunchImportValue(encodedValue);
+    if (decodedPayload != null) {
+      return decodedPayload;
     }
   }
   return null;
@@ -330,6 +371,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   UpdateCheckResult? _updateResult;
   bool _checkingUpdates = false;
   bool _initialLaunchArgsHandled = false;
+  bool _initialAndroidLaunchUriHandled = false;
 
   VlessLink? get _parsed => _singBoxController.parsedLink;
   VlessLink? get _currentLink =>
@@ -422,6 +464,9 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_isWindowsShellPlatform) {
       _installWindowsLaunchHandler();
     }
+    if (Platform.isAndroid) {
+      _installAndroidLaunchHandler();
+    }
     unawaited(_bootstrapInitialState());
     unawaited(_initVersionAndUpdates());
     if (_isWindowsShellPlatform) {
@@ -447,6 +492,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   Future<void> _bootstrapInitialState() async {
     await _loadInitialData();
     await _handleInitialLaunchArgs();
+    await _handleInitialAndroidLaunchUri();
   }
 
   Future<void> _ensureWindowsUriProtocolRegistered() async {
@@ -477,6 +523,24 @@ class _VlessHomePageState extends State<VlessHomePage>
         await windowManager.show();
         await windowManager.focus();
       }
+    });
+  }
+
+  void _installAndroidLaunchHandler() {
+    _androidLaunchChannel.setMethodCallHandler((call) async {
+      if (call.method != 'handleLaunchUri') {
+        return;
+      }
+      final payload = call.arguments;
+      if (payload is! String || payload.trim().isEmpty) {
+        return;
+      }
+      final importedUri = extractImportedVlessFromLaunchArgs([payload]);
+      if (importedUri == null || importedUri.isEmpty) {
+        _appendLogs(['[uri-import] Ignored Android runtime handoff payload']);
+        return;
+      }
+      await _importProfileFromLaunchUri(importedUri);
     });
   }
 
@@ -1225,7 +1289,9 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _loadInitialData() async {
     final prefs = await SharedPreferences.getInstance();
     final savedProfiles = prefs.getString('vpn_profiles');
-    var profiles = VpnProfile.listFromJsonString(savedProfiles);
+    var profiles = VpnProfile.listFromJsonString(savedProfiles)
+        .where((profile) => _isSecureProfileUri(profile.uri))
+        .toList();
     final storedCounter = prefs.getInt(_profileCounterKey) ?? 0;
     final metricsRaw = prefs.getString(_profileMetricsKey);
     final restoredPings = <String, int>{};
@@ -1278,7 +1344,9 @@ $regItems = foreach ($rp in $regPaths) {
 
     if (profiles.isEmpty && subscriptions.isEmpty) {
       final legacyUri = prefs.getString('vless_uri');
-      if (legacyUri != null && legacyUri.isNotEmpty) {
+      if (legacyUri != null &&
+          legacyUri.isNotEmpty &&
+          _isSecureProfileUri(legacyUri)) {
         profiles = [VpnProfile(name: 'Profile 1', uri: legacyUri)];
       }
     }
@@ -1299,7 +1367,7 @@ $regItems = foreach ($rp in $regPaths) {
       final uri =
           firstSub.selectedProfile ??
           (firstSub.profiles.isNotEmpty ? firstSub.profiles.first : null);
-      if (uri != null && uri.isNotEmpty) {
+      if (uri != null && uri.isNotEmpty && _isSecureProfileUri(uri)) {
         final autoName = _deriveProfileNameFromUri(uri);
         selected = VpnProfile(
           name: autoName.isEmpty
@@ -1428,7 +1496,9 @@ $regItems = foreach ($rp in $regPaths) {
       _controller.text = selected.uri;
     } else {
       final fallbackUri = prefs.getString('vless_uri');
-      if (fallbackUri != null && fallbackUri.isNotEmpty) {
+      if (fallbackUri != null &&
+          fallbackUri.isNotEmpty &&
+          _isSecureProfileUri(fallbackUri)) {
         _controller.text = fallbackUri;
       }
     }
@@ -1452,35 +1522,77 @@ $regItems = foreach ($rp in $regPaths) {
     await _importProfileFromLaunchUri(importedUri);
   }
 
+  Future<void> _handleInitialAndroidLaunchUri() async {
+    if (!Platform.isAndroid || _initialAndroidLaunchUriHandled) {
+      return;
+    }
+    _initialAndroidLaunchUriHandled = true;
+
+    try {
+      final payload = await _androidLaunchChannel.invokeMethod<String>(
+        'getInitialLaunchUri',
+      );
+      if (payload == null || payload.trim().isEmpty) {
+        return;
+      }
+      final importedUri = extractImportedVlessFromLaunchArgs([payload]);
+      if (importedUri == null || importedUri.isEmpty) {
+        _appendLogs(['[uri-import] Ignored Android cold-start payload']);
+        return;
+      }
+      await _importProfileFromLaunchUri(importedUri);
+    } catch (error) {
+      _appendLogs(['[uri-import] Android launch URI query failed: $error']);
+    }
+  }
+
   Future<void> _importProfileFromLaunchUri(String rawUri) async {
     final trimmedUri = rawUri.trim();
     if (trimmedUri.isEmpty) {
       return;
     }
-    if (parseVlessUri(trimmedUri) == null) {
-      _appendLogs(['[uri-import] Ignored invalid launch URI']);
-      _showDeferredSnack('Не удалось импортировать ссылку neuravpn');
+    final parsedVless = parseVlessUri(trimmedUri);
+    if (parsedVless != null) {
+      if (!isSecureVlessLink(parsedVless)) {
+        _appendLogs(['[uri-import] Rejected insecure VLESS launch URI']);
+        _showDeferredSnack('Профиль отклонен: нужен TLS/Reality');
+        return;
+      }
+      for (final profile in _profiles) {
+        if (profile.uri == trimmedUri) {
+          await _selectCurrentProfile(profile);
+          await _saveUri();
+          _appendLogs(
+            ['[uri-import] Selected existing VLESS profile from launch URI'],
+          );
+          _showDeferredSnack('Ссылка neuravpn импортирована');
+          return;
+        }
+      }
+
+      final autoName = _deriveProfileNameFromUri(trimmedUri);
+      await _addProfile(
+        autoName.isEmpty ? _previewProfileName() : autoName,
+        trimmedUri,
+      );
+      await _saveUri();
+      _appendLogs(['[uri-import] Imported VLESS profile from launch URI']);
+      _showDeferredSnack('Ссылка neuravpn импортирована');
       return;
     }
 
-    for (final profile in _profiles) {
-      if (profile.uri == trimmedUri) {
-        await _selectCurrentProfile(profile);
-        await _saveUri();
-        _appendLogs(['[uri-import] Selected existing profile from launch URI']);
-        _showDeferredSnack('Ссылка neuravpn импортирована');
-        return;
-      }
+    final parsed = Uri.tryParse(trimmedUri);
+    final scheme = parsed?.scheme.toLowerCase();
+    if ((scheme == 'http' || scheme == 'https') &&
+        parsed != null &&
+        parsed.host.isNotEmpty) {
+      await _addSubscription(trimmedUri, _deriveSubscriptionNameFromUrl(trimmedUri));
+      _appendLogs(['[uri-import] Imported subscription URL from launch URI']);
+      return;
     }
 
-    final autoName = _deriveProfileNameFromUri(trimmedUri);
-    await _addProfile(
-      autoName.isEmpty ? _previewProfileName() : autoName,
-      trimmedUri,
-    );
-    await _saveUri();
-    _appendLogs(['[uri-import] Imported profile from launch URI']);
-    _showDeferredSnack('Ссылка neuravpn импортирована');
+    _appendLogs(['[uri-import] Ignored invalid launch URI']);
+    _showDeferredSnack('Не удалось импортировать ссылку neuravpn');
   }
 
   void _showDeferredSnack(String message) {
@@ -2099,6 +2211,10 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _addProfile(String name, String uri) async {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
+    if (!_isSecureProfileUri(trimmedUri)) {
+      _showFastSnack('Небезопасный профиль. Разрешены только VLESS с TLS/Reality.');
+      return;
+    }
     final autoName = _deriveProfileNameFromUri(trimmedUri);
     final uniqueName = _allocateProfileName(
       autoName.isEmpty ? _previewProfileName() : autoName,
@@ -2191,7 +2307,7 @@ $regItems = foreach ($rp in $regPaths) {
       final manager = SubscriptionService();
       final profiles = await manager.fetchSubscription(url);
       if (profiles.isEmpty) {
-        throw 'Подписка не вернула профили';
+        throw 'Подписка не содержит поддерживаемых TLS/Reality профилей';
       }
 
       final subscription = VpnSubscription(
@@ -2748,6 +2864,9 @@ $regItems = foreach ($rp in $regPaths) {
     _logFlushTimer?.cancel();
     if (_isWindowsShellPlatform) {
       _windowsLaunchChannel.setMethodCallHandler(null);
+    }
+    if (Platform.isAndroid) {
+      _androidLaunchChannel.setMethodCallHandler(null);
     }
     _connectGlowController.dispose();
     _windowsPageController.dispose();

@@ -169,6 +169,11 @@ class SingBoxController {
     if (parsed == null) {
       return SingBoxStartResult.failure('Ошибка: неверный формат VLESS URI');
     }
+    if (!isSecureVlessLink(parsed)) {
+      return SingBoxStartResult.failure(
+        'Небезопасный профиль: поддерживаются только TLS/Reality',
+      );
+    }
     _parsedLink = parsed;
     if (!_isWindows && !_isAndroid) {
       return SingBoxStartResult.failure('Платформа не поддерживается');

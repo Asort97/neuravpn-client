@@ -34,3 +34,49 @@ Do not store `certificate_password` in `pubspec.yaml`.
 ### Env template
 
 Use `.env.example` as a local template for secret values.
+
+## Platform Version Workflow
+
+Use `release.bat` (or `tool/release.ps1`) to keep Android and Windows versions independent.
+
+Show current config:
+
+```powershell
+.\release.bat show
+```
+
+Set Android version:
+
+```powershell
+.\release.bat set -Platform android -BuildName 1.4.0 -BuildNumber 1403
+```
+
+Set Windows version:
+
+```powershell
+.\release.bat set -Platform windows -BuildName 1.5.0 -BuildNumber 1501
+```
+
+Build Android release APK:
+
+```powershell
+.\release.bat build -Platform android
+```
+
+Build Android split-per-abi:
+
+```powershell
+.\release.bat build -Platform android -SplitPerAbi
+```
+
+Build Windows release:
+
+```powershell
+.\release.bat build -Platform windows
+```
+
+Version storage file: `tool/release_versions.json`
+
+## Privacy Policy
+
+Google Play listing should point to a public copy of [PRIVACY_POLICY.md](PRIVACY_POLICY.md).

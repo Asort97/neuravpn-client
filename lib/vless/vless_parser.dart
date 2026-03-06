@@ -25,6 +25,19 @@ class VlessLink {
   bool get isTls => security == 'tls' || isReality;
 }
 
+bool isSecureVlessLink(VlessLink link) {
+  final security = (link.security ?? '').toLowerCase().trim();
+  return security == 'tls' || security == 'reality';
+}
+
+bool isSecureVlessUri(String raw) {
+  final parsed = parseVlessUri(raw);
+  if (parsed == null) {
+    return false;
+  }
+  return isSecureVlessLink(parsed);
+}
+
 /// Парсер VLESS URI с валидацией
 /// Формат: vless://<uuid>@<host>:<port>?param1=...&param2=...#tag
 VlessLink? parseVlessUri(String raw) {

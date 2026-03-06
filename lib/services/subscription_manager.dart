@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
+import '../vless/vless_parser.dart';
 
 class SubscriptionService {
   final http.Client _client = http.Client();
@@ -39,7 +40,7 @@ class SubscriptionService {
       // Парсим строки с профилями
       final profiles = _parseProfiles(decodedContent);
       if (profiles.isEmpty) {
-        throw 'В подписке не найдено ни одного VLESS профиля';
+        throw 'Подписка не содержит поддерживаемых TLS/Reality профилей';
       }
 
       return profiles;
@@ -71,7 +72,9 @@ class SubscriptionService {
 
       // Проверяем что это VLESS URI
       if (trimmed.startsWith('vless://')) {
-        profiles.add(trimmed);
+        if (isSecureVlessUri(trimmed)) {
+          profiles.add(trimmed);
+        }
       }
     }
 

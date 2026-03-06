@@ -22,4 +22,28 @@ void main() {
 
     expect(extracted, isNull);
   });
+
+  test('extracts encoded subscription URL from neuravpn import link', () {
+    const expectedUrl =
+        'https://sub.staticdeliverycdn.com:2096/s-39fj3r9f3j/fd6abff9-7831-401e-91a5-3c334fbc6c60';
+    final encodedUrl = Uri.encodeComponent(expectedUrl);
+
+    final extracted = extractImportedVlessFromLaunchArgs([
+      'neuravpn://import?v=$encodedUrl',
+    ]);
+
+    expect(extracted, expectedUrl);
+  });
+
+  test('extracts subscription URL from website wrapper link', () {
+    const expectedUrl =
+        'https://sub.staticdeliverycdn.com:2096/s-39fj3r9f3j/fd6abff9-7831-401e-91a5-3c334fbc6c60';
+    final encodedUrl = Uri.encodeComponent(expectedUrl);
+
+    final extracted = extractImportedVlessFromLaunchArgs([
+      'https://asort97.github.io/neuravpn-site/?open=1&v=$encodedUrl&cb=1',
+    ]);
+
+    expect(extracted, expectedUrl);
+  });
 }
