@@ -29,6 +29,7 @@ import 'services/singbox_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
+import 'services/windows_uri_protocol_registrar.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
@@ -40,7 +41,58 @@ import 'widgets/loading_screen.dart';
 @visibleForTesting
 bool debugForceMobileShell = false;
 
-Future<void> main() async {
+const String _customWindowsUriScheme = 'neuravpn';
+const MethodChannel _windowsLaunchChannel = MethodChannel(
+  'neuravpn/windows_launch',
+);
+
+@visibleForTesting
+String? extractImportedVlessFromLaunchArgs(List<String> args) {
+  for (final rawArg in args) {
+    final candidate = rawArg.trim();
+    if (candidate.isEmpty) {
+      continue;
+    }
+    if (candidate.startsWith('vless://')) {
+      return candidate;
+    }
+
+    final parsed = Uri.tryParse(candidate);
+    if (parsed == null ||
+        parsed.scheme.toLowerCase() != _customWindowsUriScheme) {
+      continue;
+    }
+
+    final routeTarget = parsed.host.isNotEmpty
+        ? parsed.host
+        : (parsed.pathSegments.isNotEmpty ? parsed.pathSegments.first : '');
+    if (routeTarget.toLowerCase() != 'import') {
+      continue;
+    }
+
+    final encodedValue = parsed.queryParameters['v'];
+    if (encodedValue == null || encodedValue.isEmpty) {
+      continue;
+    }
+
+    final decodedValue = encodedValue.trim();
+    if (decodedValue.startsWith('vless://')) {
+      return decodedValue;
+    }
+
+    try {
+      final decodedTwice = Uri.decodeComponent(decodedValue);
+      if (decodedTwice.startsWith('vless://')) {
+        return decodedTwice;
+      }
+    } on FormatException {
+      // Ignore malformed nested encoding and keep scanning other args.
+    }
+  }
+  return null;
+}
+
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ru_RU', null);
   await DomainRuleNormalizer.initializeDefaultRules();
@@ -61,11 +113,16 @@ Future<void> main() async {
       await windowManager.focus();
     });
   }
-  runApp(const VpnApp());
+  runApp(VpnApp(initialLaunchArgs: args));
 }
 
 class VpnApp extends StatelessWidget {
-  const VpnApp({super.key});
+  const VpnApp({
+    super.key,
+    this.initialLaunchArgs = const <String>[],
+  });
+
+  final List<String> initialLaunchArgs;
 
   @override
   Widget build(BuildContext context) {
@@ -86,7 +143,7 @@ class VpnApp extends StatelessWidget {
         ),
       ),
       scrollBehavior: const _AppScrollBehavior(),
-      home: const VlessHomePage(),
+      home: VlessHomePage(initialLaunchArgs: initialLaunchArgs),
     );
   }
 }
@@ -105,7 +162,12 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
 enum _WindowsView { connection, splitTunneling, settings }
 
 class VlessHomePage extends StatefulWidget {
-  const VlessHomePage({super.key});
+  const VlessHomePage({
+    super.key,
+    this.initialLaunchArgs = const <String>[],
+  });
+
+  final List<String> initialLaunchArgs;
 
   @override
   State<VlessHomePage> createState() => _VlessHomePageState();
@@ -267,6 +329,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   String _appVersion = '';
   UpdateCheckResult? _updateResult;
   bool _checkingUpdates = false;
+  bool _initialLaunchArgsHandled = false;
 
   VlessLink? get _parsed => _singBoxController.parsedLink;
   VlessLink? get _currentLink =>
@@ -356,10 +419,14 @@ class _VlessHomePageState extends State<VlessHomePage>
       curve: Curves.easeInOutCubic,
     );
     _updateConnectGlowTicker();
-    _loadInitialData();
+    if (_isWindowsShellPlatform) {
+      _installWindowsLaunchHandler();
+    }
+    unawaited(_bootstrapInitialState());
     unawaited(_initVersionAndUpdates());
     if (_isWindowsShellPlatform) {
       unawaited(_checkWintun());
+      unawaited(_ensureWindowsUriProtocolRegistered());
     }
     if (_isDesktopPlatform) {
       windowManager.addListener(this);
@@ -375,6 +442,42 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (Platform.isAndroid) {
       unawaited(_loadAndroidApps());
     }
+  }
+
+  Future<void> _bootstrapInitialState() async {
+    await _loadInitialData();
+    await _handleInitialLaunchArgs();
+  }
+
+  Future<void> _ensureWindowsUriProtocolRegistered() async {
+    if (!_isWindowsShellPlatform) {
+      return;
+    }
+    await WindowsUriProtocolRegistrar(
+      scheme: _customWindowsUriScheme,
+    ).ensureRegistered();
+  }
+
+  void _installWindowsLaunchHandler() {
+    _windowsLaunchChannel.setMethodCallHandler((call) async {
+      if (call.method != 'handleLaunchUri') {
+        return;
+      }
+      final payload = call.arguments;
+      if (payload is! String || payload.trim().isEmpty) {
+        return;
+      }
+      final importedUri = extractImportedVlessFromLaunchArgs([payload]);
+      if (importedUri == null || importedUri.isEmpty) {
+        _appendLogs(['[uri-import] Ignored runtime handoff payload']);
+        return;
+      }
+      await _importProfileFromLaunchUri(importedUri);
+      if (_isWindowsShellPlatform) {
+        await windowManager.show();
+        await windowManager.focus();
+      }
+    });
   }
 
   Future<void> _checkWintun() async {
@@ -1331,6 +1434,62 @@ $regItems = foreach ($rp in $regPaths) {
     }
 
     await _syncAndroidRuntimeState();
+  }
+
+  Future<void> _handleInitialLaunchArgs() async {
+    if (_initialLaunchArgsHandled) {
+      return;
+    }
+    _initialLaunchArgsHandled = true;
+
+    final importedUri = extractImportedVlessFromLaunchArgs(
+      widget.initialLaunchArgs,
+    );
+    if (importedUri == null || importedUri.isEmpty) {
+      return;
+    }
+
+    await _importProfileFromLaunchUri(importedUri);
+  }
+
+  Future<void> _importProfileFromLaunchUri(String rawUri) async {
+    final trimmedUri = rawUri.trim();
+    if (trimmedUri.isEmpty) {
+      return;
+    }
+    if (parseVlessUri(trimmedUri) == null) {
+      _appendLogs(['[uri-import] Ignored invalid launch URI']);
+      _showDeferredSnack('Не удалось импортировать ссылку neuravpn');
+      return;
+    }
+
+    for (final profile in _profiles) {
+      if (profile.uri == trimmedUri) {
+        await _selectCurrentProfile(profile);
+        await _saveUri();
+        _appendLogs(['[uri-import] Selected existing profile from launch URI']);
+        _showDeferredSnack('Ссылка neuravpn импортирована');
+        return;
+      }
+    }
+
+    final autoName = _deriveProfileNameFromUri(trimmedUri);
+    await _addProfile(
+      autoName.isEmpty ? _previewProfileName() : autoName,
+      trimmedUri,
+    );
+    await _saveUri();
+    _appendLogs(['[uri-import] Imported profile from launch URI']);
+    _showDeferredSnack('Ссылка neuravpn импортирована');
+  }
+
+  void _showDeferredSnack(String message) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _showFastSnack(message);
+    });
   }
 
   Future<void> _syncAndroidRuntimeState() async {
@@ -2587,6 +2746,9 @@ $regItems = foreach ($rp in $regPaths) {
   @override
   void dispose() {
     _logFlushTimer?.cancel();
+    if (_isWindowsShellPlatform) {
+      _windowsLaunchChannel.setMethodCallHandler(null);
+    }
     _connectGlowController.dispose();
     _windowsPageController.dispose();
     _controller.dispose();

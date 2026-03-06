@@ -4,6 +4,8 @@
 
 #include "flutter/generated_plugin_registrant.h"
 #include "dpi_evasion_channel.h"
+#include "launch_uri_channel.h"
+#include "utils.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -27,6 +29,7 @@ bool FlutterWindow::OnCreate() {
   }
   RegisterPlugins(flutter_controller_->engine());
   SetupDpiEvasionChannel(flutter_controller_->engine()->messenger());
+  SetupLaunchUriChannel(flutter_controller_->engine()->messenger());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -44,6 +47,7 @@ bool FlutterWindow::OnCreate() {
 void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
     TeardownDpiEvasionChannel();
+    TeardownLaunchUriChannel();
     flutter_controller_ = nullptr;
   }
 
@@ -65,6 +69,23 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_COPYDATA: {
+      const auto* copy_data =
+          reinterpret_cast<const COPYDATASTRUCT*>(lparam);
+      if (copy_data != nullptr &&
+          copy_data->dwData == kLaunchUriCopyDataId &&
+          copy_data->lpData != nullptr &&
+          copy_data->cbData >= sizeof(wchar_t)) {
+        const auto* payload =
+            reinterpret_cast<const wchar_t*>(copy_data->lpData);
+        const std::string utf8_payload = Utf8FromUtf16(payload);
+        if (!utf8_payload.empty()) {
+          DispatchLaunchUri(utf8_payload);
+          return 1;
+        }
+      }
+      break;
+    }
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;

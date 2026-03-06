@@ -1,11 +1,14 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
+#include <shellapi.h>
 
 #include <clocale>
 #include <mbctype.h>
+#include <vector>
 
 #include "flutter_window.h"
+#include "launch_uri_channel.h"
 #include "utils.h"
 
 namespace {
@@ -43,6 +46,133 @@ std::wstring GetExecutablePath() {
 
 HANDLE g_job_handle = nullptr;
 HANDLE g_instance_mutex = nullptr;
+
+std::vector<std::wstring> GetWideCommandLineArguments() {
+  int argc = 0;
+  wchar_t** argv = ::CommandLineToArgvW(::GetCommandLineW(), &argc);
+  if (argv == nullptr) {
+    return {};
+  }
+
+  std::vector<std::wstring> arguments;
+  for (int i = 1; i < argc; ++i) {
+    arguments.emplace_back(argv[i]);
+  }
+  ::LocalFree(argv);
+  return arguments;
+}
+
+std::wstring QueryProcessImagePath(DWORD process_id) {
+  HANDLE process = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+  if (process == nullptr) {
+    return L"";
+  }
+
+  wchar_t buffer[MAX_PATH];
+  DWORD size = MAX_PATH;
+  std::wstring path;
+  if (::QueryFullProcessImageNameW(process, 0, buffer, &size) != 0 && size > 0) {
+    path.assign(buffer, size);
+  }
+  ::CloseHandle(process);
+  return path;
+}
+
+struct ExistingWindowSearchContext {
+  std::wstring current_exe_path;
+  HWND found_window = nullptr;
+};
+
+BOOL CALLBACK FindExistingWindowCallback(HWND hwnd, LPARAM lparam) {
+  auto* context = reinterpret_cast<ExistingWindowSearchContext*>(lparam);
+  if (context == nullptr) {
+    return TRUE;
+  }
+
+  wchar_t class_name[64] = {};
+  if (::GetClassNameW(hwnd, class_name, 64) == 0) {
+    return TRUE;
+  }
+  if (wcscmp(class_name, L"FLUTTER_RUNNER_WIN32_WINDOW") != 0) {
+    return TRUE;
+  }
+
+  DWORD pid = 0;
+  ::GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == 0 || pid == ::GetCurrentProcessId()) {
+    return TRUE;
+  }
+
+  const std::wstring other_exe_path = QueryProcessImagePath(pid);
+  if (other_exe_path.empty()) {
+    return TRUE;
+  }
+
+  if (_wcsicmp(other_exe_path.c_str(), context->current_exe_path.c_str()) != 0) {
+    return TRUE;
+  }
+
+  context->found_window = hwnd;
+  return FALSE;
+}
+
+HWND FindExistingInstanceWindow() {
+  ExistingWindowSearchContext context;
+  context.current_exe_path = GetExecutablePath();
+  if (context.current_exe_path.empty()) {
+    return nullptr;
+  }
+
+  ::EnumWindows(FindExistingWindowCallback, reinterpret_cast<LPARAM>(&context));
+  return context.found_window;
+}
+
+std::wstring FindLaunchUriArgument(
+    const std::vector<std::wstring>& arguments) {
+  for (const auto& argument : arguments) {
+    if (argument.rfind(L"neuravpn://", 0) == 0 ||
+        argument.rfind(L"vless://", 0) == 0) {
+      return argument;
+    }
+  }
+  return L"";
+}
+
+bool ForwardLaunchUriToExistingInstance(const std::wstring& launch_uri) {
+  if (launch_uri.empty()) {
+    return false;
+  }
+
+  HWND existing_window = FindExistingInstanceWindow();
+  if (existing_window == nullptr) {
+    return false;
+  }
+
+  COPYDATASTRUCT copy_data = {};
+  copy_data.dwData = kLaunchUriCopyDataId;
+  copy_data.cbData =
+      static_cast<DWORD>((launch_uri.size() + 1) * sizeof(wchar_t));
+  copy_data.lpData = const_cast<wchar_t*>(launch_uri.c_str());
+
+  DWORD_PTR send_result = 0;
+  const auto delivered = ::SendMessageTimeoutW(
+      existing_window,
+      WM_COPYDATA,
+      0,
+      reinterpret_cast<LPARAM>(&copy_data),
+      SMTO_BLOCK | SMTO_ABORTIFHUNG,
+      4000,
+      &send_result);
+
+  if (!::IsWindowVisible(existing_window)) {
+    ::ShowWindow(existing_window, SW_SHOWNORMAL);
+  } else if (::IsIconic(existing_window)) {
+    ::ShowWindow(existing_window, SW_RESTORE);
+  }
+  ::SetForegroundWindow(existing_window);
+
+  return delivered != 0 && send_result == 1;
+}
 
 void EnableKillOnJobClose() {
   if (g_job_handle != nullptr) {
@@ -201,6 +331,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   EnsureUtf8Locale();
   SetSafeWorkingDirectory();
   EnableKillOnJobClose();
+  const std::vector<std::wstring> wide_command_line_arguments =
+      GetWideCommandLineArguments();
+  const std::wstring launch_uri_argument =
+      FindLaunchUriArgument(wide_command_line_arguments);
+  if (ForwardLaunchUriToExistingInstance(launch_uri_argument)) {
+    return EXIT_SUCCESS;
+  }
   if (!AcquireInstanceSlot()) {
     ::MessageBoxW(nullptr,
                   L"\u041e\u0434\u043d\u043e\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u043c\u043e\u0436\u043d\u043e \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u0432\u0430 \u044d\u043a\u0437\u0435\u043c\u043f\u043b\u044f\u0440\u0430.",

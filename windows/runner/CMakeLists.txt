@@ -18,6 +18,7 @@ add_executable(${BINARY_NAME} WIN32
   "utils.cpp"
   "win32_window.cpp"
   "dpi_evasion_channel.cpp"
+  "launch_uri_channel.cpp"
   "ttl_phantom_injector.cpp"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
