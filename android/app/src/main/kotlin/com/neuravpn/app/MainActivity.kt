@@ -1,4 +1,4 @@
-package com.example.happycat_vpnclient
+package com.neuravpn.app
 
 import android.app.Activity
 import android.content.Intent
@@ -6,7 +6,7 @@ import android.net.VpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import com.example.happycat_vpnclient.vpn.LibboxVpnService
+import com.neuravpn.app.vpn.LibboxVpnService
 
 class MainActivity : FlutterActivity() {
 
@@ -113,10 +113,18 @@ class MainActivity : FlutterActivity() {
 		}
 		val data = intent.data ?: return null
 		val scheme = data.scheme?.lowercase() ?: return null
-		if (scheme != "neuravpn" && scheme != "vless") {
-			return null
+		when (scheme) {
+			"neuravpn", "vless" -> return data.toString()
+			"http", "https" -> {
+				val host = data.host?.lowercase() ?: return null
+				val path = data.encodedPath ?: return null
+				if (host == "asort97.github.io" && path.startsWith("/neuravpn-site")) {
+					return data.toString()
+				}
+				return null
+			}
+			else -> return null
 		}
-		return data.toString()
 	}
 
 	companion object {

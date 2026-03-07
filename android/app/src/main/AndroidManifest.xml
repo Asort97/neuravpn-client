@@ -9,7 +9,7 @@
 
     <application
         android:label="@string/app_name"
-        android:name="com.example.happycat_vpnclient.HappycatVpnApplication"
+        android:name="com.neuravpn.app.HappycatVpnApplication"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
@@ -39,6 +39,15 @@
                 <data
                     android:scheme="neuravpn"
                     android:host="import" />
+            </intent-filter>
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="asort97.github.io"
+                    android:pathPrefix="/neuravpn-site" />
             </intent-filter>
         </activity>
 

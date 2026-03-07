@@ -1,4 +1,4 @@
-package com.example.happycat_vpnclient
+package com.neuravpn.app
 
 import android.app.Application
 import android.app.NotificationManager

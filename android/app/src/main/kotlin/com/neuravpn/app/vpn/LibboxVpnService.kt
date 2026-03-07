@@ -1,4 +1,4 @@
-package com.example.happycat_vpnclient.vpn
+package com.neuravpn.app.vpn
 
 import android.Manifest
 import android.app.Notification
@@ -22,8 +22,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.TaskStackBuilder
 import androidx.core.content.ContextCompat
-import com.example.happycat_vpnclient.HappycatVpnApplication
-import com.example.happycat_vpnclient.MainActivity
+import com.neuravpn.app.HappycatVpnApplication
+import com.neuravpn.app.MainActivity
 import libbox.BoxService
 import libbox.InterfaceUpdateListener
 import libbox.Libbox
@@ -574,11 +574,11 @@ class LibboxVpnService : VpnService(), PlatformInterface {
         private val FALLBACK_DNS = listOf("1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4")
         private val runningState = AtomicBoolean(false)
         private val stopInProgress = AtomicBoolean(false)
-        const val ACTION_STOP = "com.example.happycat_vpnclient.vpn.ACTION_STOP"
-        const val EXTRA_CONFIG = "com.example.happycat_vpnclient.vpn.EXTRA_CONFIG"
-        const val EXTRA_DEEPLINK = "com.example.happycat_vpnclient.vpn.EXTRA_DEEPLINK"
-        const val EXTRA_INCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_INCLUDE_PACKAGES"
-        const val EXTRA_EXCLUDE_PACKAGES = "com.example.happycat_vpnclient.vpn.EXTRA_EXCLUDE_PACKAGES"
+        const val ACTION_STOP = "com.neuravpn.app.vpn.ACTION_STOP"
+        const val EXTRA_CONFIG = "com.neuravpn.app.vpn.EXTRA_CONFIG"
+        const val EXTRA_DEEPLINK = "com.neuravpn.app.vpn.EXTRA_DEEPLINK"
+        const val EXTRA_INCLUDE_PACKAGES = "com.neuravpn.app.vpn.EXTRA_INCLUDE_PACKAGES"
+        const val EXTRA_EXCLUDE_PACKAGES = "com.neuravpn.app.vpn.EXTRA_EXCLUDE_PACKAGES"
 
         fun isRunning(): Boolean = runningState.get() || stopInProgress.get()
 
