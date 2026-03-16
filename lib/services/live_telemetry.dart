@@ -306,7 +306,7 @@ class LiveTelemetryManager {
 
   Future<void> _ensureZapretEvasion() async {
     try {
-      // Best-effort: call back into main via onDecisionChanged hook will re-read decisions and restart sing-box.
+      // Best-effort: call back into main via onDecisionChanged hook to re-read decisions and restart VPN core.
       onDecisionChanged();
     } catch (_) {}
   }

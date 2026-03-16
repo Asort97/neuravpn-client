@@ -73,7 +73,7 @@ flutter:
   assets:
     - assets/bin/wintun.dll
     - assets/bin/sing-box
-    - assets/bin/sing-box.exe
+    - assets/bin/xray.exe
     - assets/bin/WinDivert.dll
     - assets/bin/WinDivert64.sys
     - assets/zapret/bin/
