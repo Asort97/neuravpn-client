@@ -25,7 +25,7 @@ import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/domain_rule_normalizer.dart';
 import 'services/smart_route_engine.dart';
-import 'services/singbox_controller.dart';
+import 'services/vpn_core_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
@@ -158,10 +158,7 @@ Future<void> main(List<String> args) async {
 }
 
 class VpnApp extends StatelessWidget {
-  const VpnApp({
-    super.key,
-    this.initialLaunchArgs = const <String>[],
-  });
+  const VpnApp({super.key, this.initialLaunchArgs = const <String>[]});
 
   final List<String> initialLaunchArgs;
 
@@ -203,10 +200,7 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
 enum _WindowsView { connection, splitTunneling, settings }
 
 class VlessHomePage extends StatefulWidget {
-  const VlessHomePage({
-    super.key,
-    this.initialLaunchArgs = const <String>[],
-  });
+  const VlessHomePage({super.key, this.initialLaunchArgs = const <String>[]});
 
   final List<String> initialLaunchArgs;
 
@@ -248,7 +242,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _presetDirty = false;
   List<VpnProfile> _profiles = [];
   VpnProfile? _selectedProfile;
-  final SingBoxController _singBoxController = SingBoxController();
+  final VpnCoreController _vpnCoreController = VpnCoreController();
   final ScrollController _logScrollController = ScrollController();
   Timer? _logFlushTimer;
   final List<String> _pendingLogLines = <String>[];
@@ -373,11 +367,11 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _initialLaunchArgsHandled = false;
   bool _initialAndroidLaunchUriHandled = false;
 
-  VlessLink? get _parsed => _singBoxController.parsedLink;
+  VlessLink? get _parsed => _vpnCoreController.parsedLink;
   VlessLink? get _currentLink =>
       _parsed ?? parseVlessUri(_controller.text.trim());
-  File? get _configFile => _singBoxController.configFile;
-  String? get _generatedConfig => _singBoxController.generatedConfig;
+  File? get _configFile => _vpnCoreController.configFile;
+  String? get _generatedConfig => _vpnCoreController.generatedConfig;
   bool get _isWindowsShellPlatform =>
       Platform.isWindows && !debugForceMobileShell;
   bool get _isDesktopPlatform =>
@@ -478,7 +472,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
       if (_isWindowsShellPlatform) {
-        unawaited(_startSingBoxWatchdog());
+        unawaited(_startVpnCoreWatchdog());
         WidgetsBinding.instance.addPostFrameCallback((_) {
           unawaited(_fitWindowToDisplay());
         });
@@ -546,7 +540,7 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   Future<void> _checkWintun() async {
     if (!_isWindowsShellPlatform) return;
-    final available = await _singBoxController.isWintunAvailable();
+    final available = await _vpnCoreController.isWintunAvailable();
     if (!available && mounted) {
       _showFastSnack(
         'wintun.dll \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d',
@@ -1260,8 +1254,8 @@ $regItems = foreach ($rp in $regPaths) {
     if (_trafficHistory.isEmpty) {
       _trafficHistory.addAll(List<double>.filled(20, 0));
     }
-    unawaited(_singBoxController.startTrafficStream());
-    _trafficSub = _singBoxController.trafficStream.listen((sample) {
+    unawaited(_vpnCoreController.startTrafficStream());
+    _trafficSub = _vpnCoreController.trafficStream.listen((sample) {
       if (!mounted) return;
       setState(() {
         _trafficHistory.add(sample.toDouble());
@@ -1277,21 +1271,21 @@ $regItems = foreach ($rp in $regPaths) {
     _trafficSub = null;
     _trafficFetchInProgress = false;
     _trafficHistory.clear();
-    await _singBoxController.stopTrafficStream();
+    await _vpnCoreController.stopTrafficStream();
     if (_isWindowsShellPlatform) {
       // Даем немного времени для полной остановки Windows traffic stream.
       await Future.delayed(const Duration(milliseconds: 200));
     }
   }
 
-  bool get _isRunning => _singBoxController.isRunning;
+  bool get _isRunning => _vpnCoreController.isRunning;
 
   Future<void> _loadInitialData() async {
     final prefs = await SharedPreferences.getInstance();
     final savedProfiles = prefs.getString('vpn_profiles');
-    var profiles = VpnProfile.listFromJsonString(savedProfiles)
-        .where((profile) => _isSecureProfileUri(profile.uri))
-        .toList();
+    var profiles = VpnProfile.listFromJsonString(
+      savedProfiles,
+    ).where((profile) => _isSecureProfileUri(profile.uri)).toList();
     final storedCounter = prefs.getInt(_profileCounterKey) ?? 0;
     final metricsRaw = prefs.getString(_profileMetricsKey);
     final restoredPings = <String, int>{};
@@ -1562,9 +1556,9 @@ $regItems = foreach ($rp in $regPaths) {
         if (profile.uri == trimmedUri) {
           await _selectCurrentProfile(profile);
           await _saveUri();
-          _appendLogs(
-            ['[uri-import] Selected existing VLESS profile from launch URI'],
-          );
+          _appendLogs([
+            '[uri-import] Selected existing VLESS profile from launch URI',
+          ]);
           _showDeferredSnack('Ссылка neuravpn импортирована');
           return;
         }
@@ -1586,7 +1580,10 @@ $regItems = foreach ($rp in $regPaths) {
     if ((scheme == 'http' || scheme == 'https') &&
         parsed != null &&
         parsed.host.isNotEmpty) {
-      await _addSubscription(trimmedUri, _deriveSubscriptionNameFromUrl(trimmedUri));
+      await _addSubscription(
+        trimmedUri,
+        _deriveSubscriptionNameFromUrl(trimmedUri),
+      );
       _appendLogs(['[uri-import] Imported subscription URL from launch URI']);
       return;
     }
@@ -1606,7 +1603,7 @@ $regItems = foreach ($rp in $regPaths) {
 
   Future<void> _syncAndroidRuntimeState() async {
     if (!Platform.isAndroid) return;
-    final running = await _singBoxController.syncRuntimeState();
+    final running = await _vpnCoreController.syncRuntimeState();
     if (!mounted) return;
     setState(() {
       _status = running
@@ -1703,6 +1700,85 @@ $regItems = foreach ($rp in $regPaths) {
     await prefs.setBool(_smartRoutingKey, _smartRouting);
   }
 
+  Future<void> _maybeHotReloadWindowsRules({
+    SplitTunnelConfig? previousConfig,
+  }) async {
+    if (!Platform.isWindows) return;
+    if (!_isRunning || _isConnecting || _isDisconnecting) return;
+    final nextConfig = _configForConnection;
+    final applied = await _vpnCoreController.hotReloadWindowsRules(
+      splitConfig: nextConfig,
+      developerMode: _developerMode,
+      smartRouteEngine: _smartRouteEngine,
+      dpiEvasionConfig: _dpiEvasionConfig,
+      onLog: (line) => _appendLogs([line]),
+    );
+    if (applied) {
+      final requiresSessionReset =
+          previousConfig != null &&
+          _requiresWindowsSessionResetForRuleChange(
+            previousConfig,
+            nextConfig,
+          );
+      if (requiresSessionReset) {
+        _appendLogs([
+          '[xray] Rules applied, reconnecting to drop stale sessions',
+        ]);
+        if (mounted) {
+          _showFastSnack(
+            'Правила применены. Переподключаем для сброса старых сессий.',
+          );
+        }
+        await _stop();
+        if (!mounted) return;
+        await _start();
+        return;
+      }
+      _appendLogs(['[xray] Routing rules updated without reconnect']);
+      if (mounted) {
+        _showFastSnack('Правило применено');
+      }
+      return;
+    }
+
+    _appendLogs([
+      '[xray] Routing hot-reload failed, doing controlled reconnect',
+    ]);
+    await _stop();
+    if (!mounted) return;
+    await _start();
+  }
+
+  bool _requiresWindowsSessionResetForRuleChange(
+    SplitTunnelConfig previous,
+    SplitTunnelConfig next,
+  ) {
+    if (previous.mode != next.mode) {
+      return true;
+    }
+    if (previous.smartRouting != next.smartRouting) {
+      return true;
+    }
+    if (_hasRemovedRuleEntries(previous.domains, next.domains)) {
+      return true;
+    }
+    if (_hasRemovedRuleEntries(previous.applications, next.applications)) {
+      return true;
+    }
+    if (_hasRemovedRuleEntries(previous.smartDomains, next.smartDomains)) {
+      return true;
+    }
+    return false;
+  }
+
+  bool _hasRemovedRuleEntries(List<String> previous, List<String> next) {
+    final previousSet = previous.map(_normalizeRuleEntry).toSet();
+    final nextSet = next.map(_normalizeRuleEntry).toSet();
+    return previousSet.difference(nextSet).isNotEmpty;
+  }
+
+  String _normalizeRuleEntry(String value) => value.trim().toLowerCase();
+
   Future<void> _setDeveloperMode(bool enabled) async {
     if (_developerMode == enabled) return;
     setState(() => _developerMode = enabled);
@@ -1711,6 +1787,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _updateActiveSplitConfig(SplitTunnelConfig config) {
+    final previousConfig = _configForConnection;
     setState(() {
       _splitConfigs[_splitMode] = config.copyWith(mode: _splitMode);
       if (_activePresetName != null) {
@@ -1720,11 +1797,13 @@ $regItems = foreach ($rp in $regPaths) {
       }
     });
     unawaited(_persistSplitState());
+    unawaited(_maybeHotReloadWindowsRules(previousConfig: previousConfig));
   }
 
   void _changeSplitMode(String mode) {
     final normalized = _normalizeSplitMode(mode);
     if (_splitMode == normalized) return;
+    final previousConfig = _configForConnection;
     final current = _activeSplitConfig;
     final hadPreset = _hasActivePreset;
     _splitConfigs[normalized] = current.copyWith(mode: normalized);
@@ -1738,18 +1817,23 @@ $regItems = foreach ($rp in $regPaths) {
       }
     });
     unawaited(_persistSplitState());
+    unawaited(_maybeHotReloadWindowsRules(previousConfig: previousConfig));
   }
 
   Future<void> _setSplitEnabled(bool enabled) async {
     if (_splitEnabled == enabled) return;
+    final previousConfig = _configForConnection;
     setState(() => _splitEnabled = enabled);
     await _persistSplitState();
+    await _maybeHotReloadWindowsRules(previousConfig: previousConfig);
   }
 
   Future<void> _setSmartRouting(bool enabled) async {
     if (_smartRouting == enabled) return;
+    final previousConfig = _configForConnection;
     setState(() => _smartRouting = enabled);
     await _persistSplitState();
+    await _maybeHotReloadWindowsRules(previousConfig: previousConfig);
   }
 
   Future<int?> _measurePing(String host, int port) async {
@@ -1818,7 +1902,7 @@ $regItems = foreach ($rp in $regPaths) {
     await _setupTrayIcon();
   }
 
-  Future<void> _startSingBoxWatchdog() async {
+  Future<void> _startVpnCoreWatchdog() async {
     if (_singBoxWatchdogStarted || !Platform.isWindows) return;
     _singBoxWatchdogStarted = true;
     final parentPid = pid;
@@ -1826,7 +1910,14 @@ $regItems = foreach ($rp in $regPaths) {
         '\$parent=$parentPid;'
         'while (Get-Process -Id \$parent -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };'
         'Start-Sleep -Milliseconds 200;'
-        "Stop-Process -Name 'sing-box' -Force -ErrorAction SilentlyContinue";
+        "Stop-Process -Name 'xray' -Force -ErrorAction SilentlyContinue;"
+        r"$ifaces = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | "
+        r"Where-Object { $_.Name -like 'xray*' -or $_.Name -like 'tun-in*' -or $_.Name -like 'wintun*' };"
+        r"foreach ($iface in $ifaces) { "
+        r"Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
+        r"Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
+        r"Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
+        r"}";
     try {
       await Process.start('powershell', [
         '-NoProfile',
@@ -2025,8 +2116,8 @@ $regItems = foreach ($rp in $regPaths) {
     _isExitingApp = true;
     _stopTrafficMonitor();
     await _dpiEvasionManager.stopNativeInjector();
-    await _singBoxController.forceTerminate();
-    unawaited(_singBoxController.dispose());
+    await _vpnCoreController.forceTerminate();
+    unawaited(_vpnCoreController.dispose());
     if (!_isDesktopPlatform) {
       exit(0);
     }
@@ -2212,7 +2303,9 @@ $regItems = foreach ($rp in $regPaths) {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
     if (!_isSecureProfileUri(trimmedUri)) {
-      _showFastSnack('Небезопасный профиль. Разрешены только VLESS с TLS/Reality.');
+      _showFastSnack(
+        'Небезопасный профиль. Разрешены только VLESS с TLS/Reality.',
+      );
       return;
     }
     final autoName = _deriveProfileNameFromUri(trimmedUri);
@@ -2488,7 +2581,7 @@ $regItems = foreach ($rp in $regPaths) {
     if (_isConnecting || _isDisconnecting) return;
 
     if (Platform.isAndroid) {
-      await _singBoxController.syncRuntimeState();
+      await _vpnCoreController.syncRuntimeState();
     }
 
     if (_isRunning) {
@@ -2508,7 +2601,7 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
-    final result = await _singBoxController.connect(
+    final result = await _vpnCoreController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
       developerMode: _developerMode,
@@ -2604,7 +2697,7 @@ $regItems = foreach ($rp in $regPaths) {
 
     if (_isRunning) {
       // Если после попыток еще подключено - попробуем еще раз отключить
-      await _singBoxController.disconnect(onStatus: (_) {}, onLog: (_) {});
+      await _vpnCoreController.disconnect(onStatus: (_) {}, onLog: (_) {});
       await Future.delayed(const Duration(seconds: 1));
     }
   }
@@ -2613,7 +2706,7 @@ $regItems = foreach ($rp in $regPaths) {
     // Защита от спама - проверяем, не идёт ли уже отключение или подключение
     if (_isDisconnecting || _isConnecting) return;
     if (Platform.isAndroid && !_isRunning) {
-      await _singBoxController.syncRuntimeState();
+      await _vpnCoreController.syncRuntimeState();
     }
     if (!_isRunning) return;
 
@@ -2627,8 +2720,8 @@ $regItems = foreach ($rp in $regPaths) {
     // Остановить DPI injection
     await _dpiEvasionManager.stopNativeInjector();
 
-    // Затем отключить sing-box
-    await _singBoxController.disconnect(
+    // Затем отключить VPN core
+    await _vpnCoreController.disconnect(
       onStatus: (value) {
         if (!mounted) return;
         setState(() => _status = _mapStatus(value));
@@ -2638,7 +2731,7 @@ $regItems = foreach ($rp in $regPaths) {
     );
 
     final androidStillRunning = Platform.isAndroid
-        ? await _singBoxController.syncRuntimeState()
+        ? await _vpnCoreController.syncRuntimeState()
         : false;
 
     if (!mounted) return;
@@ -2829,7 +2922,7 @@ $regItems = foreach ($rp in $regPaths) {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Конфигурация sing-box'),
+        title: const Text('Конфигурация VPN core'),
         insetPadding: EdgeInsets.symmetric(
           horizontal: (Platform.isAndroid || Platform.isIOS) ? 12 : 40,
           vertical: 24,
@@ -2882,7 +2975,7 @@ $regItems = foreach ($rp in $regPaths) {
       unawaited(_stop());
     }
     unawaited(_stopTrafficMonitor());
-    unawaited(_singBoxController.dispose());
+    unawaited(_vpnCoreController.dispose());
     unawaited(_dpiEvasionManager.stopNativeInjector());
     super.dispose();
   }
@@ -3095,8 +3188,8 @@ $regItems = foreach ($rp in $regPaths) {
               builder: (context, constraints) {
                 return Align(
                   alignment: Alignment.topCenter,
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 640),
+                  child: SizedBox(
+                    width: math.min(constraints.maxWidth, 420),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
@@ -5981,7 +6074,7 @@ $regItems = foreach ($rp in $regPaths) {
                     const SizedBox(width: 12),
                     const Expanded(
                       child: Text(
-                        'Конфигурация sing-box',
+                        'Конфигурация VPN core',
                         style: TextStyle(
                           fontWeight: FontWeight.w600,
                           color: Colors.white,
@@ -6789,3 +6882,4 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
+
