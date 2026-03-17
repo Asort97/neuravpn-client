@@ -36,6 +36,7 @@ import 'widgets/add_profile_dialog.dart';
 import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
+import 'widgets/neura_ui.dart';
 import 'widgets/loading_screen.dart';
 
 @visibleForTesting
@@ -164,22 +165,9 @@ class VpnApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = ColorScheme.fromSeed(
-      seedColor: const Color(0xFFFF1E3C),
-      brightness: Brightness.dark,
-    );
     return MaterialApp(
       title: 'neuravpn',
-      theme: ThemeData(
-        colorScheme: colorScheme,
-        scaffoldBackgroundColor: const Color(0xFF050608),
-        useMaterial3: true,
-        inputDecorationTheme: const InputDecorationTheme(
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.all(Radius.circular(16)),
-          ),
-        ),
-      ),
+      theme: NeuraUi.buildTheme(),
       scrollBehavior: const _AppScrollBehavior(),
       home: VlessHomePage(initialLaunchArgs: initialLaunchArgs),
     );
@@ -248,13 +236,18 @@ class _VlessHomePageState extends State<VlessHomePage>
   final List<String> _pendingLogLines = <String>[];
   bool _trafficFetchInProgress = false;
   final List<double> _trafficHistory = <double>[];
-  StreamSubscription<int>? _trafficSub;
+  final List<double> _trafficUplinkHistory = <double>[];
+  final List<double> _trafficDownlinkHistory = <double>[];
+  int _latestUplinkBps = 0;
+  int _latestDownlinkBps = 0;
+  StreamSubscription<TrafficSample>? _trafficSub;
   final TrayManager _trayManager = TrayManager.instance;
   bool _trayInitialized = false;
   bool _isExitingApp = false;
   bool _isConnecting = false;
   bool _isDisconnecting = false;
   bool _connectButtonHovered = false;
+  bool _connectButtonPressed = false;
   bool _hasSubscriptions = false;
   bool _trayPopupMode = false;
   OverlayEntry? _trayOverlayEntry;
@@ -448,11 +441,11 @@ class _VlessHomePageState extends State<VlessHomePage>
     );
     _connectGlowController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1800),
+      duration: const Duration(milliseconds: 2600),
     );
     _connectGlowAnimation = CurvedAnimation(
       parent: _connectGlowController,
-      curve: Curves.easeInOutCubic,
+      curve: Curves.linear,
     );
     _updateConnectGlowTicker();
     if (_isWindowsShellPlatform) {
@@ -630,96 +623,63 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   void _showUpdateDialog(UpdateCheckResult result) {
     if (!mounted) return;
-    showDialog(
+    showNeuraDialog(
       context: context,
       builder: (ctx) => Dialog(
         backgroundColor: Colors.transparent,
         insetPadding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
-        child: Container(
-          padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            color: _neuraCardColor,
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: Colors.white.withOpacity(0.08)),
+        child: NeuraOverlayDialog(
+          title: const Text(
+            '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435',
           ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(_updateDismissedTagKey, result.latestTag);
+                if (ctx.mounted) Navigator.of(ctx).pop();
+              },
+              child: const Text('\u041f\u043e\u0437\u0436\u0435'),
+            ),
+            FilledButton(
+              onPressed: () {
+                _openUrl(result.releaseUrl.toString());
+                Navigator.of(ctx).pop();
+              },
+              child: const Text(
+                '\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437',
+              ),
+            ),
+          ],
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w700,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(height: 10),
               Text(
                 '\u0412\u0435\u0440\u0441\u0438\u044f ${result.latestVersion} \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 (\u0443 \u0432\u0430\u0441 ${result.currentVersion}).',
-                style: TextStyle(color: Colors.white.withOpacity(0.75)),
+                style: TextStyle(color: Colors.white.withOpacity(0.75), height: 1.3),
               ),
               if (result.releaseNotes.trim().isNotEmpty) ...[
                 const SizedBox(height: 12),
-                Container(
+                ConstrainedBox(
                   constraints: const BoxConstraints(maxHeight: 220),
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: _neuraSurface,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: Colors.white.withOpacity(0.06)),
-                  ),
-                  child: SingleChildScrollView(
-                    child: Text(
-                      result.releaseNotes,
-                      style: TextStyle(
-                        color: Colors.white.withOpacity(0.7),
-                        height: 1.35,
+                  child: NeuraGlassSurface(
+                    borderRadius: 18,
+                    blur: 18,
+                    padding: const EdgeInsets.all(12),
+                    fillColor: _neuraSurface.withOpacity(0.4),
+                    child: SingleChildScrollView(
+                      child: Text(
+                        result.releaseNotes,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.7),
+                          height: 1.35,
+                        ),
                       ),
                     ),
                   ),
                 ),
               ],
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  TextButton(
-                    onPressed: () async {
-                      final prefs = await SharedPreferences.getInstance();
-                      await prefs.setString(
-                        _updateDismissedTagKey,
-                        result.latestTag,
-                      );
-                      if (ctx.mounted) Navigator.of(ctx).pop();
-                    },
-                    style: TextButton.styleFrom(
-                      foregroundColor: Colors.white70,
-                    ),
-                    child: const Text('\u041f\u043e\u0437\u0436\u0435'),
-                  ),
-                  const Spacer(),
-                  FilledButton(
-                    onPressed: () {
-                      _openUrl(result.releaseUrl.toString());
-                      Navigator.of(ctx).pop();
-                    },
-                    style: FilledButton.styleFrom(
-                      backgroundColor: _neuraRed,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 18,
-                        vertical: 12,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
-                    child: const Text(
-                      '\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437',
-                    ),
-                  ),
-                ],
-              ),
             ],
           ),
         ),
@@ -798,10 +758,8 @@ class _VlessHomePageState extends State<VlessHomePage>
       );
       return;
     }
-    final package = await showModalBottomSheet<String>(
+    final package = await showNeuraBottomSheet<String>(
       context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
       builder: (ctx) => _AndroidAppPickerSheet(apps: apps),
     );
     if (package == null || package.isEmpty) return;
@@ -1055,12 +1013,8 @@ $regItems = foreach ($rp in $regPaths) {
     }
     if (!mounted) return;
     final apps = _windowsInstalledApps;
-    final path = await showModalBottomSheet<String>(
+    final path = await showNeuraBottomSheet<String>(
       context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      backgroundColor: Colors.transparent,
-      barrierColor: Colors.black.withOpacity(0.55),
       builder: (ctx) => _WindowsAppPickerSheet(
         apps: apps,
         errorMessage: _windowsAppLoadError,
@@ -1208,13 +1162,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _showFastSnack(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
+    showNeuraToast(context, message);
   }
 
   void _dismissLoadingScreen() {
@@ -1253,17 +1201,63 @@ $regItems = foreach ($rp in $regPaths) {
     if (_trafficSub != null) return;
     if (_trafficHistory.isEmpty) {
       _trafficHistory.addAll(List<double>.filled(20, 0));
+      _trafficUplinkHistory.addAll(List<double>.filled(20, 0));
+      _trafficDownlinkHistory.addAll(List<double>.filled(20, 0));
     }
     unawaited(_vpnCoreController.startTrafficStream());
-    _trafficSub = _vpnCoreController.trafficStream.listen((sample) {
+    _trafficSub = _vpnCoreController.trafficSampleStream.listen((sample) {
       if (!mounted) return;
       setState(() {
-        _trafficHistory.add(sample.toDouble());
-        if (_trafficHistory.length > 80) {
-          _trafficHistory.removeAt(0);
-        }
+        _appendTrafficTransition(
+          _trafficHistory,
+          sample.totalBps.toDouble(),
+          steps: 6,
+        );
+        _appendTrafficTransition(
+          _trafficUplinkHistory,
+          sample.uplinkBps.toDouble(),
+          steps: 6,
+        );
+        _appendTrafficTransition(
+          _trafficDownlinkHistory,
+          sample.downlinkBps.toDouble(),
+          steps: 6,
+        );
+        _latestUplinkBps = sample.uplinkBps;
+        _latestDownlinkBps = sample.downlinkBps;
       });
     });
+  }
+
+  void _appendTrafficTransition(
+    List<double> target,
+    double nextValue, {
+    int steps = 1,
+  }) {
+    if (target.isEmpty) {
+      target.add(nextValue);
+      return;
+    }
+    final clampedSteps = math.max(1, steps);
+    final last = target.last;
+    for (int i = 1; i <= clampedSteps; i++) {
+      final t = i / clampedSteps;
+      final interpolated = last + ((nextValue - last) * t);
+      target.add(interpolated);
+    }
+    while (target.length > 160) {
+      target.removeAt(0);
+    }
+  }
+
+  String _formatThroughput(int bytesPerSecond) {
+    if (bytesPerSecond <= 0) return '0 KB/s';
+    final kbps = bytesPerSecond / 1024;
+    if (kbps < 1024) {
+      return '${kbps.toStringAsFixed(kbps >= 100 ? 0 : 1)} KB/s';
+    }
+    final mbps = kbps / 1024;
+    return '${mbps.toStringAsFixed(mbps >= 100 ? 0 : 1)} MB/s';
   }
 
   Future<void> _stopTrafficMonitor() async {
@@ -1271,6 +1265,10 @@ $regItems = foreach ($rp in $regPaths) {
     _trafficSub = null;
     _trafficFetchInProgress = false;
     _trafficHistory.clear();
+    _trafficUplinkHistory.clear();
+    _trafficDownlinkHistory.clear();
+    _latestUplinkBps = 0;
+    _latestDownlinkBps = 0;
     await _vpnCoreController.stopTrafficStream();
     if (_isWindowsShellPlatform) {
       // Даем немного времени для полной остановки Windows traffic stream.
@@ -2168,7 +2166,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _promptSavePreset() async {
-    final name = await showDialog<String>(
+    final name = await showNeuraDialog<String>(
       context: context,
       builder: (ctx) => _PresetNameDialog(initialValue: _defaultPresetName()),
     );
@@ -2195,7 +2193,7 @@ $regItems = foreach ($rp in $regPaths) {
       _presetDirty = false;
     });
     unawaited(_persistSplitState());
-    _showFastSnack('Text');
+      _showFastSnack('Пресет сохранён');
   }
 
   void _overwriteActivePreset() {
@@ -2253,11 +2251,14 @@ $regItems = foreach ($rp in $regPaths) {
 
   Future<void> _confirmDeletePreset(SplitTunnelPreset preset) async {
     final shouldDelete =
-        await showDialog<bool>(
+        await showNeuraDialog<bool>(
           context: context,
-          builder: (ctx) => AlertDialog(
+          builder: (ctx) => NeuraOverlayDialog(
             title: const Text('Удалить пресет'),
-            content: Text('Удалить пресет "${preset.name}"?'),
+            child: Text(
+              'Удалить пресет "${preset.name}"?',
+              style: TextStyle(color: Colors.white.withOpacity(0.78)),
+            ),
             actions: [
               TextButton(
                 onPressed: () => Navigator.of(ctx).pop(false),
@@ -2354,7 +2355,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _showProfileDialog() async {
-    final result = await showDialog<Map<String, dynamic>>(
+    final result = await showNeuraDialog<Map<String, dynamic>>(
       context: context,
       builder: (ctx) => const AddProfileDialog(),
     );
@@ -2416,9 +2417,11 @@ $regItems = foreach ($rp in $regPaths) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_hasEverAddedKeyKey, true);
         setState(() => _hasEverAddedKey = true);
-        ScaffoldMessenger.of(
+        showNeuraToast(
           context,
-        ).showSnackBar(const SnackBar(content: Text('Подписка добавлена')));
+          'Подписка добавлена',
+          tone: NeuraToastTone.success,
+        );
         await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
 
@@ -2433,14 +2436,18 @@ $regItems = foreach ($rp in $regPaths) {
         );
         await _selectCurrentProfile(profile);
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Не удалось добавить: ссылка уже есть')),
+        showNeuraToast(
+          context,
+          'Не удалось добавить: ссылка уже есть',
+          tone: NeuraToastTone.warning,
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(
+      showNeuraToast(
         context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+        'Ошибка: $e',
+        tone: NeuraToastTone.error,
+      );
     }
   }
 
@@ -2832,65 +2839,67 @@ $regItems = foreach ($rp in $regPaths) {
         ? 'Лог пуст. Подключитесь к VPN для просмотра сообщений.'
         : _logLines.join('\n');
     final controller = ScrollController();
-    await showDialog(
+    await showNeuraDialog(
       context: context,
       builder: (ctx) {
         final theme = Theme.of(ctx);
-        return Dialog(
-          insetPadding: const EdgeInsets.all(16),
-          backgroundColor: theme.colorScheme.surfaceContainerHighest
-              .withOpacity(0.9),
+        return Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 1100, maxHeight: 720),
             child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(Icons.notes_rounded),
-                      const SizedBox(width: 8),
-                      const Expanded(
-                        child: Text(
-                          'Лог подключения — полноэкранно',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
+              padding: const EdgeInsets.all(16),
+              child: NeuraGlassSurface(
+                borderRadius: 30,
+                blur: 28,
+                padding: const EdgeInsets.all(20),
+                fillColor: theme.colorScheme.surfaceContainerHighest.withOpacity(
+                  0.82,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.notes_rounded),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            'Лог подключения — полноэкранно',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                            ),
                           ),
                         ),
-                      ),
-                      IconButton(
-                        tooltip: 'Скопировать лог',
-                        onPressed: () async {
-                          await Clipboard.setData(ClipboardData(text: logText));
-                          if (mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Лог скопирован в буфер'),
-                                duration: Duration(seconds: 2),
-                              ),
-                            );
-                          }
-                        },
-                        icon: const Icon(Icons.copy_all_outlined),
-                      ),
-                      IconButton(
-                        tooltip: 'Закрыть',
-                        onPressed: () => Navigator.of(ctx).pop(),
-                        icon: const Icon(Icons.close_rounded),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  Expanded(
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.surface.withOpacity(0.4),
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                      child: Padding(
+                        IconButton(
+                          tooltip: 'Скопировать лог',
+                          onPressed: () async {
+                            await Clipboard.setData(ClipboardData(text: logText));
+                            if (mounted) {
+                              showNeuraToast(
+                                context,
+                                'Лог скопирован в буфер',
+                                tone: NeuraToastTone.success,
+                              );
+                            }
+                          },
+                          icon: const Icon(Icons.copy_all_outlined),
+                        ),
+                        IconButton(
+                          tooltip: 'Закрыть',
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          icon: const Icon(Icons.close_rounded),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Expanded(
+                      child: NeuraGlassSurface(
+                        borderRadius: 20,
+                        blur: 18,
                         padding: const EdgeInsets.all(12),
+                        fillColor: theme.colorScheme.surface.withOpacity(0.24),
                         child: Scrollbar(
                           thumbVisibility: true,
                           controller: controller,
@@ -2902,14 +2911,15 @@ $regItems = foreach ($rp in $regPaths) {
                                 fontFamily: 'monospace',
                                 fontSize: 13,
                                 height: 1.25,
+                                color: Colors.white,
                               ),
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -2919,34 +2929,41 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _showConfigDialog(BuildContext context) {
-    showDialog(
+    showNeuraDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => NeuraOverlayDialog(
         title: const Text('Конфигурация VPN core'),
-        insetPadding: EdgeInsets.symmetric(
-          horizontal: (Platform.isAndroid || Platform.isIOS) ? 12 : 40,
-          vertical: 24,
-        ),
-        content: SizedBox(
-          width: math.min(MediaQuery.of(ctx).size.width, 900),
-          child: Scrollbar(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  _generatedConfig ?? '',
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
-                ),
-              ),
-            ),
-          ),
-        ),
+        width: math.min(MediaQuery.of(ctx).size.width - 24, 920),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(),
             child: const Text('Закрыть'),
           ),
         ],
+        child: SizedBox(
+          width: math.min(MediaQuery.of(ctx).size.width, 900),
+          child: NeuraGlassSurface(
+            borderRadius: 18,
+            blur: 18,
+            padding: const EdgeInsets.all(12),
+            fillColor: Colors.white.withOpacity(0.03),
+            child: Scrollbar(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    _generatedConfig ?? '',
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 11,
+                      color: Colors.white,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -3023,51 +3040,54 @@ $regItems = foreach ($rp in $regPaths) {
                   children: [
                     Padding(
                       padding: const EdgeInsets.fromLTRB(16, 8, 16, 6),
-                      child: Row(
-                        children: [
-                          SizedBox(
-                            width: 38,
-                            height: 38,
-                            child: Image.asset(
-                              'assets/images/11zon_cropped.png',
-                              fit: BoxFit.contain,
-                              filterQuality: FilterQuality.high,
-                            ),
+                      child: NeuraReveal(
+                        child: NeuraGlassSurface(
+                          expand: true,
+                          borderRadius: 22,
+                          blur: 22,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 10,
                           ),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Text(
-                              'neuravpn',
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                                letterSpacing: 0.2,
+                          child: Row(
+                            children: [
+                              SizedBox(
+                                width: 38,
+                                height: 38,
+                                child: Image.asset(
+                                  'assets/images/11zon_cropped.png',
+                                  fit: BoxFit.contain,
+                                  filterQuality: FilterQuality.high,
+                                ),
                               ),
-                            ),
+                              const SizedBox(width: 10),
+                              const Expanded(
+                                child: Text(
+                                  'neuravpn',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w700,
+                                    letterSpacing: 0.2,
+                                  ),
+                                ),
+                              ),
+                              NeuraGlassPill(
+                                active: _isRunning,
+                                child: Text(
+                                  _isRunning ? 'Подключено' : 'Отключено',
+                                  style: TextStyle(
+                                    color: _isRunning
+                                        ? _neuraRed
+                                        : Colors.white70,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 10,
-                              vertical: 5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.06),
-                              borderRadius: BorderRadius.circular(999),
-                              border: Border.all(
-                                color: Colors.white.withOpacity(0.08),
-                              ),
-                            ),
-                            child: Text(
-                              _isRunning ? 'Подключено' : 'Отключено',
-                              style: TextStyle(
-                                color: _isRunning ? _neuraRed : Colors.white70,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                     if (hasConnectable)
@@ -3112,44 +3132,48 @@ $regItems = foreach ($rp in $regPaths) {
   Widget _buildMobileNeuraPage(Widget child) {
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [child, const SizedBox(height: 16), _buildWindowsFooter()],
+      child: SizedBox(
+        width: double.infinity,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            NeuraReveal(child: child),
+            const SizedBox(height: 16),
+            _buildWindowsFooter(),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildEmptyState() {
-    final theme = Theme.of(context);
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: 420),
-        child: Card(
-          color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.25),
-          elevation: 0,
-          child: Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Center(child: AnimatedEmoji(emoji: '??', size: 84)),
-                const SizedBox(height: 16),
-                FilledButton(
-                  onPressed: _showProfileDialog,
-                  child: const Text(
-                    '\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447',
-                  ),
+        child: NeuraGlassSurface(
+          padding: const EdgeInsets.all(20),
+          blur: 24,
+          glowColor: _neuraRed,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Center(child: AnimatedEmoji(emoji: '??', size: 84)),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: _showProfileDialog,
+                child: const Text(
+                  '\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447',
                 ),
-                const SizedBox(height: 12),
-                OutlinedButton(
-                  onPressed: _pasteProfileFromClipboard,
-                  child: const Text(
-                    '\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430',
-                  ),
+              ),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: _pasteProfileFromClipboard,
+                child: const Text(
+                  '\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430',
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -3206,7 +3230,7 @@ $regItems = foreach ($rp in $regPaths) {
                             ),
                             Padding(
                               padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
-                              child: _buildWindowsTitleBar(),
+                              child: NeuraReveal(child: _buildWindowsTitleBar()),
                             ),
                           ],
                         ),
@@ -3319,54 +3343,63 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Widget _buildWindowsTitleBar() {
-    return Row(
-      children: [
-        Expanded(
-          child: DragToMoveArea(
-            child: Row(
-              children: [
-                SizedBox(
-                  width: 44,
-                  height: 44,
-                  child: Image.asset(
-                    'assets/images/11zon_cropped.png',
-                    width: 44,
-                    height: 44,
-                    fit: BoxFit.contain,
-                    filterQuality: FilterQuality.high,
-                  ),
+    return SizedBox(
+      width: double.infinity,
+      child: NeuraGlassSurface(
+        expand: true,
+        borderRadius: 22,
+        blur: 24,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        child: Row(
+          children: [
+            Expanded(
+              child: DragToMoveArea(
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 44,
+                      height: 44,
+                      child: Image.asset(
+                        'assets/images/11zon_cropped.png',
+                        width: 44,
+                        height: 44,
+                        fit: BoxFit.contain,
+                        filterQuality: FilterQuality.high,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    const Text(
+                      'neuravpn',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 12),
-                const Text(
-                  'neuravpn',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
+              ),
+            ),
+            Row(
+              children: [
+                _buildWindowButton(
+                  icon: Icons.settings,
+                  onPressed: () => _setWindowsView(_WindowsView.settings),
+                ),
+                _buildWindowButton(
+                  icon: Icons.remove,
+                  onPressed: () => windowManager.minimize(),
+                ),
+                _buildWindowButton(
+                  icon: Icons.close,
+                  hoverColor: _neuraRed.withOpacity(0.2),
+                  onPressed: () => unawaited(_hideToTray(showHint: true)),
                 ),
               ],
             ),
-          ),
-        ),
-        Row(
-          children: [
-            _buildWindowButton(
-              icon: Icons.settings,
-              onPressed: () => _setWindowsView(_WindowsView.settings),
-            ),
-            _buildWindowButton(
-              icon: Icons.remove,
-              onPressed: () => windowManager.minimize(),
-            ),
-            _buildWindowButton(
-              icon: Icons.close,
-              hoverColor: _neuraRed.withOpacity(0.2),
-              onPressed: () => unawaited(_hideToTray(showHint: true)),
-            ),
           ],
         ),
-      ],
+      ),
     );
   }
 
@@ -3420,65 +3453,74 @@ $regItems = foreach ($rp in $regPaths) {
         );
         final currentView = _windowsViewAt(currentIndex);
 
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 240),
-              switchInCurve: Curves.easeOutCubic,
-              switchOutCurve: Curves.easeInCubic,
-              transitionBuilder: (child, animation) =>
-                  FadeTransition(opacity: animation, child: child),
-              child: Text(
-                _tabLabelForView(currentView),
-                key: ValueKey(currentView),
-                textAlign: TextAlign.center,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontWeight: FontWeight.w600,
+        return SizedBox(
+          width: double.infinity,
+          child: NeuraGlassSurface(
+            expand: true,
+            borderRadius: 999,
+            blur: 18,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 240),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) =>
+                    FadeTransition(opacity: animation, child: child),
+                child: Text(
+                  _tabLabelForView(currentView),
+                  key: ValueKey(currentView),
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
-            ),
-            const SizedBox(height: 10),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: _windowsViewOrder.asMap().entries.map((entry) {
-                final index = entry.key;
-                final view = entry.value;
-                final distance = (page - index).abs().clamp(0.0, 1.0);
-                final t = 1.0 - distance;
-                final size = 8.0 + 6.0 * t;
-                final isActive = _windowsView == view;
+              const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: _windowsViewOrder.asMap().entries.map((entry) {
+                  final index = entry.key;
+                  final view = entry.value;
+                  final distance = (page - index).abs().clamp(0.0, 1.0);
+                  final t = 1.0 - distance;
+                  final size = 8.0 + 6.0 * t;
+                  final isActive = _windowsView == view;
 
-                return GestureDetector(
-                  onTap: () => _setWindowsView(view),
-                  child: AnimatedContainer(
-                    duration: const Duration(milliseconds: 160),
-                    curve: Curves.easeOutCubic,
-                    width: size,
-                    height: size,
-                    margin: const EdgeInsets.symmetric(horizontal: 8),
-                    decoration: BoxDecoration(
-                      color: isActive
-                          ? _neuraRed
-                          : Colors.white.withOpacity(0.28),
-                      shape: BoxShape.circle,
-                      boxShadow: isActive
-                          ? [
-                              BoxShadow(
-                                color: _neuraRed.withOpacity(0.45),
-                                blurRadius: 8,
-                              ),
-                            ]
-                          : null,
+                  return GestureDetector(
+                    onTap: () => _setWindowsView(view),
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 160),
+                      curve: Curves.easeOutCubic,
+                      width: size,
+                      height: size,
+                      margin: const EdgeInsets.symmetric(horizontal: 8),
+                      decoration: BoxDecoration(
+                        color: isActive
+                            ? _neuraRed
+                            : Colors.white.withOpacity(0.28),
+                        shape: BoxShape.circle,
+                        boxShadow: isActive
+                            ? [
+                                BoxShadow(
+                                  color: _neuraRed.withOpacity(0.45),
+                                  blurRadius: 8,
+                                ),
+                              ]
+                            : null,
+                      ),
                     ),
-                  ),
-                );
-              }).toList(),
+                  );
+                  }).toList(),
+                ),
+              ],
             ),
-          ],
+          ),
         );
       },
     );
@@ -3487,14 +3529,17 @@ $regItems = foreach ($rp in $regPaths) {
   Widget _buildWindowsPage(Widget child) {
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const SizedBox(height: 8),
-          child,
-          const SizedBox(height: 20),
-          _buildWindowsFooter(),
-        ],
+      child: SizedBox(
+        width: double.infinity,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const SizedBox(height: 8),
+            NeuraReveal(child: child),
+            const SizedBox(height: 20),
+            _buildWindowsFooter(),
+          ],
+        ),
       ),
     );
   }
@@ -3778,14 +3823,18 @@ $regItems = foreach ($rp in $regPaths) {
     EdgeInsets padding = const EdgeInsets.all(20),
     bool repaintBoundary = true,
   }) {
-    final card = Container(
-      decoration: BoxDecoration(
-        color: _neuraCardColor,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: Colors.white.withOpacity(0.08)),
+    final card = SizedBox(
+      width: double.infinity,
+      child: NeuraGlassSurface(
+        expand: true,
+        padding: padding,
+        borderRadius: 22,
+        blur: 24,
+        animate: true,
+        fillColor: _neuraCardColor.withOpacity(0.82),
+        borderColor: Colors.white.withOpacity(0.08),
+        child: child,
       ),
-      padding: padding,
-      child: child,
     );
     if (!repaintBoundary) {
       return card;
@@ -3821,11 +3870,13 @@ $regItems = foreach ($rp in $regPaths) {
         ? 'VLESS'
         : 'VLESS / ${(link.type ?? 'tcp').toUpperCase()}';
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
+    final throughputLabel =
+        'IN ${_formatThroughput(_latestDownlinkBps)}  •  OUT ${_formatThroughput(_latestUplinkBps)}';
 
     return _neuraCard(
       child: Stack(
         children: [
-          if (isRunning)
+          if (isRunning || _isConnecting)
             Positioned.fill(
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(20),
@@ -3833,13 +3884,28 @@ $regItems = foreach ($rp in $regPaths) {
                   children: [
                     CustomPaint(
                       painter: _TrafficGraphPainter(
-                        samples: List<double>.from(_trafficHistory),
+                        uplinkSamples: List<double>.from(_trafficUplinkHistory),
+                        downlinkSamples: List<double>.from(
+                          _trafficDownlinkHistory,
+                        ),
+                        progress: _connectGlowAnimation.value,
+                        color: _neuraRed,
+                        emphasizeBackground: true,
                       ),
                       child: const SizedBox.expand(),
                     ),
-                    BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
-                      child: Container(color: Colors.white.withOpacity(0.02)),
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topCenter,
+                          end: Alignment.bottomCenter,
+                          colors: [
+                            Colors.black.withOpacity(0.06),
+                            Colors.transparent,
+                            Colors.black.withOpacity(0.16),
+                          ],
+                        ),
+                      ),
                     ),
                   ],
                 ),
@@ -3849,14 +3915,17 @@ $regItems = foreach ($rp in $regPaths) {
             Positioned.fill(
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(20),
-                child: BackdropFilter(
-                  filter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
-                  child: CustomPaint(
-                    painter: _ConnectionWavePainter(
-                      progress: _connectGlowAnimation.value,
-                      color: _neuraRed,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: RadialGradient(
+                      center: const Alignment(0, -0.12),
+                      radius: 1.0,
+                      colors: [
+                        _neuraRed.withOpacity(0.06),
+                        Colors.transparent,
+                      ],
+                      stops: const [0.0, 1.0],
                     ),
-                    child: Container(color: Colors.white.withOpacity(0.02)),
                   ),
                 ),
               ),
@@ -3883,9 +3952,27 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                   const SizedBox(width: 10),
                   Expanded(
-                    child: Text(
-                      statusText,
-                      style: const TextStyle(color: Colors.white70),
+                    child: AnimatedSwitcher(
+                      duration: NeuraUi.fast,
+                      switchInCurve: NeuraUi.curve,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0, 0.08),
+                              end: Offset.zero,
+                            ).animate(animation),
+                            child: child,
+                          ),
+                        );
+                      },
+                      child: Text(
+                        statusText,
+                        key: ValueKey(statusText),
+                        style: const TextStyle(color: Colors.white70),
+                      ),
                     ),
                   ),
                   if (isRunning)
@@ -3902,8 +3989,34 @@ $regItems = foreach ($rp in $regPaths) {
                   cursor: canInteract
                       ? SystemMouseCursors.click
                       : SystemMouseCursors.basic,
+                  onEnter: (_) {
+                    if (!_connectButtonHovered) {
+                      setState(() => _connectButtonHovered = true);
+                    }
+                  },
+                  onExit: (_) {
+                    if (_connectButtonHovered || _connectButtonPressed) {
+                      setState(() {
+                        _connectButtonHovered = false;
+                        _connectButtonPressed = false;
+                      });
+                    }
+                  },
                   child: GestureDetector(
                     behavior: HitTestBehavior.opaque,
+                    onTapDown: canInteract
+                        ? (_) => setState(() => _connectButtonPressed = true)
+                        : null,
+                    onTapUp: (_) {
+                      if (_connectButtonPressed) {
+                        setState(() => _connectButtonPressed = false);
+                      }
+                    },
+                    onTapCancel: () {
+                      if (_connectButtonPressed) {
+                        setState(() => _connectButtonPressed = false);
+                      }
+                    },
                     onTap: canInteract
                         ? () => _onMainConnectButtonPressed(
                             isEnabled: isEnabled,
@@ -3915,15 +4028,23 @@ $regItems = foreach ($rp in $regPaths) {
                       builder: (context, child) {
                         final rotation =
                             _connectGlowAnimation.value * 2 * math.pi;
-                        final pulse = _isConnecting
-                            ? 1 + 0.04 * math.sin(rotation)
+                        final interactionScale = _connectButtonPressed
+                            ? 0.95
+                            : _connectButtonHovered
+                            ? 1.04
                             : 1.0;
+                        final pulse = _isConnecting
+                            ? 1 + 0.03 * math.sin(rotation)
+                            : (isRunning ? 1 + 0.012 * math.sin(rotation) : 1.0);
                         final ring = Container(
                           width: 140,
                           height: 140,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            border: Border.all(color: statusColor, width: 2),
+                            border: Border.all(
+                              color: statusColor.withOpacity(0.9),
+                              width: 1.8,
+                            ),
                           ),
                         );
                         return Opacity(
@@ -3931,14 +4052,51 @@ $regItems = foreach ($rp in $regPaths) {
                               ? 1
                               : 0.5,
                           child: Transform.scale(
-                            scale: pulse,
+                            scale: pulse * interactionScale,
                             child: Stack(
                               alignment: Alignment.center,
                               children: [
+                                AnimatedContainer(
+                                  duration: NeuraUi.fast,
+                                  width: 176,
+                                  height: 176,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    gradient: RadialGradient(
+                                      colors: [
+                                        _neuraRed.withOpacity(
+                                          _isConnecting
+                                              ? 0.16
+                                              : (isRunning ? 0.12 : 0.04),
+                                        ),
+                                        Colors.transparent,
+                                      ],
+                                      stops: const [0.0, 0.72],
+                                    ),
+                                  ),
+                                ),
                                 if (_isConnecting)
-                                  Transform.rotate(angle: rotation, child: ring)
+                                  Transform.rotate(
+                                    angle: rotation,
+                                    child: ring,
+                                  )
                                 else
                                   ring,
+                                AnimatedContainer(
+                                  duration: NeuraUi.fast,
+                                  width: 154,
+                                  height: 154,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: _neuraRed.withOpacity(
+                                        _connectButtonHovered || _isConnecting
+                                            ? 0.35
+                                            : 0.12,
+                                      ),
+                                    ),
+                                  ),
+                                ),
                                 if (isRunning)
                                   Container(
                                     width: 140,
@@ -3959,17 +4117,44 @@ $regItems = foreach ($rp in $regPaths) {
                                   height: 104,
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
-                                    color: isRunning
-                                        ? _neuraRed
-                                        : _neuraSurface,
+                                    gradient: RadialGradient(
+                                      colors: [
+                                        (isRunning ? _neuraRed : _neuraSurface)
+                                            .withOpacity(0.98),
+                                        (isRunning
+                                                ? const Color(0xFFD92F2F)
+                                                : const Color(0xFF1C1E22))
+                                            .withOpacity(0.98),
+                                      ],
+                                      stops: const [0.0, 1.0],
+                                    ),
+                                    boxShadow: [
+                                      BoxShadow(
+                                        color: _neuraRed.withOpacity(
+                                          isRunning
+                                              ? 0.34
+                                              : (_connectButtonHovered ? 0.16 : 0.08),
+                                        ),
+                                        blurRadius: _connectButtonPressed ? 16 : 24,
+                                        spreadRadius: _connectButtonHovered ? 1 : 0,
+                                      ),
+                                    ],
                                   ),
                                   child: Center(
-                                    child: Image.asset(
-                                      'assets/images/logo.png',
-                                      width: 48,
-                                      height: 48,
-                                      color: Colors.white,
-                                      filterQuality: FilterQuality.high,
+                                    child: AnimatedScale(
+                                      duration: NeuraUi.fast,
+                                      scale: _connectButtonPressed ? 0.92 : 1.0,
+                                      child: AnimatedRotation(
+                                        duration: NeuraUi.normal,
+                                        turns: _isConnecting ? 0.0125 : 0,
+                                        child: Image.asset(
+                                          'assets/images/logo.png',
+                                          width: 48,
+                                          height: 48,
+                                          color: Colors.white,
+                                          filterQuality: FilterQuality.high,
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -3983,10 +4168,49 @@ $regItems = foreach ($rp in $regPaths) {
                 ),
               ),
               const SizedBox(height: 16),
-              Text(
-                statusHint,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white54),
+              AnimatedSwitcher(
+                duration: NeuraUi.fast,
+                switchInCurve: NeuraUi.curve,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0, 0.08),
+                        end: Offset.zero,
+                      ).animate(animation),
+                      child: child,
+                    ),
+                  );
+                },
+                child: Text(
+                  statusHint,
+                  key: ValueKey(statusHint),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white54),
+                ),
+              ),
+              const SizedBox(height: 8),
+              AnimatedSwitcher(
+                duration: NeuraUi.fast,
+                switchInCurve: NeuraUi.curve,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) => FadeTransition(
+                  opacity: animation,
+                  child: child,
+                ),
+                child: Text(
+                  throughputLabel,
+                  key: ValueKey(throughputLabel),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.62),
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.2,
+                  ),
+                ),
               ),
               if (isRunning) ...[
                 const SizedBox(height: 20),
@@ -4009,9 +4233,20 @@ $regItems = foreach ($rp in $regPaths) {
                               ],
                             ),
                             const SizedBox(height: 6),
-                            Text(
-                              pingLabel,
-                              style: const TextStyle(color: Colors.white),
+                            AnimatedSwitcher(
+                              duration: NeuraUi.fast,
+                              switchInCurve: NeuraUi.curve,
+                              switchOutCurve: Curves.easeInCubic,
+                              transitionBuilder: (child, animation) =>
+                                  FadeTransition(
+                                    opacity: animation,
+                                    child: child,
+                                  ),
+                              child: Text(
+                                pingLabel,
+                                key: ValueKey(pingLabel),
+                                style: const TextStyle(color: Colors.white),
+                              ),
                             ),
                           ],
                         ),
@@ -4039,9 +4274,20 @@ $regItems = foreach ($rp in $regPaths) {
                               ],
                             ),
                             const SizedBox(height: 6),
-                            Text(
-                              protocolLabel,
-                              style: const TextStyle(color: Colors.white),
+                            AnimatedSwitcher(
+                              duration: NeuraUi.fast,
+                              switchInCurve: NeuraUi.curve,
+                              switchOutCurve: Curves.easeInCubic,
+                              transitionBuilder: (child, animation) =>
+                                  FadeTransition(
+                                    opacity: animation,
+                                    child: child,
+                                  ),
+                              child: Text(
+                                protocolLabel,
+                                key: ValueKey(protocolLabel),
+                                style: const TextStyle(color: Colors.white),
+                              ),
                             ),
                           ],
                         ),
@@ -4147,61 +4393,22 @@ $regItems = foreach ($rp in $regPaths) {
                 tooltip: 'Что это?',
                 icon: const Icon(Icons.help_outline, color: Colors.white70),
                 onPressed: () {
-                  showDialog(
+                  showNeuraDialog(
                     context: context,
-                    builder: (ctx) => Dialog(
-                      backgroundColor: Colors.transparent,
-                      insetPadding: const EdgeInsets.symmetric(
-                        horizontal: 28,
-                        vertical: 24,
-                      ),
-                      child: Container(
-                        padding: const EdgeInsets.all(20),
-                        decoration: BoxDecoration(
-                          color: _neuraCardColor,
-                          borderRadius: BorderRadius.circular(24),
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.08),
-                          ),
+                    builder: (ctx) => NeuraOverlayDialog(
+                      title: const Text('Умная маршрутизация'),
+                      actions: [
+                        FilledButton(
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          child: const Text('Понятно'),
                         ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Умная маршрутизация',
-                              style: TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.white,
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            Text(
-                              'Некоторые сайты, где VPN не нужен, открываются без него.\n'
-                              'А сайты, которым нужен VPN, идут через него.',
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(0.75),
-                                height: 1.35,
-                              ),
-                            ),
-                            const SizedBox(height: 16),
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: FilledButton(
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: _neuraRed,
-                                  foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 18,
-                                    vertical: 10,
-                                  ),
-                                ),
-                                onPressed: () => Navigator.of(ctx).pop(),
-                                child: const Text('Понятно'),
-                              ),
-                            ),
-                          ],
+                      ],
+                      child: Text(
+                        'Некоторые сайты, где VPN не нужен, открываются без него.\n'
+                        'А сайты, которым нужен VPN, идут через него.',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.75),
+                          height: 1.35,
                         ),
                       ),
                     ),
@@ -4298,67 +4505,25 @@ $regItems = foreach ($rp in $regPaths) {
                 tooltip: 'Что это?',
                 icon: const Icon(Icons.help_outline, color: Colors.white70),
                 onPressed: () {
-                  showDialog(
+                  showNeuraDialog(
                     context: context,
-                    builder: (ctx) => Dialog(
-                      backgroundColor: Colors.transparent,
-                      insetPadding: const EdgeInsets.symmetric(
-                        horizontal: 28,
-                        vertical: 24,
-                      ),
-                      child: Container(
-                        padding: const EdgeInsets.all(20),
-                        decoration: BoxDecoration(
-                          color: _neuraCardColor,
-                          borderRadius: BorderRadius.circular(24),
-                          border: Border.all(
-                            color: Colors.white.withOpacity(0.08),
-                          ),
+                    builder: (ctx) => NeuraOverlayDialog(
+                      title: const Text('Раздельное туннелирование'),
+                      actions: [
+                        FilledButton(
+                          onPressed: () => Navigator.of(ctx).pop(),
+                          child: const Text('Понятно'),
                         ),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'Раздельное туннелирование',
-                              style: TextStyle(
-                                fontSize: 18,
-                                fontWeight: FontWeight.w700,
-                                color: Colors.white,
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            Text(
-                              'Вы выбираете, что идёт через VPN, а что — напрямую.\n\n'
-                              'Белый список: через VPN идут только выбранные домены/приложения.\n'
-                              'Всё остальное — напрямую.\n\n'
-                              'Чёрный список: выбранные домены/приложения идут напрямую.\n'
-                              'Всё остальное — через VPN.',
-                              style: TextStyle(
-                                color: Colors.white.withOpacity(0.75),
-                                height: 1.35,
-                              ),
-                            ),
-                            const SizedBox(height: 16),
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: FilledButton(
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: _neuraRed,
-                                  foregroundColor: Colors.white,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 18,
-                                    vertical: 10,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                ),
-                                onPressed: () => Navigator.of(ctx).pop(),
-                                child: const Text('Понятно'),
-                              ),
-                            ),
-                          ],
+                      ],
+                      child: Text(
+                        'Вы выбираете, что идёт через VPN, а что — напрямую.\n\n'
+                        'Белый список: через VPN идут только выбранные домены/приложения.\n'
+                        'Всё остальное — напрямую.\n\n'
+                        'Чёрный список: выбранные домены/приложения идут напрямую.\n'
+                        'Всё остальное — через VPN.',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.75),
+                          height: 1.35,
                         ),
                       ),
                     ),
@@ -5337,9 +5502,24 @@ $regItems = foreach ($rp in $regPaths) {
                 isRunning: isRunning,
               )
             : null,
+        onTapDown: canInteract
+            ? (_) => setState(() => _connectButtonPressed = true)
+            : null,
+        onTapUp: (_) {
+          if (_connectButtonPressed) {
+            setState(() => _connectButtonPressed = false);
+          }
+        },
+        onTapCancel: () {
+          if (_connectButtonPressed) {
+            setState(() => _connectButtonPressed = false);
+          }
+        },
         child: AnimatedScale(
-          scale: _connectButtonHovered && canInteract ? 1.08 : 1.0,
-          duration: const Duration(milliseconds: 150),
+          scale: _connectButtonPressed
+              ? 0.95
+              : (_connectButtonHovered && canInteract ? 1.08 : 1.0),
+          duration: NeuraUi.micro,
           child: AnimatedBuilder(
             animation: _connectGlowController,
             builder: (context, child) {
@@ -5375,16 +5555,20 @@ $regItems = foreach ($rp in $regPaths) {
                     boxShadow: [
                       BoxShadow(
                         color: scheme.primary.withOpacity(
-                          isRunning ? 0.35 : 0.12,
+                          isRunning
+                              ? 0.35
+                              : (_connectButtonHovered ? 0.18 : 0.12),
                         ),
-                        blurRadius: isRunning ? 28 : 18,
-                        spreadRadius: isRunning ? 2 : 0,
+                        blurRadius: _connectButtonPressed
+                            ? 16
+                            : (isRunning ? 28 : 18),
+                        spreadRadius: isRunning || _connectButtonHovered ? 2 : 0,
                       ),
                     ],
                   ),
                   child: Center(
                     child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 250),
+                      duration: NeuraUi.fast,
                       width: buttonSize * 0.7,
                       height: buttonSize * 0.7,
                       decoration: BoxDecoration(
@@ -5870,7 +6054,7 @@ $regItems = foreach ($rp in $regPaths) {
     required String hint,
     required void Function(String value) onSubmit,
   }) async {
-    final value = await showDialog<String>(
+    final value = await showNeuraDialog<String>(
       context: context,
       builder: (ctx) => _SplitEntryDialog(title: title, hint: hint),
     );
@@ -6122,9 +6306,9 @@ $regItems = foreach ($rp in $regPaths) {
 
     Widget buildItem(String domain, ConnectivityTestResult result) {
       final color = switch (result.status) {
-        'ok' => Colors.green,
-        'timeout' => Colors.orange,
-        _ => Colors.red,
+        'ok' => NeuraUi.success,
+        'timeout' => NeuraUi.warning,
+        _ => NeuraUi.danger,
       };
       final timeLabel = result.durationMs != null
           ? '${result.durationMs} мс'
@@ -6153,7 +6337,7 @@ $regItems = foreach ($rp in $regPaths) {
               if (running)
                 const Text(
                   'Выполняется...',
-                  style: TextStyle(color: Colors.orange),
+                  style: TextStyle(color: NeuraUi.warning),
                 ),
             ],
           ),
@@ -6242,13 +6426,8 @@ class _SplitEntryDialogState extends State<_SplitEntryDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
+    return NeuraOverlayDialog(
       title: Text(widget.title),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        decoration: InputDecoration(hintText: widget.hint),
-      ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
@@ -6263,6 +6442,11 @@ class _SplitEntryDialogState extends State<_SplitEntryDialog> {
           child: const Text('Добавить'),
         ),
       ],
+      child: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: InputDecoration(hintText: widget.hint),
+      ),
     );
   }
 }
@@ -6293,13 +6477,8 @@ class _PresetNameDialogState extends State<_PresetNameDialog> {
 
   @override
   Widget build(BuildContext context) {
-    return AlertDialog(
+    return NeuraOverlayDialog(
       title: const Text('Сохранить пресет'),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        decoration: const InputDecoration(labelText: 'Название пресета'),
-      ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
@@ -6314,6 +6493,11 @@ class _PresetNameDialogState extends State<_PresetNameDialog> {
           child: const Text('Сохранить'),
         ),
       ],
+      child: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(labelText: 'Название пресета'),
+      ),
     );
   }
 }
@@ -6564,125 +6748,217 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
   }
 }
 
-class _ConnectionWavePainter extends CustomPainter {
-  _ConnectionWavePainter({required this.progress, required this.color});
+class _TrafficGraphPainter extends CustomPainter {
+  _TrafficGraphPainter({
+    required this.uplinkSamples,
+    required this.downlinkSamples,
+    required this.progress,
+    required this.color,
+    this.emphasizeBackground = false,
+  });
 
+  final List<double> uplinkSamples;
+  final List<double> downlinkSamples;
   final double progress;
   final Color color;
+  final bool emphasizeBackground;
 
   @override
   void paint(Canvas canvas, Size size) {
-    final basePaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2
-      ..color = color.withOpacity(0.35);
-    final accentPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.6
-      ..color = color.withOpacity(0.6);
-    final dashedPaint = Paint()
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1
-      ..color = color.withOpacity(0.18);
+    if (uplinkSamples.isEmpty && downlinkSamples.isEmpty) return;
 
-    final midY = size.height * 0.42;
-    final topY = size.height * 0.22;
-    final bottomY = size.height * 0.62;
-
-    _drawWave(canvas, size, midY, progress * 2 * math.pi, basePaint);
-    _drawWave(
-      canvas,
-      size,
-      topY,
-      progress * 2 * math.pi + 1.4,
-      dashedPaint,
-      dash: true,
-    );
-    _drawWave(canvas, size, bottomY, progress * 2 * math.pi + 2.2, accentPaint);
-  }
-
-  void _drawWave(
-    Canvas canvas,
-    Size size,
-    double y,
-    double phase,
-    Paint paint, {
-    bool dash = false,
-  }) {
-    final path = Path();
-    final amplitude = size.height * 0.03;
-    for (double x = 0; x <= size.width; x += 4) {
-      final dy = math.sin((x / size.width * 2 * math.pi) + phase) * amplitude;
-      if (x == 0) {
-        path.moveTo(x, y + dy);
-      } else {
-        path.lineTo(x, y + dy);
-      }
-    }
-    if (!dash) {
-      canvas.drawPath(path, paint);
-      return;
-    }
-    final metrics = path.computeMetrics();
-    for (final metric in metrics) {
-      var distance = 0.0;
-      while (distance < metric.length) {
-        final next = math.min(distance + 12, metric.length);
-        canvas.drawPath(metric.extractPath(distance, next), paint);
-        distance = next + 8;
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _ConnectionWavePainter oldDelegate) {
-    return oldDelegate.progress != progress || oldDelegate.color != color;
-  }
-}
-
-class _TrafficGraphPainter extends CustomPainter {
-  _TrafficGraphPainter({required this.samples});
-
-  final List<double> samples;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final baseline = size.height * 0.7;
-    final width = size.width - 24;
     final startX = 12.0;
-    final spikePaint = Paint()
+    final width = size.width - 24;
+    final topY = size.height * 0.16;
+    final bottomY = size.height * 0.84;
+    final chartHeight = bottomY - topY;
+    final centerY = topY + chartHeight * 0.5;
+    final maxUp = uplinkSamples.isEmpty ? 0.0 : uplinkSamples.reduce(math.max);
+    final maxDown = downlinkSamples.isEmpty
+        ? 0.0
+        : downlinkSamples.reduce(math.max);
+    final maxSample = math.max(maxUp, maxDown);
+    final maxScale = math.max(32 * 1024.0, maxSample);
+    final virtualLength = math.max(
+      2,
+      math.max(uplinkSamples.length, downlinkSamples.length),
+    );
+    final xStep = width / 90;
+
+    final gridPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.6
+      ..strokeWidth = 0.8
+      ..color = Colors.white.withOpacity(emphasizeBackground ? 0.1 : 0.06);
+    final centerPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.1
+      ..color = Colors.white.withOpacity(emphasizeBackground ? 0.16 : 0.1);
+    for (int i = 0; i <= 4; i++) {
+      final y = topY + (chartHeight / 4 * i);
+      canvas.drawLine(Offset(startX, y), Offset(startX + width, y), gridPaint);
+    }
+    canvas.drawLine(
+      Offset(startX, centerY),
+      Offset(startX + width, centerY),
+      centerPaint,
+    );
+
+    final downColor = const Color(0xFFFB7185);
+    final upColor = const Color(0xFFEF4444);
+    final uplinkGlowPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = emphasizeBackground ? 5.5 : 4
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10)
+      ..color = upColor.withOpacity(emphasizeBackground ? 0.12 : 0.08);
+    final downlinkGlowPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = emphasizeBackground ? 5.5 : 4
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10)
+      ..color = downColor.withOpacity(
+        emphasizeBackground ? 0.12 : 0.08,
+      );
+    final uplinkPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = emphasizeBackground ? 2.1 : 1.8
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
       ..shader = LinearGradient(
         colors: [
-          const Color(0xFF00E676).withOpacity(0.7),
-          const Color(0xFFFFD54F).withOpacity(0.9),
+          upColor.withOpacity(emphasizeBackground ? 0.28 : 0.18),
+          upColor.withOpacity(0.95),
+          upColor.withOpacity(emphasizeBackground ? 0.34 : 0.22),
         ],
-        begin: Alignment.bottomCenter,
-        end: Alignment.topCenter,
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
       ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
+    final downlinkPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = emphasizeBackground ? 2.1 : 1.8
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..shader = LinearGradient(
+        colors: [
+          downColor.withOpacity(emphasizeBackground ? 0.26 : 0.16),
+          const Color(0xFFFFD1DC).withOpacity(0.92),
+          downColor.withOpacity(emphasizeBackground ? 0.3 : 0.2),
+        ],
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+      ).createShader(Rect.fromLTWH(0, 0, size.width, size.height));
+    final uplinkPath = Path();
+    final uplinkFillPath = Path();
+    final downlinkPath = Path();
+    final downlinkFillPath = Path();
+    bool hasUplink = false;
+    bool hasDownlink = false;
 
-    if (samples.isEmpty) return;
-    final maxSample = samples.reduce(math.max);
-    final scale = maxSample <= 0 ? 0 : (size.height * 0.45) / maxSample;
-    final step = width / math.max(1, samples.length - 1);
+    for (double x = 0; x <= width; x += xStep) {
+      final position = (x / width) * (virtualLength - 1);
+      final upSample = _sampleAt(uplinkSamples, position);
+      final downSample = _sampleAt(downlinkSamples, position);
+      final normalizedUp = (upSample / maxScale).clamp(0.0, 1.0);
+      final normalizedDown = (downSample / maxScale).clamp(0.0, 1.0);
 
-    final path = Path();
-    for (int i = 0; i < samples.length; i++) {
-      final x = startX + step * i;
-      final y = baseline - (samples[i] * scale);
-      if (i == 0) {
-        path.moveTo(x, y);
+      final screenX = startX + x;
+      final uplinkY = centerY + (normalizedUp * (chartHeight * 0.42));
+      final downlinkY = centerY - (normalizedDown * (chartHeight * 0.42));
+
+      if (!hasUplink) {
+        uplinkPath.moveTo(screenX, uplinkY);
+        uplinkFillPath.moveTo(screenX, centerY);
+        uplinkFillPath.lineTo(screenX, uplinkY);
+        hasUplink = true;
       } else {
-        path.lineTo(x, y);
+        uplinkPath.lineTo(screenX, uplinkY);
+        uplinkFillPath.lineTo(screenX, uplinkY);
+      }
+
+      if (!hasDownlink) {
+        downlinkPath.moveTo(screenX, downlinkY);
+        downlinkFillPath.moveTo(screenX, centerY);
+        downlinkFillPath.lineTo(screenX, downlinkY);
+        hasDownlink = true;
+      } else {
+        downlinkPath.lineTo(screenX, downlinkY);
+        downlinkFillPath.lineTo(screenX, downlinkY);
       }
     }
-    canvas.drawPath(path, spikePaint);
+
+    uplinkFillPath
+      ..lineTo(startX + width, centerY)
+      ..close();
+    downlinkFillPath
+      ..lineTo(startX + width, centerY)
+      ..close();
+    final uplinkFillPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.transparent,
+          upColor.withOpacity(0.04),
+          upColor.withOpacity(emphasizeBackground ? 0.16 : 0.1),
+        ],
+      ).createShader(
+        Rect.fromLTWH(0, centerY, size.width, chartHeight * 0.5),
+      );
+    final downlinkFillPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          downColor.withOpacity(emphasizeBackground ? 0.16 : 0.1),
+          downColor.withOpacity(0.04),
+          Colors.transparent,
+        ],
+      ).createShader(
+        Rect.fromLTWH(0, topY, size.width, chartHeight * 0.5),
+      );
+    canvas.drawPath(uplinkFillPath, uplinkFillPaint);
+    canvas.drawPath(downlinkFillPath, downlinkFillPaint);
+    canvas.drawPath(uplinkPath, uplinkGlowPaint);
+    canvas.drawPath(uplinkPath, uplinkPaint);
+    canvas.drawPath(downlinkPath, downlinkGlowPaint);
+    canvas.drawPath(downlinkPath, downlinkPaint);
+  }
+
+  double _sampleAt(List<double> input, double index) {
+    if (input.isEmpty) return 0;
+    final last = input.length - 1;
+    if (last <= 0) return input.first;
+
+    final clamped = index.clamp(0.0, last.toDouble());
+    final i1 = clamped.floor();
+    final i2 = math.min(last, i1 + 1);
+    final i0 = math.max(0, i1 - 1);
+    final i3 = math.min(last, i2 + 1);
+    final t = clamped - i1;
+
+    final p0 = input[i0];
+    final p1 = input[i1];
+    final p2 = input[i2];
+    final p3 = input[i3];
+
+    final t2 = t * t;
+    final t3 = t2 * t;
+    return 0.5 *
+        ((2 * p1) +
+            (-p0 + p2) * t +
+            (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+            (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
   }
 
   @override
   bool shouldRepaint(covariant _TrafficGraphPainter oldDelegate) {
-    return oldDelegate.samples != samples;
+    return oldDelegate.uplinkSamples != uplinkSamples ||
+        oldDelegate.downlinkSamples != downlinkSamples ||
+        oldDelegate.progress != progress ||
+        oldDelegate.color != color ||
+        oldDelegate.emphasizeBackground != emphasizeBackground;
   }
 }
 

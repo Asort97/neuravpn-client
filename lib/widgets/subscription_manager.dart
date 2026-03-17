@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../models/vpn_subscription.dart';
 import '../services/subscription_manager.dart';
 import '../services/subscription_repository.dart';
+import 'neura_ui.dart';
 
 class SubscriptionManager extends StatefulWidget {
   const SubscriptionManager({Key? key}) : super(key: key);
@@ -16,6 +17,12 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
   List<VpnSubscription> _subscriptions = [];
   VpnSubscription? _selectedSubscription;
   bool _isLoading = false;
+
+  void _toast(String message, {NeuraToastTone tone = NeuraToastTone.neutral}) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(buildNeuraSnackBar(context, message, tone: tone));
+  }
 
   @override
   void initState() {
@@ -35,16 +42,14 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         _selectedSubscription = selected;
       });
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка загрузки подписок: $e')));
+      _toast('Ошибка загрузки подписок: $e', tone: NeuraToastTone.error);
     } finally {
       setState(() => _isLoading = false);
     }
   }
 
   Future<void> _addSubscription() async {
-    final result = await showDialog<(String, String)?>(
+    final result = await showNeuraDialog<(String, String)?>(
       context: context,
       builder: (context) => _AddSubscriptionDialog(),
     );
@@ -76,16 +81,12 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       final added = await _repository.addSubscription(subscription);
       if (added) {
         await _loadSubscriptions();
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Подписка добавлена')));
+        _toast('Подписка добавлена', tone: NeuraToastTone.success);
       } else {
         throw 'Не удалось добавить подписку';
       }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+      _toast('Ошибка: $e', tone: NeuraToastTone.error);
     } finally {
       setState(() => _isLoading = false);
     }
@@ -109,35 +110,32 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       final success = await _repository.updateSubscription(updated);
       if (success) {
         await _loadSubscriptions();
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Подписка обновлена')));
+        _toast('Подписка обновлена', tone: NeuraToastTone.success);
       }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка обновления: $e')));
+      _toast('Ошибка обновления: $e', tone: NeuraToastTone.error);
     } finally {
       setState(() => _isLoading = false);
     }
   }
 
   Future<void> _deleteSubscription(VpnSubscription subscription) async {
-    final confirm = await showDialog<bool>(
+    final confirm = await showNeuraDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => NeuraOverlayDialog(
         title: const Text('Удалить подписку?'),
-        content: Text(
+        child: Text(
           'Подписка "${subscription.name}" будет удалена безвозвратно',
+          style: TextStyle(color: Colors.white.withOpacity(0.78)),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
             child: const Text('Отмена'),
           ),
-          TextButton(
+          FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Удалить', style: TextStyle(color: Colors.red)),
+            child: const Text('Удалить'),
           ),
         ],
       ),
@@ -149,13 +147,9 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       await _repository.deleteSubscription(subscription.id);
       await _repository.deleteSubscriptionByUrl(subscription.url);
       await _loadSubscriptions();
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Подписка удалена')));
+      _toast('Подписка удалена', tone: NeuraToastTone.success);
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+      _toast('Ошибка: $e', tone: NeuraToastTone.error);
     }
   }
 
@@ -169,13 +163,12 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       await _repository.setSelectedSubscription(subscription.id);
       await _loadSubscriptions();
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Профиль "${updated.selectedProfile}" выбран')),
+      _toast(
+        'Профиль "${updated.selectedProfile}" выбран',
+        tone: NeuraToastTone.success,
       );
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Ошибка: $e')));
+      _toast('Ошибка: $e', tone: NeuraToastTone.error);
     }
   }
 
@@ -199,7 +192,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.cloud_off, size: 64, color: Colors.grey[400]),
+                  Icon(Icons.cloud_off, size: 64, color: NeuraUi.neutral.withOpacity(0.7)),
                   const SizedBox(height: 16),
                   const Text('Нет подписок'),
                   const SizedBox(height: 16),
@@ -225,7 +218,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
                   child: ExpansionTile(
                     leading: Icon(
                       isSelected ? Icons.check_circle : Icons.cloud_download,
-                      color: isSelected ? Colors.green : Colors.grey,
+                      color: isSelected ? NeuraUi.success : NeuraUi.neutral.withOpacity(0.6),
                     ),
                     title: Text(subscription.name),
                     subtitle: Text('Профилей: ${subscription.profileCount}'),
@@ -246,7 +239,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
                               'Обновлено: ${subscription.formattedLastUpdate}',
                               style: TextStyle(
                                 fontSize: 12,
-                                color: Colors.grey[600],
+                                color: NeuraUi.neutral.withOpacity(0.55),
                               ),
                             ),
                             const SizedBox(height: 12),
@@ -273,7 +266,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
                                 trailing: subscription.selectedIndex == i
                                     ? const Icon(
                                         Icons.check,
-                                        color: Colors.green,
+                                        color: NeuraUi.success,
                                       )
                                     : null,
                               ),
@@ -294,7 +287,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
                                   icon: const Icon(Icons.delete),
                                   label: const Text('Удалить'),
                                   style: ElevatedButton.styleFrom(
-                                    backgroundColor: Colors.red[400],
+                                    backgroundColor: NeuraUi.danger,
                                   ),
                                 ),
                               ],
@@ -342,9 +335,26 @@ class _AddSubscriptionDialogState extends State<_AddSubscriptionDialog> {
     final isValid =
         _urlController.text.isNotEmpty && _nameController.text.isNotEmpty;
 
-    return AlertDialog(
+    return NeuraOverlayDialog(
       title: const Text('Добавить подписку'),
-      content: SingleChildScrollView(
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: isValid
+              ? () {
+                  Navigator.pop(context, (
+                    _urlController.text,
+                    _nameController.text,
+                  ));
+                }
+              : null,
+          child: const Text('Добавить'),
+        ),
+      ],
+      child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -367,23 +377,6 @@ class _AddSubscriptionDialogState extends State<_AddSubscriptionDialog> {
           ],
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Отмена'),
-        ),
-        ElevatedButton(
-          onPressed: isValid
-              ? () {
-                  Navigator.pop(context, (
-                    _urlController.text,
-                    _nameController.text,
-                  ));
-                }
-              : null,
-          child: const Text('Добавить'),
-        ),
-      ],
     );
   }
 }

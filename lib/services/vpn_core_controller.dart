@@ -26,6 +26,15 @@ typedef VpnCoreProcessStarter =
 typedef VpnCoreProcessRunner =
     Future<ProcessResult> Function(String executable, List<String> arguments);
 
+class TrafficSample {
+  const TrafficSample({required this.uplinkBps, required this.downlinkBps});
+
+  final int uplinkBps;
+  final int downlinkBps;
+
+  int get totalBps => uplinkBps + downlinkBps;
+}
+
 class VpnCoreStartResult {
   final bool success;
   final String? errorMessage;
@@ -96,6 +105,11 @@ class VpnCoreController {
   Timer? _trafficPollTimer;
   final StreamController<int> _trafficController =
       StreamController<int>.broadcast();
+  final StreamController<TrafficSample> _trafficSampleController =
+      StreamController<TrafficSample>.broadcast();
+  int? _lastTrafficUplinkCounter;
+  int? _lastTrafficDownlinkCounter;
+  String? _lastTrafficCounterSource;
 
   String? _activeInterfaceName;
   File? _configFile;
@@ -114,6 +128,7 @@ class VpnCoreController {
   final Map<int, String> _sessionInterfaces = <int, String>{};
   final Set<int> _cleanupInProgressTokens = <int>{};
   String _activeWindowsOutboundTag = 'proxy';
+  String _activeWindowsInboundTag = WindowsTunGuard.defaultInboundTag;
   String? _lastWindowsRuleHash;
   WindowsRouteSession? _activeWindowsRouteSession;
   final Map<int, WindowsRouteSession> _sessionRoutePlans =
@@ -130,6 +145,7 @@ class VpnCoreController {
   String? get generatedConfig => _generatedConfig;
   int get clashApiPort => _windowsCoreAdapter.apiPort;
   Stream<int> get trafficStream => _trafficController.stream;
+  Stream<TrafficSample> get trafficSampleStream => _trafficSampleController.stream;
   @visibleForTesting
   int? get debugActiveConnectionToken => _activeConnectionToken;
 
@@ -395,6 +411,7 @@ class VpnCoreController {
       }
 
       _activeInterfaceName = plan.interfaceName;
+      _activeWindowsInboundTag = plan.inboundTag;
       _sessionInterfaces[token] = plan.interfaceName;
       final uplinkDiscoveryLogs = <String>[];
       final uplink = await _windowsRouteManager.discoverPrimaryUplink(
@@ -921,7 +938,9 @@ class VpnCoreController {
     _windowsConnected = false;
   }
 
-  Future<int?> fetchTrafficBps() async {
+  Future<TrafficSample?> fetchTrafficSample({
+    bool useDelta = false,
+  }) async {
     if (!_isWindows) return null;
     if (_process == null) return null;
     try {
@@ -929,39 +948,272 @@ class VpnCoreController {
       if (exePath == null) {
         return null;
       }
-      final result = await _processRunner(exePath, [
-        'api',
-        'statsquery',
-        '--server=127.0.0.1:$_xrayApiPort',
-      ]);
-      if (result.exitCode != 0) {
-        return null;
+      int? down;
+      int? up;
+      String? source;
+
+      // 1) Preferred source for UI graph: exact TUN inbound counters via `api stats`.
+      final tunPair = await _fetchTrafficPairByStatsApi(
+        exePath: exePath,
+        downlinkName: 'inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink',
+        uplinkName: 'inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink',
+      );
+      if (tunPair.$1 != null || tunPair.$2 != null) {
+        down = tunPair.$1 ?? 0;
+        up = tunPair.$2 ?? 0;
+        source = 'xray-api-stats-tun';
       }
-      final payload = '${result.stdout}\n${result.stderr}';
-      final down = _extractXrayStatValue(
-        payload,
-        'outbound>>>$_activeWindowsOutboundTag>>>traffic>>>downlink',
-      );
-      final up = _extractXrayStatValue(
-        payload,
-        'outbound>>>$_activeWindowsOutboundTag>>>traffic>>>uplink',
-      );
+
+      // 2) Secondary source: current outbound counters via `api stats`.
+      if (down == null && up == null) {
+        final activePair = await _fetchTrafficPairByStatsApi(
+          exePath: exePath,
+          downlinkName:
+              'outbound>>>$_activeWindowsOutboundTag>>>traffic>>>downlink',
+          uplinkName:
+              'outbound>>>$_activeWindowsOutboundTag>>>traffic>>>uplink',
+        );
+        if (activePair.$1 != null || activePair.$2 != null) {
+          down = activePair.$1 ?? 0;
+          up = activePair.$2 ?? 0;
+          source = 'xray-api-stats-outbound';
+        }
+      }
+
+      // 3) Fallback: full statsquery parser for compatibility with older/other outputs.
+      if (down == null && up == null) {
+        final result = await _processRunner(exePath, [
+          'api',
+          'statsquery',
+          '--server=127.0.0.1:$_xrayApiPort',
+        ]);
+        if (result.exitCode != 0) {
+          return null;
+        }
+        final payload = '${result.stdout}\n${result.stderr}';
+        final counters = _extractXrayTrafficCounters(payload);
+        final tunDown = counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink'];
+        final tunUp = counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink'];
+        final activeDown =
+            counters['outbound>>>$_activeWindowsOutboundTag>>>traffic>>>downlink'];
+        final activeUp =
+            counters['outbound>>>$_activeWindowsOutboundTag>>>traffic>>>uplink'];
+
+        if (tunDown != null || tunUp != null) {
+          down = tunDown ?? 0;
+          up = tunUp ?? 0;
+          source = 'xray-statsquery-tun';
+        } else {
+          down = activeDown;
+          up = activeUp;
+          source = 'xray-statsquery-active';
+
+          final summedOut = _sumOutboundCounters(counters);
+          final summedIn = _sumInboundCounters(counters);
+          if (down == null && up == null) {
+            down = summedOut.$1;
+            up = summedOut.$2;
+          } else if ((down ?? 0) == 0 && (up ?? 0) == 0) {
+            final sumDown = summedOut.$1 ?? 0;
+            final sumUp = summedOut.$2 ?? 0;
+            if (sumDown > 0 || sumUp > 0) {
+              down = sumDown;
+              up = sumUp;
+              source = 'xray-statsquery-summed-out';
+            } else {
+              final inDown = summedIn.$1 ?? 0;
+              final inUp = summedIn.$2 ?? 0;
+              if (inDown > 0 || inUp > 0) {
+                down = inDown;
+                up = inUp;
+                source = 'xray-statsquery-summed-in';
+              }
+            }
+          }
+
+          if (down == null && up == null) {
+            down = summedIn.$1;
+            up = summedIn.$2;
+            source = 'xray-statsquery-summed-in';
+          }
+        }
+      }
+
+      // 4) Final fallback: Windows adapter byte counters (independent from Xray API format).
+      if (down == null && up == null) {
+        final adapterPair = await _fetchAdapterTrafficPair();
+        if (adapterPair.$1 != null || adapterPair.$2 != null) {
+          down = adapterPair.$1 ?? 0;
+          up = adapterPair.$2 ?? 0;
+          source = 'adapter-stats';
+        }
+      }
+
       if (down == null && up == null) {
         return null;
       }
-      return (down ?? 0) + (up ?? 0);
+      final currentDown = down ?? 0;
+      final currentUp = up ?? 0;
+      if (_lastTrafficCounterSource != null &&
+          source != null &&
+          _lastTrafficCounterSource != source) {
+        _lastTrafficDownlinkCounter = null;
+        _lastTrafficUplinkCounter = null;
+      }
+      _lastTrafficCounterSource = source ?? _lastTrafficCounterSource;
+      final deltaDown = _computeTrafficDelta(
+        current: currentDown,
+        previous: _lastTrafficDownlinkCounter,
+        useDelta: useDelta,
+      );
+      final deltaUp = _computeTrafficDelta(
+        current: currentUp,
+        previous: _lastTrafficUplinkCounter,
+        useDelta: useDelta,
+      );
+      _lastTrafficDownlinkCounter = currentDown;
+      _lastTrafficUplinkCounter = currentUp;
+      return TrafficSample(
+        uplinkBps: deltaUp,
+        downlinkBps: deltaDown,
+      );
     } catch (_) {
       return null;
     }
   }
 
+  Future<(int?, int?)> _fetchAdapterTrafficPair() async {
+    if (!_isWindows) return (null, null);
+    final preferred = _activeWindowsRouteSession?.tunInterfaceName ?? 'xray0';
+    final quotedPreferred = preferred.replaceAll("'", "''");
+    const fallbackNames = "'xray0','xray0 1'";
+    final script = '''
+\$preferred = '$quotedPreferred'
+\$adapter = \$null
+\$candidates = @(\$preferred,$fallbackNames)
+foreach (\$name in \$candidates) {
+  if (-not \$name) { continue }
+  \$a = Get-NetAdapter -IncludeHidden -Name \$name -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (\$a) { \$adapter = \$a; break }
+}
+if (-not \$adapter) {
+  \$adapter = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+    Where-Object { \$_.Name -like 'xray*' -or \$_.Name -like 'tun-in*' -or \$_.Name -like 'wintun*' } |
+    Sort-Object Name |
+    Select-Object -First 1
+}
+if (-not \$adapter) { exit 0 }
+\$s = Get-NetAdapterStatistics -Name \$adapter.Name -ErrorAction SilentlyContinue
+if (-not \$s) { exit 0 }
+[pscustomobject]@{
+  Name = \$adapter.Name
+  ReceivedBytes = [int64]\$s.ReceivedBytes
+  SentBytes = [int64]\$s.SentBytes
+} | ConvertTo-Json -Compress
+''';
+    try {
+      final result = await Process.run(
+        'powershell',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          script,
+        ],
+      );
+      if (result.exitCode != 0) return (null, null);
+      final raw = '${result.stdout}'.trim();
+      if (raw.isEmpty) return (null, null);
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) return (null, null);
+      final down = int.tryParse('${decoded['ReceivedBytes'] ?? ''}');
+      final up = int.tryParse('${decoded['SentBytes'] ?? ''}');
+      return (down, up);
+    } catch (_) {
+      return (null, null);
+    }
+  }
+
+  Future<(int?, int?)> _fetchTrafficPairByStatsApi({
+    required String exePath,
+    required String downlinkName,
+    required String uplinkName,
+  }) async {
+    final down = await _fetchSingleTrafficStatByName(
+      exePath: exePath,
+      statName: downlinkName,
+    );
+    final up = await _fetchSingleTrafficStatByName(
+      exePath: exePath,
+      statName: uplinkName,
+    );
+    return (down, up);
+  }
+
+  Future<int?> _fetchSingleTrafficStatByName({
+    required String exePath,
+    required String statName,
+  }) async {
+    final result = await _processRunner(exePath, [
+      'api',
+      'stats',
+      '--server=127.0.0.1:$_xrayApiPort',
+      '--name=$statName',
+    ]);
+    if (result.exitCode != 0) {
+      return null;
+    }
+    final payload = '${result.stdout}\n${result.stderr}';
+    final namedValue = _extractXrayStatValue(payload, statName);
+    if (namedValue != null) {
+      return namedValue;
+    }
+    final generic = RegExp(
+      r'value:\s*"?(\d+)"?',
+      caseSensitive: false,
+      multiLine: true,
+    ).firstMatch(payload);
+    if (generic != null) {
+      return int.tryParse(generic.group(1) ?? '');
+    }
+    return null;
+  }
+
+  int _computeTrafficDelta({
+    required int current,
+    required int? previous,
+    required bool useDelta,
+  }) {
+    if (!useDelta) return current;
+    if (previous == null) {
+      return current;
+    }
+    final diff = current - previous;
+    if (diff >= 0) {
+      return diff.clamp(0, 1 << 31);
+    }
+    // Some runtimes/query modes can reset counters between samples.
+    // In that case current already represents the latest interval traffic.
+    return current.clamp(0, 1 << 31);
+  }
+
+  Future<int?> fetchTrafficBps() async {
+    final sample = await fetchTrafficSample();
+    return sample?.totalBps;
+  }
+
   Future<void> startTrafficStream() async {
     if (!_isWindows) return;
     if (_trafficPollTimer != null) return;
-    _trafficPollTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
-      final sample = await fetchTrafficBps();
+    _lastTrafficUplinkCounter = null;
+    _lastTrafficDownlinkCounter = null;
+    _lastTrafficCounterSource = null;
+    _trafficPollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      final sample = await fetchTrafficSample(useDelta: true);
       if (sample != null) {
-        _trafficController.add(sample);
+        _trafficSampleController.add(sample);
+        _trafficController.add(sample.totalBps);
       }
     });
   }
@@ -969,6 +1221,9 @@ class VpnCoreController {
   Future<void> stopTrafficStream() async {
     _trafficPollTimer?.cancel();
     _trafficPollTimer = null;
+    _lastTrafficUplinkCounter = null;
+    _lastTrafficDownlinkCounter = null;
+    _lastTrafficCounterSource = null;
   }
 
   int? _extractXrayStatValue(String payload, String statName) {
@@ -989,6 +1244,76 @@ class VpnCoreController {
       return int.tryParse(jsonLike.group(1) ?? '');
     }
     return null;
+  }
+
+  Map<String, int> _extractXrayTrafficCounters(String payload) {
+    final result = <String, int>{};
+    final protoMatches = RegExp(
+      r'name:\s*"([^"]+)"\s*value:\s*"?(\d+)"?',
+      multiLine: true,
+    ).allMatches(payload);
+    for (final match in protoMatches) {
+      final name = match.group(1);
+      final valueRaw = match.group(2);
+      final value = int.tryParse(valueRaw ?? '');
+      if (name == null || value == null) continue;
+      result[name] = value;
+    }
+    final jsonMatches = RegExp(
+      r'"([^"]+)"\s*:\s*"?(\d+)"?',
+      multiLine: true,
+    ).allMatches(payload);
+    for (final match in jsonMatches) {
+      final name = match.group(1);
+      final valueRaw = match.group(2);
+      final value = int.tryParse(valueRaw ?? '');
+      if (name == null || value == null) continue;
+      result.putIfAbsent(name, () => value);
+    }
+    return result;
+  }
+
+  (int?, int?) _sumOutboundCounters(Map<String, int> counters) {
+    int down = 0;
+    int up = 0;
+    bool found = false;
+    for (final entry in counters.entries) {
+      final name = entry.key;
+      if (!name.startsWith('outbound>>>')) continue;
+      if (name.contains('>>>api>>>') ||
+          name.contains('>>>block>>>')) {
+        continue;
+      }
+      if (name.endsWith('>>>traffic>>>downlink')) {
+        down += entry.value;
+        found = true;
+      } else if (name.endsWith('>>>traffic>>>uplink')) {
+        up += entry.value;
+        found = true;
+      }
+    }
+    if (!found) return (null, null);
+    return (down, up);
+  }
+
+  (int?, int?) _sumInboundCounters(Map<String, int> counters) {
+    int down = 0;
+    int up = 0;
+    bool found = false;
+    for (final entry in counters.entries) {
+      final name = entry.key;
+      if (!name.startsWith('inbound>>>')) continue;
+      if (name.contains('>>>api-in>>>')) continue;
+      if (name.endsWith('>>>traffic>>>downlink')) {
+        down += entry.value;
+        found = true;
+      } else if (name.endsWith('>>>traffic>>>uplink')) {
+        up += entry.value;
+        found = true;
+      }
+    }
+    if (!found) return (null, null);
+    return (down, up);
   }
 
   void _emitChunk(String chunk, {required bool isError}) {
