@@ -17,6 +17,8 @@ import '../vless/config_generator.dart';
 import '../vless/vless_parser.dart';
 import 'dpi_evasion_config.dart';
 
+enum TrafficSamplingMode { stopped, foreground, background }
+
 typedef VpnCoreProcessStarter =
     Future<Process> Function(
       String executable,
@@ -71,27 +73,36 @@ class VpnCoreController {
     VpnCoreProcessRunner? processRunner,
     bool? isWindowsOverride,
     bool? isAndroidOverride,
-  }) : _wintunManager = wintunManager ?? WintunManager(),
-       _tunGuard = tunGuard ?? WindowsTunGuard(),
-       _binaryManager = binaryManager ?? VpnCoreBinaryManager(),
-       _androidController = androidController ?? AndroidVpnController(),
-       _windowsCoreAdapter = windowsCoreAdapter ?? WindowsXrayCoreAdapter(),
-       _windowsRouteManager =
-           windowsRouteManager ??
-           WindowsRouteManager(processRunner: processRunner),
-       _processStarter = processStarter ?? _defaultProcessStarter,
-       _processRunner = processRunner ?? _defaultProcessRunner,
-       _isWindowsOverride = isWindowsOverride,
-       _isAndroidOverride = isAndroidOverride;
+  }) : _isWindowsOverride = isWindowsOverride,
+       _isAndroidOverride = isAndroidOverride {
+    _processStarter = processStarter ?? _defaultProcessStarter;
+    _processRunner = processRunner ?? _defaultProcessRunner;
+    _wintunManager = wintunManager ?? WintunManager();
+    _tunGuard =
+        tunGuard ??
+        WindowsTunGuard(
+          processRunner: _processRunner,
+          processLaunchRecorder: _recordProcessLaunch,
+        );
+    _binaryManager = binaryManager ?? VpnCoreBinaryManager();
+    _androidController = androidController ?? AndroidVpnController();
+    _windowsCoreAdapter = windowsCoreAdapter ?? WindowsXrayCoreAdapter();
+    _windowsRouteManager =
+        windowsRouteManager ??
+        WindowsRouteManager(
+          processRunner: _processRunner,
+          processLaunchRecorder: _recordProcessLaunch,
+        );
+  }
 
-  final WintunManager _wintunManager;
-  final WindowsTunGuard _tunGuard;
-  final VpnCoreBinaryManager _binaryManager;
-  final AndroidVpnController _androidController;
-  final WindowsVpnCoreAdapter _windowsCoreAdapter;
-  final WindowsRouteManager _windowsRouteManager;
-  final VpnCoreProcessStarter _processStarter;
-  final VpnCoreProcessRunner _processRunner;
+  late final WintunManager _wintunManager;
+  late final WindowsTunGuard _tunGuard;
+  late final VpnCoreBinaryManager _binaryManager;
+  late final AndroidVpnController _androidController;
+  late final WindowsVpnCoreAdapter _windowsCoreAdapter;
+  late final WindowsRouteManager _windowsRouteManager;
+  late final VpnCoreProcessStarter _processStarter;
+  late final VpnCoreProcessRunner _processRunner;
   final bool? _isWindowsOverride;
   final bool? _isAndroidOverride;
 
@@ -103,6 +114,8 @@ class VpnCoreController {
   bool _accessDeniedDetected = false;
   bool _startupCheckInProgress = false;
   Timer? _trafficPollTimer;
+  bool _trafficPollInProgress = false;
+  TrafficSamplingMode _trafficSamplingMode = TrafficSamplingMode.stopped;
   final StreamController<int> _trafficController =
       StreamController<int>.broadcast();
   final StreamController<TrafficSample> _trafficSampleController =
@@ -117,10 +130,13 @@ class VpnCoreController {
   VlessLink? _parsedLink;
   String? _lastStartError;
   final List<String> _recentLogs = <String>[];
+  final List<String> _memoryConnectionLogLines = <String>[];
   File? _connectionLogFile;
   final List<String> _pendingConnectionLogLines = <String>[];
   Timer? _connectionLogFlushTimer;
   bool _connectionLogFlushInProgress = false;
+  bool _connectionLogDiskEnabled = false;
+  bool _developerModeEnabled = false;
   int _droppedConnectionLogLines = 0;
   bool _connectionLogThrottleMarkerQueued = false;
   int _sessionEpoch = 0;
@@ -133,9 +149,21 @@ class VpnCoreController {
   WindowsRouteSession? _activeWindowsRouteSession;
   final Map<int, WindowsRouteSession> _sessionRoutePlans =
       <int, WindowsRouteSession>{};
+  WindowsRouteUplink? _cachedWindowsUplink;
+  bool _windowsRuntimePrepared = false;
+  bool _pendingAggressiveRecovery = false;
+  final _WindowsRuntimeSessionStore _sessionStore =
+      const _WindowsRuntimeSessionStore();
+  final Map<String, int> _lastConnectPhaseDurationsMs = <String, int>{};
+  final Map<String, int> _lastConnectProcessLaunchCounts = <String, int>{};
   static const int _maxWindowsAutoRecoverAttempts = 3;
   static const int _connectionLogFlushMs = 200;
   static const int _maxPendingConnectionLogLines = 1000;
+  static const int _maxMemoryConnectionLogLines = 400;
+  static const Duration _trafficForegroundPollInterval = Duration(
+    milliseconds: 750,
+  );
+  static const Duration _trafficBackgroundPollInterval = Duration(seconds: 2);
 
   void Function(String status)? _statusSink;
   void Function(String log)? _logSink;
@@ -145,7 +173,14 @@ class VpnCoreController {
   String? get generatedConfig => _generatedConfig;
   int get clashApiPort => _windowsCoreAdapter.apiPort;
   Stream<int> get trafficStream => _trafficController.stream;
-  Stream<TrafficSample> get trafficSampleStream => _trafficSampleController.stream;
+  Stream<TrafficSample> get trafficSampleStream =>
+      _trafficSampleController.stream;
+  @visibleForTesting
+  Map<String, int> get debugProcessLaunchCounts =>
+      Map<String, int>.unmodifiable(_lastConnectProcessLaunchCounts);
+  @visibleForTesting
+  Map<String, int> get debugConnectPhaseDurationsMs =>
+      Map<String, int>.unmodifiable(_lastConnectPhaseDurationsMs);
   @visibleForTesting
   int? get debugActiveConnectionToken => _activeConnectionToken;
 
@@ -175,6 +210,61 @@ class VpnCoreController {
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
   bool get _isAndroid => _isAndroidOverride ?? Platform.isAndroid;
 
+  Future<void> prepareWindowsRuntime({
+    void Function(String log)? onLog,
+    bool force = false,
+  }) async {
+    if (!_isWindows) return;
+    if (_windowsRuntimePrepared && !force) return;
+    _windowsRuntimePrepared = true;
+    final state = await _sessionStore.read();
+    if (!state.dirty) {
+      return;
+    }
+
+    final logs = <String>[
+      '[recovery] Dirty Windows VPN session marker detected.',
+    ];
+    _pendingAggressiveRecovery = true;
+    try {
+      await _terminateExistingProcesses(forceGlobal: true);
+      await _windowsRouteManager.cleanupStale(logs: logs);
+      final tunCleanup = await _tunGuard.cleanupStaleTunAdapters();
+      logs.addAll(tunCleanup.logs);
+      if (tunCleanup.success) {
+        await _sessionStore.clear();
+        _pendingAggressiveRecovery = false;
+        logs.add('[recovery] Previous Windows VPN session cleanup completed.');
+      } else {
+        logs.add(
+          '[recovery] Stale adapters remain: '
+          '${tunCleanup.stillPresentAdapters.join(', ')}',
+        );
+      }
+    } catch (e) {
+      logs.add('[recovery] Cleanup exception: $e');
+    }
+
+    for (final line in logs) {
+      onLog?.call(line);
+      _logSink?.call(line);
+      _appendConnectionLog(line);
+    }
+  }
+
+  Future<void> setTrafficSamplingMode(TrafficSamplingMode mode) async {
+    if (!_isWindows) return;
+    if (mode == TrafficSamplingMode.stopped) {
+      await stopTrafficStream();
+      return;
+    }
+    _trafficSamplingMode = mode;
+    if (_process == null || !_windowsConnected) {
+      return;
+    }
+    await _restartTrafficPollingTimer();
+  }
+
   Future<VpnCoreStartResult> connect({
     required String rawUri,
     required SplitTunnelConfig splitConfig,
@@ -186,11 +276,16 @@ class VpnCoreController {
   }) async {
     _statusSink = onStatus;
     _logSink = onLog;
+    _developerModeEnabled = developerMode;
     _accessDeniedDetected = false;
     _windowsConnected = false;
     _lastStartError = null;
     _recentLogs.clear();
-    await _createConnectionLogFile();
+    _resetConnectionLogging(enableDiskLogging: developerMode);
+    if (developerMode) {
+      await _createConnectionLogFile();
+    }
+    _beginConnectDiagnostics();
 
     final trimmed = rawUri.trim();
     if (trimmed.isEmpty) {
@@ -210,6 +305,10 @@ class VpnCoreController {
     _activeWindowsOutboundTag = parsed.tag ?? 'proxy';
     if (!_isWindows && !_isAndroid) {
       return VpnCoreStartResult.failure('Платформа не поддерживается');
+    }
+
+    if (_isWindows) {
+      await prepareWindowsRuntime(onLog: onLog);
     }
 
     final androidPackages = _isAndroid
@@ -301,7 +400,7 @@ class VpnCoreController {
       return VpnCoreStartResult.success();
     }
 
-    return _connectWindowsWithAutoRecover(
+    final result = await _connectWindowsWithAutoRecover(
       parsed: parsed,
       splitConfig: splitConfig,
       useSmartEngineRules: useSmartEngineRules,
@@ -313,6 +412,14 @@ class VpnCoreController {
       dpiEvasionConfig: dpiEvasionConfig,
       developerMode: developerMode,
     );
+    if (!result.success) {
+      await _captureFailureDiagnostics(
+        result.errorMessage ?? 'Windows VPN startup failed',
+      );
+    } else {
+      _emitConnectDiagnosticsIfNeeded(success: true);
+    }
+    return result;
   }
 
   Future<VpnCoreStartResult> _connectWindowsWithAutoRecover({
@@ -328,11 +435,17 @@ class VpnCoreController {
     required bool developerMode,
   }) async {
     _notifyStatus('Поиск xray-core');
-    final exePath = await _binaryManager.resolveExecutable();
+    final exePath = await _measureConnectPhase(
+      'binary_resolve',
+      () => _binaryManager.resolveExecutable(),
+    );
     if (exePath == null) {
       return VpnCoreStartResult.failure('Не найден исполняемый файл xray-core');
     }
-    final sanityError = await _verifyWindowsCoreBinary(exePath);
+    final sanityError = await _measureConnectPhase(
+      'binary_verify',
+      () => _verifyWindowsCoreBinary(exePath),
+    );
     if (sanityError != null) {
       return VpnCoreStartResult.failure(sanityError);
     }
@@ -343,12 +456,12 @@ class VpnCoreController {
         reason: 'pre-connect',
       );
     }
-
-    await _terminateExistingProcesses();
     if (_isWindows) {
-      final staleRouteLogs = <String>[];
-      await _windowsRouteManager.cleanupStale(logs: staleRouteLogs);
-      _emitLogs(staleRouteLogs);
+      final process = _process;
+      if (process != null) {
+        await _forceStopProcess(process);
+        await _teardownProcess();
+      }
     }
     final environment = Map<String, String>.from(Platform.environment);
     String? lastError;
@@ -369,7 +482,12 @@ class VpnCoreController {
         'attempt=$attempt/$_maxWindowsAutoRecoverAttempts\n',
       );
 
-      final plan = await _tunGuard.prepare();
+      final plan = await _measureConnectPhase(
+        'tun_prepare',
+        () => _tunGuard.prepare(
+          detectExistingAdapters: _pendingAggressiveRecovery,
+        ),
+      );
       _emitLogs(plan.logs);
       if (!plan.success) {
         await _cleanupSessionToken(token, reason: 'prepare-failed');
@@ -413,11 +531,25 @@ class VpnCoreController {
       _activeInterfaceName = plan.interfaceName;
       _activeWindowsInboundTag = plan.inboundTag;
       _sessionInterfaces[token] = plan.interfaceName;
-      final uplinkDiscoveryLogs = <String>[];
-      final uplink = await _windowsRouteManager.discoverPrimaryUplink(
-        logs: uplinkDiscoveryLogs,
+      await _sessionStore.markDirty(
+        interfaceName: plan.interfaceName,
+        remoteHost: parsed.host,
       );
-      _emitLogs(uplinkDiscoveryLogs);
+      WindowsRouteUplink? uplink = _cachedWindowsUplink;
+      if (uplink != null) {
+        _appendConnectionLog(
+          '[token=$token] reusing cached uplink ${uplink.interfaceName} via ${uplink.gateway}',
+        );
+      } else {
+        final uplinkDiscoveryLogs = <String>[];
+        uplink = await _measureConnectPhase(
+          'uplink_discovery',
+          () => _windowsRouteManager.discoverPrimaryUplink(
+            logs: uplinkDiscoveryLogs,
+          ),
+        );
+        _emitLogs(uplinkDiscoveryLogs);
+      }
       if (uplink == null) {
         lastError = 'Не удалось определить активный uplink Windows';
         await _cleanupSessionToken(token, reason: 'uplink-discovery-failed');
@@ -449,9 +581,15 @@ class VpnCoreController {
       );
       _generatedConfig = jsonConfig;
 
-      final tempDir = await Directory.systemTemp.createTemp('xray_cfg_');
+      final tempDir = await _measureConnectPhase(
+        'config_tempdir',
+        () => Directory.systemTemp.createTemp('xray_cfg_'),
+      );
       final cfgFile = File('${tempDir.path}/config.json');
-      await cfgFile.writeAsString(jsonConfig);
+      await _measureConnectPhase(
+        'config_write',
+        () => cfgFile.writeAsString(jsonConfig),
+      );
       _configFile = cfgFile;
 
       _notifyStatus('Запуск процесса');
@@ -460,29 +598,49 @@ class VpnCoreController {
         'with interface=${plan.interfaceName}',
       );
       try {
-        final process = await _processStarter(exePath, [
-          'run',
-          '-c',
-          cfgFile.path,
-        ], environment: environment);
+        final process = await _measureConnectPhase(
+          'process_start',
+          () => _startMeasuredProcess(exePath, [
+            'run',
+            '-c',
+            cfgFile.path,
+          ], environment: environment),
+        );
         _process = process;
         _attachProcessHandlers(process, plan.interfaceName, token);
-        final startupError = await _verifyStartup(process, plan.interfaceName);
+        await _sessionStore.markDirty(
+          interfaceName: plan.interfaceName,
+          remoteHost: parsed.host,
+          pid: process.pid,
+        );
+        final startupError = await _measureConnectPhase(
+          'startup_verify',
+          () => _verifyStartup(process, plan.interfaceName),
+        );
         if (startupError == null) {
-          final routeResult = await _windowsRouteManager.applyRoutes(
-            preferredTunInterface: _activeInterfaceName ?? plan.interfaceName,
-            remoteHost: parsed.host,
-            dnsServers: const <String>['8.8.8.8', '1.1.1.1'],
-            tunAddressHint: plan.addresses.isEmpty ? null : plan.addresses.first,
-            uplink: uplink,
+          final routeResult = await _measureConnectPhase(
+            'route_apply',
+            () => _windowsRouteManager.applyRoutes(
+              preferredTunInterface: _activeInterfaceName ?? plan.interfaceName,
+              remoteHost: parsed.host,
+              dnsServers: const <String>['8.8.8.8', '1.1.1.1'],
+              tunAddressHint: plan.addresses.isEmpty
+                  ? null
+                  : plan.addresses.first,
+              uplink: uplink,
+            ),
           );
           _emitLogs(routeResult.logs);
           if (!routeResult.success || routeResult.session == null) {
             final routeError =
-                routeResult.error ?? 'Не удалось перенаправить Windows трафик в TUN';
-            _appendConnectionLog('[token=$token] route setup failed: $routeError');
+                routeResult.error ??
+                'Не удалось перенаправить Windows трафик в TUN';
+            _appendConnectionLog(
+              '[token=$token] route setup failed: $routeError',
+            );
             await _forceStopProcess(process);
             await _teardownProcess();
+            _cachedWindowsUplink = null;
             await _cleanupSessionToken(token, reason: 'route-setup-failed');
             if (attempt >= _maxWindowsAutoRecoverAttempts) {
               return VpnCoreStartResult.failure(routeError);
@@ -494,6 +652,8 @@ class VpnCoreController {
           }
           _activeWindowsRouteSession = routeResult.session;
           _sessionRoutePlans[token] = routeResult.session!;
+          _cachedWindowsUplink = uplink;
+          _pendingAggressiveRecovery = false;
           _windowsConnected = true;
           _notifyStatus(
             'Подключено (TUN: ${routeResult.session!.tunInterfaceName})',
@@ -516,6 +676,7 @@ class VpnCoreController {
 
         await _forceStopProcess(process);
         await _teardownProcess();
+        _cachedWindowsUplink = null;
         await _cleanupSessionToken(token, reason: 'startup-failed');
 
         if (failureClass == _StartupFailureClass.requiresAdmin ||
@@ -535,6 +696,7 @@ class VpnCoreController {
         lastError = 'Ошибка запуска: $e';
         _appendConnectionLog('[token=$token] process start exception: $e');
         await _teardownProcess();
+        _cachedWindowsUplink = null;
         await _cleanupSessionToken(token, reason: 'process-start-exception');
         if (attempt >= _maxWindowsAutoRecoverAttempts) {
           return VpnCoreStartResult.failure(lastError);
@@ -632,7 +794,9 @@ class VpnCoreController {
   Future<String?> _verifyWindowsCoreBinary(String executablePath) async {
     if (!_isWindows) return null;
     try {
-      final result = await _processRunner(executablePath, ['version']);
+      final result = await _runMeasuredProcess(executablePath, const [
+        'version',
+      ]);
       if (result.exitCode != 0) {
         return 'xray-core не отвечает: code ${result.exitCode}';
       }
@@ -715,9 +879,9 @@ class VpnCoreController {
     final tempDir = await Directory.systemTemp.createTemp('xray_rules_');
     final routeFile = File('${tempDir.path}/routing.json');
     await routeFile.writeAsString(
-      const JsonEncoder.withIndent('  ').convert(<String, dynamic>{
-        'routing': payload,
-      }),
+      const JsonEncoder.withIndent(
+        '  ',
+      ).convert(<String, dynamic>{'routing': payload}),
       flush: true,
     );
 
@@ -728,7 +892,7 @@ class VpnCoreController {
 
     for (final args in commands) {
       try {
-        final result = await _processRunner(exePath, args);
+        final result = await _runMeasuredProcess(exePath, args);
         if (result.exitCode == 0) {
           _lastWindowsRuleHash = nextHash;
           onLog?.call('[xray] routing hot-reload applied');
@@ -738,7 +902,11 @@ class VpnCoreController {
         final stdout = '${result.stdout}'.trim();
         onLog?.call(
           '[xray] adrules failed: '
-          '${stderr.isNotEmpty ? stderr : stdout.isNotEmpty ? stdout : 'exit=${result.exitCode}'}',
+          '${stderr.isNotEmpty
+              ? stderr
+              : stdout.isNotEmpty
+              ? stdout
+              : 'exit=${result.exitCode}'}',
         );
       } catch (e) {
         onLog?.call('[xray] adrules exception: $e');
@@ -748,10 +916,18 @@ class VpnCoreController {
     return false;
   }
 
-  Future<void> _terminateExistingProcesses() async {
+  Future<void> _terminateExistingProcesses({bool forceGlobal = false}) async {
     if (!_isWindows) return;
+    if (!forceGlobal) {
+      final process = _process;
+      if (process != null) {
+        await _forceStopProcess(process);
+        await _teardownProcess();
+      }
+      return;
+    }
     try {
-      await _processRunner('taskkill', [
+      await _runMeasuredProcess('taskkill', [
         '/F',
         '/IM',
         _windowsCoreAdapter.processName,
@@ -824,6 +1000,8 @@ class VpnCoreController {
       _emitLogs(cleanup.logs);
       _activeInterfaceName = null;
     }
+    _cachedWindowsUplink = null;
+    await _sessionStore.clear();
     await _flushConnectionLog(force: true);
     _notifyStatus('Остановлено');
   }
@@ -854,7 +1032,7 @@ class VpnCoreController {
     if (_isWindows) {
       _windowsConnected = false;
       try {
-        await _processRunner('taskkill', [
+        await _runMeasuredProcess('taskkill', [
           '/F',
           '/IM',
           _windowsCoreAdapter.processName,
@@ -886,12 +1064,15 @@ class VpnCoreController {
       _emitLogs(cleanup.logs);
       _activeInterfaceName = null;
     }
+    _cachedWindowsUplink = null;
+    await _sessionStore.clear();
     await _flushConnectionLog(force: true);
   }
 
   Future<void> dispose() async {
     await disconnect();
     await _teardownProcess();
+    await _sessionStore.clear();
     await _flushConnectionLog(force: true);
   }
 
@@ -938,9 +1119,7 @@ class VpnCoreController {
     _windowsConnected = false;
   }
 
-  Future<TrafficSample?> fetchTrafficSample({
-    bool useDelta = false,
-  }) async {
+  Future<TrafficSample?> fetchTrafficSample({bool useDelta = false}) async {
     if (!_isWindows) return null;
     if (_process == null) return null;
     try {
@@ -952,19 +1131,30 @@ class VpnCoreController {
       int? up;
       String? source;
 
-      // 1) Preferred source for UI graph: exact TUN inbound counters via `api stats`.
-      final tunPair = await _fetchTrafficPairByStatsApi(
-        exePath: exePath,
-        downlinkName: 'inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink',
-        uplinkName: 'inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink',
-      );
-      if (tunPair.$1 != null || tunPair.$2 != null) {
-        down = tunPair.$1 ?? 0;
-        up = tunPair.$2 ?? 0;
-        source = 'xray-api-stats-tun';
+      // 1) Default steady-state source: Windows adapter byte counters.
+      final adapterPair = await _fetchAdapterTrafficPair();
+      if (adapterPair.$1 != null || adapterPair.$2 != null) {
+        down = adapterPair.$1 ?? 0;
+        up = adapterPair.$2 ?? 0;
+        source = 'adapter-stats';
       }
 
-      // 2) Secondary source: current outbound counters via `api stats`.
+      // 2) Fallback: exact TUN inbound counters via `api stats`.
+      if (down == null && up == null) {
+        final tunPair = await _fetchTrafficPairByStatsApi(
+          exePath: exePath,
+          downlinkName:
+              'inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink',
+          uplinkName: 'inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink',
+        );
+        if (tunPair.$1 != null || tunPair.$2 != null) {
+          down = tunPair.$1 ?? 0;
+          up = tunPair.$2 ?? 0;
+          source = 'xray-api-stats-tun';
+        }
+      }
+
+      // 3) Secondary API source: active outbound counters.
       if (down == null && up == null) {
         final activePair = await _fetchTrafficPairByStatsApi(
           exePath: exePath,
@@ -980,9 +1170,9 @@ class VpnCoreController {
         }
       }
 
-      // 3) Fallback: full statsquery parser for compatibility with older/other outputs.
+      // 4) Final compatibility fallback: full statsquery parser.
       if (down == null && up == null) {
-        final result = await _processRunner(exePath, [
+        final result = await _runMeasuredProcess(exePath, [
           'api',
           'statsquery',
           '--server=127.0.0.1:$_xrayApiPort',
@@ -992,8 +1182,10 @@ class VpnCoreController {
         }
         final payload = '${result.stdout}\n${result.stderr}';
         final counters = _extractXrayTrafficCounters(payload);
-        final tunDown = counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink'];
-        final tunUp = counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink'];
+        final tunDown =
+            counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>downlink'];
+        final tunUp =
+            counters['inbound>>>$_activeWindowsInboundTag>>>traffic>>>uplink'];
         final activeDown =
             counters['outbound>>>$_activeWindowsOutboundTag>>>traffic>>>downlink'];
         final activeUp =
@@ -1039,16 +1231,6 @@ class VpnCoreController {
         }
       }
 
-      // 4) Final fallback: Windows adapter byte counters (independent from Xray API format).
-      if (down == null && up == null) {
-        final adapterPair = await _fetchAdapterTrafficPair();
-        if (adapterPair.$1 != null || adapterPair.$2 != null) {
-          down = adapterPair.$1 ?? 0;
-          up = adapterPair.$2 ?? 0;
-          source = 'adapter-stats';
-        }
-      }
-
       if (down == null && up == null) {
         return null;
       }
@@ -1073,10 +1255,7 @@ class VpnCoreController {
       );
       _lastTrafficDownlinkCounter = currentDown;
       _lastTrafficUplinkCounter = currentUp;
-      return TrafficSample(
-        uplinkBps: deltaUp,
-        downlinkBps: deltaDown,
-      );
+      return TrafficSample(uplinkBps: deltaUp, downlinkBps: deltaDown);
     } catch (_) {
       return null;
     }
@@ -1086,16 +1265,23 @@ class VpnCoreController {
     if (!_isWindows) return (null, null);
     final preferred = _activeWindowsRouteSession?.tunInterfaceName ?? 'xray0';
     final quotedPreferred = preferred.replaceAll("'", "''");
-    const fallbackNames = "'xray0','xray0 1'";
-    final script = '''
+    final script =
+        '''
 \$preferred = '$quotedPreferred'
-\$adapter = \$null
-\$candidates = @(\$preferred,$fallbackNames)
+\$candidates = @(\$preferred,'xray0','xray0 1') | Select-Object -Unique
 foreach (\$name in \$candidates) {
   if (-not \$name) { continue }
-  \$a = Get-NetAdapter -IncludeHidden -Name \$name -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (\$a) { \$adapter = \$a; break }
+  \$s = Get-NetAdapterStatistics -Name \$name -ErrorAction SilentlyContinue
+  if (\$s) {
+    [pscustomobject]@{
+      Name = \$name
+      ReceivedBytes = [int64]\$s.ReceivedBytes
+      SentBytes = [int64]\$s.SentBytes
+    } | ConvertTo-Json -Compress
+    exit 0
+  }
 }
+\$adapter = \$null
 if (-not \$adapter) {
   \$adapter = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
     Where-Object { \$_.Name -like 'xray*' -or \$_.Name -like 'tun-in*' -or \$_.Name -like 'wintun*' } |
@@ -1112,16 +1298,13 @@ if (-not \$s) { exit 0 }
 } | ConvertTo-Json -Compress
 ''';
     try {
-      final result = await Process.run(
-        'powershell',
-        [
-          '-NoProfile',
-          '-ExecutionPolicy',
-          'Bypass',
-          '-Command',
-          script,
-        ],
-      );
+      final result = await _runMeasuredProcess('powershell', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        script,
+      ]);
       if (result.exitCode != 0) return (null, null);
       final raw = '${result.stdout}'.trim();
       if (raw.isEmpty) return (null, null);
@@ -1155,7 +1338,7 @@ if (-not \$s) { exit 0 }
     required String exePath,
     required String statName,
   }) async {
-    final result = await _processRunner(exePath, [
+    final result = await _runMeasuredProcess(exePath, [
       'api',
       'stats',
       '--server=127.0.0.1:$_xrayApiPort',
@@ -1205,25 +1388,55 @@ if (-not \$s) { exit 0 }
 
   Future<void> startTrafficStream() async {
     if (!_isWindows) return;
+    if (_trafficSamplingMode == TrafficSamplingMode.stopped) {
+      _trafficSamplingMode = TrafficSamplingMode.foreground;
+    }
     if (_trafficPollTimer != null) return;
     _lastTrafficUplinkCounter = null;
     _lastTrafficDownlinkCounter = null;
     _lastTrafficCounterSource = null;
-    _trafficPollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
-      final sample = await fetchTrafficSample(useDelta: true);
-      if (sample != null) {
-        _trafficSampleController.add(sample);
-        _trafficController.add(sample.totalBps);
-      }
-    });
+    await _restartTrafficPollingTimer();
   }
 
   Future<void> stopTrafficStream() async {
     _trafficPollTimer?.cancel();
     _trafficPollTimer = null;
+    _trafficPollInProgress = false;
+    _trafficSamplingMode = TrafficSamplingMode.stopped;
     _lastTrafficUplinkCounter = null;
     _lastTrafficDownlinkCounter = null;
     _lastTrafficCounterSource = null;
+  }
+
+  Future<void> _restartTrafficPollingTimer() async {
+    _trafficPollTimer?.cancel();
+    final interval = _pollIntervalForTrafficMode(_trafficSamplingMode);
+    _trafficPollTimer = Timer.periodic(interval, (_) async {
+      if (_trafficPollInProgress) {
+        return;
+      }
+      _trafficPollInProgress = true;
+      try {
+        final sample = await fetchTrafficSample(useDelta: true);
+        if (sample != null) {
+          _trafficSampleController.add(sample);
+          _trafficController.add(sample.totalBps);
+        }
+      } finally {
+        _trafficPollInProgress = false;
+      }
+    });
+  }
+
+  Duration _pollIntervalForTrafficMode(TrafficSamplingMode mode) {
+    switch (mode) {
+      case TrafficSamplingMode.foreground:
+        return _trafficForegroundPollInterval;
+      case TrafficSamplingMode.background:
+        return _trafficBackgroundPollInterval;
+      case TrafficSamplingMode.stopped:
+        return _trafficBackgroundPollInterval;
+    }
   }
 
   int? _extractXrayStatValue(String payload, String statName) {
@@ -1280,8 +1493,7 @@ if (-not \$s) { exit 0 }
     for (final entry in counters.entries) {
       final name = entry.key;
       if (!name.startsWith('outbound>>>')) continue;
-      if (name.contains('>>>api>>>') ||
-          name.contains('>>>block>>>')) {
+      if (name.contains('>>>api>>>') || name.contains('>>>block>>>')) {
         continue;
       }
       if (name.endsWith('>>>traffic>>>downlink')) {
@@ -1316,6 +1528,115 @@ if (-not \$s) { exit 0 }
     return (down, up);
   }
 
+  void _resetConnectionLogging({required bool enableDiskLogging}) {
+    _connectionLogDiskEnabled = enableDiskLogging;
+    _connectionLogFile = null;
+    _pendingConnectionLogLines.clear();
+    _memoryConnectionLogLines.clear();
+    _connectionLogFlushTimer?.cancel();
+    _connectionLogFlushTimer = null;
+    _connectionLogFlushInProgress = false;
+    _droppedConnectionLogLines = 0;
+    _connectionLogThrottleMarkerQueued = false;
+  }
+
+  void _beginConnectDiagnostics() {
+    _lastConnectPhaseDurationsMs.clear();
+    _lastConnectProcessLaunchCounts.clear();
+  }
+
+  Future<T> _measureConnectPhase<T>(
+    String phase,
+    Future<T> Function() action,
+  ) async {
+    final sw = Stopwatch()..start();
+    try {
+      return await action();
+    } finally {
+      _lastConnectPhaseDurationsMs[phase] = sw.elapsedMilliseconds;
+    }
+  }
+
+  void _recordProcessLaunch(String category) {
+    _lastConnectProcessLaunchCounts.update(
+      category,
+      (value) => value + 1,
+      ifAbsent: () => 1,
+    );
+  }
+
+  String _categorizeProcessLaunch(String executable, List<String> arguments) {
+    final normalized = executable.toLowerCase();
+    if (normalized == 'powershell' || normalized.endsWith('\\powershell.exe')) {
+      return 'powershell';
+    }
+    if (normalized == 'netsh' || normalized.endsWith('\\netsh.exe')) {
+      return 'netsh';
+    }
+    if (normalized == 'taskkill' || normalized.endsWith('\\taskkill.exe')) {
+      return 'taskkill';
+    }
+    if (arguments.isNotEmpty && arguments.first == 'api') {
+      return 'xray api';
+    }
+    return 'xray-core';
+  }
+
+  Future<ProcessResult> _runMeasuredProcess(
+    String executable,
+    List<String> arguments,
+  ) async {
+    _recordProcessLaunch(_categorizeProcessLaunch(executable, arguments));
+    return _processRunner(executable, arguments);
+  }
+
+  Future<Process> _startMeasuredProcess(
+    String executable,
+    List<String> arguments, {
+    Map<String, String>? environment,
+  }) async {
+    _recordProcessLaunch(_categorizeProcessLaunch(executable, arguments));
+    return _processStarter(executable, arguments, environment: environment);
+  }
+
+  void _emitConnectDiagnosticsIfNeeded({required bool success}) {
+    if (!_isWindows) return;
+    if (!_developerModeEnabled && success) return;
+    if (_lastConnectPhaseDurationsMs.isEmpty &&
+        _lastConnectProcessLaunchCounts.isEmpty) {
+      return;
+    }
+    final phaseSummary = _lastConnectPhaseDurationsMs.entries
+        .map((entry) => '${entry.key}=${entry.value}ms')
+        .join(', ');
+    final processSummary = _lastConnectProcessLaunchCounts.entries
+        .map((entry) => '${entry.key}=${entry.value}')
+        .join(', ');
+    if (phaseSummary.isNotEmpty) {
+      _appendConnectionLog('[diag] phases: $phaseSummary');
+    }
+    if (processSummary.isNotEmpty) {
+      _appendConnectionLog('[diag] processes: $processSummary');
+    }
+  }
+
+  Future<void> _captureFailureDiagnostics(String message) async {
+    _appendConnectionLog('[diag] failure: $message');
+    _emitConnectDiagnosticsIfNeeded(success: false);
+    await _enablePersistentConnectionLog(reason: 'connect-failed');
+    await _flushConnectionLog(force: true);
+  }
+
+  Future<void> _enablePersistentConnectionLog({required String reason}) async {
+    if (_connectionLogFile != null) {
+      _connectionLogDiskEnabled = true;
+      _appendConnectionLog('[diag] persistent log enabled: $reason');
+      return;
+    }
+    _connectionLogDiskEnabled = true;
+    await _createConnectionLogFile(reason: reason);
+  }
+
   void _emitChunk(String chunk, {required bool isError}) {
     final lines = chunk.split(RegExp(r'[\r\n]+'));
     for (final raw in lines) {
@@ -1346,9 +1667,13 @@ if (-not \$s) { exit 0 }
   }
 
   void _appendConnectionLog(String log) {
-    if (_connectionLogFile == null) return;
     final trimmed = log.trim();
     if (trimmed.isEmpty) return;
+    _memoryConnectionLogLines.add(trimmed);
+    if (_memoryConnectionLogLines.length > _maxMemoryConnectionLogLines) {
+      _memoryConnectionLogLines.removeAt(0);
+    }
+    if (!_connectionLogDiskEnabled || _connectionLogFile == null) return;
     if (_pendingConnectionLogLines.length >= _maxPendingConnectionLogLines) {
       _droppedConnectionLogLines++;
       _connectionLogThrottleMarkerQueued = true;
@@ -1359,7 +1684,7 @@ if (-not \$s) { exit 0 }
     _scheduleConnectionLogFlush();
   }
 
-  Future<void> _createConnectionLogFile() async {
+  Future<void> _createConnectionLogFile({String? reason}) async {
     try {
       await _flushConnectionLog(force: true);
       _connectionLogFlushTimer?.cancel();
@@ -1377,7 +1702,14 @@ if (-not \$s) { exit 0 }
         '=== Connection Attempt Log ===\nStart Time: $now\n\n',
       );
       _connectionLogFile = logFile;
+      if (_memoryConnectionLogLines.isNotEmpty) {
+        final seedPayload = '${_memoryConnectionLogLines.join('\n')}\n';
+        await logFile.writeAsString(seedPayload, mode: FileMode.append);
+      }
       _appendConnectionLog('Log file created: ${logFile.path}');
+      if (reason != null && reason.isNotEmpty) {
+        _appendConnectionLog('[diag] log file reason: $reason');
+      }
     } catch (e) {
       // Error creating connection log - ignore
     }
@@ -1473,7 +1805,10 @@ if (-not \$s) { exit 0 }
       );
       if (_isWindows && routeSession != null) {
         final routeLogs = <String>[];
-        await _windowsRouteManager.cleanupSession(routeSession, logs: routeLogs);
+        await _windowsRouteManager.cleanupSession(
+          routeSession,
+          logs: routeLogs,
+        );
         _emitLogs(routeLogs);
       }
       if (_isWindows && interfaceName != null) {
@@ -1553,15 +1888,6 @@ if (-not \$s) { exit 0 }
         _appendConnectionLog('Waiting for TUN adapter to come up...');
         final deadline = DateTime.now().add(const Duration(seconds: 6));
         while (DateTime.now().isBefore(deadline)) {
-          final adapterUp = await _tunGuard.waitForAdapterUp(
-            interfaceName,
-            timeout: const Duration(milliseconds: 120),
-          );
-          if (adapterUp) {
-            _appendConnectionLog('TUN adapter is up and ready');
-            return null;
-          }
-
           if (_hasTunReadySignal()) {
             final apiReady = await _isWindowsCoreApiResponsive();
             if (apiReady) {
@@ -1572,7 +1898,16 @@ if (-not \$s) { exit 0 }
             }
           }
 
-          await Future.delayed(const Duration(milliseconds: 120));
+          final adapterUp = await _tunGuard.waitForAdapterUp(
+            interfaceName,
+            timeout: const Duration(milliseconds: 250),
+          );
+          if (adapterUp) {
+            _appendConnectionLog('TUN adapter is up and ready');
+            return null;
+          }
+
+          await Future.delayed(const Duration(milliseconds: 180));
         }
 
         final hint =
@@ -1603,7 +1938,7 @@ if (-not \$s) { exit 0 }
     try {
       final exePath = await _binaryManager.resolveExecutable();
       if (exePath == null) return false;
-      final result = await _processRunner(exePath, [
+      final result = await _runMeasuredProcess(exePath, [
         'api',
         'statsquery',
         '--server=127.0.0.1:$_xrayApiPort',
@@ -1730,3 +2065,102 @@ enum _StartupFailureClass {
   fatal,
 }
 
+class _WindowsRuntimeSessionState {
+  const _WindowsRuntimeSessionState({
+    required this.dirty,
+    this.interfaceName,
+    this.remoteHost,
+    this.pid,
+    this.updatedAt,
+  });
+
+  final bool dirty;
+  final String? interfaceName;
+  final String? remoteHost;
+  final int? pid;
+  final DateTime? updatedAt;
+
+  factory _WindowsRuntimeSessionState.fromJson(Map<String, dynamic> json) {
+    return _WindowsRuntimeSessionState(
+      dirty: json['dirty'] == true,
+      interfaceName: json['interfaceName'] as String?,
+      remoteHost: json['remoteHost'] as String?,
+      pid: json['pid'] is int
+          ? json['pid'] as int
+          : int.tryParse('${json['pid'] ?? ''}'),
+      updatedAt: json['updatedAt'] is String
+          ? DateTime.tryParse(json['updatedAt'] as String)
+          : null,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return <String, dynamic>{
+      'dirty': dirty,
+      'interfaceName': interfaceName,
+      'remoteHost': remoteHost,
+      'pid': pid,
+      'updatedAt': updatedAt?.toIso8601String(),
+    };
+  }
+}
+
+class _WindowsRuntimeSessionStore {
+  const _WindowsRuntimeSessionStore();
+
+  Future<File> _markerFile() async {
+    final dir = Directory('${Directory.systemTemp.path}/neuravpn_runtime');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return File('${dir.path}/windows_session_marker.json');
+  }
+
+  Future<_WindowsRuntimeSessionState> read() async {
+    try {
+      final file = await _markerFile();
+      if (!await file.exists()) {
+        return const _WindowsRuntimeSessionState(dirty: false);
+      }
+      final raw = await file.readAsString();
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) {
+        return const _WindowsRuntimeSessionState(dirty: false);
+      }
+      return _WindowsRuntimeSessionState.fromJson(decoded);
+    } catch (_) {
+      return const _WindowsRuntimeSessionState(dirty: false);
+    }
+  }
+
+  Future<void> markDirty({
+    String? interfaceName,
+    String? remoteHost,
+    int? pid,
+  }) async {
+    try {
+      final file = await _markerFile();
+      final state = _WindowsRuntimeSessionState(
+        dirty: true,
+        interfaceName: interfaceName,
+        remoteHost: remoteHost,
+        pid: pid,
+        updatedAt: DateTime.now(),
+      );
+      await file.writeAsString(jsonEncode(state.toJson()), flush: true);
+    } catch (_) {
+      // Best-effort marker update.
+    }
+  }
+
+  Future<void> clear() async {
+    try {
+      final file = await _markerFile();
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (_) {
+      // Best-effort marker cleanup.
+    }
+  }
+}
