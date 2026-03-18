@@ -58,11 +58,14 @@ class WindowsRouteManager {
   WindowsRouteManager({
     WindowsRouteProcessRunner? processRunner,
     bool? isWindowsOverride,
+    void Function(String category)? processLaunchRecorder,
   }) : _processRunner = processRunner ?? _defaultProcessRunner,
-       _isWindowsOverride = isWindowsOverride;
+       _isWindowsOverride = isWindowsOverride,
+       _processLaunchRecorder = processLaunchRecorder;
 
   final WindowsRouteProcessRunner _processRunner;
   final bool? _isWindowsOverride;
+  final void Function(String category)? _processLaunchRecorder;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
 
@@ -180,8 +183,7 @@ class WindowsRouteManager {
     List<String> logs,
   ) async {
     final escapedPreferred = _escapePs(preferredTunInterface);
-    final result = await _runPowerShell(
-      '''
+    final result = await _runPowerShell('''
 \$preferred = '$escapedPreferred'
 \$items = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
 Where-Object { \$_.Name -eq \$preferred -or \$_.Name -eq 'xray0' -or \$_.Name -like 'xray*' -or \$_.Name -like 'tun-in*' -or \$_.Name -like 'wintun*' } |
@@ -189,9 +191,7 @@ Select-Object Name, InterfaceIndex
 if (-not \$items) { exit 0 }
 \$selected = \$items | Sort-Object @{ Expression = { if (\$_.Name -eq \$preferred) { 0 } elseif (\$_.Name -eq 'xray0') { 1 } elseif (\$_.Name -like 'xray*') { 2 } else { 3 } } } | Select-Object -First 1
 \$selected | ConvertTo-Json -Compress
-''',
-      logs,
-    );
+''', logs);
     if (result.exitCode != 0) return null;
     final parsed = _decodeJson(result.stdout);
     if (parsed is! Map) return null;
@@ -203,16 +203,13 @@ if (-not \$items) { exit 0 }
   }
 
   Future<String?> _findTunAddress(int interfaceIndex, List<String> logs) async {
-    final result = await _runPowerShell(
-      '''
+    final result = await _runPowerShell('''
 \$items = Get-NetIPAddress -InterfaceIndex $interfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
 Where-Object { \$_.IPAddress -and \$_.IPAddress -ne '0.0.0.0' } |
 Sort-Object @{ Expression = { if (\$_.IPAddress -like '169.254.*') { 1 } else { 0 } } }
 if (-not \$items) { exit 0 }
 (\$items | Select-Object -First 1 -ExpandProperty IPAddress) | ConvertTo-Json -Compress
-''',
-      logs,
-    );
+''', logs);
     if (result.exitCode != 0) return null;
     final parsed = _decodeJson(result.stdout);
     final address = parsed?.toString().trim();
@@ -229,9 +226,10 @@ if (-not \$items) { exit 0 }
     return _looksLikeIpv4(address) ? address : null;
   }
 
-  Future<WindowsRouteUplink?> _findPrimaryDefaultRoute(List<String> logs) async {
-    final result = await _runPowerShell(
-      r'''
+  Future<WindowsRouteUplink?> _findPrimaryDefaultRoute(
+    List<String> logs,
+  ) async {
+    final result = await _runPowerShell(r'''
 $routes =
   Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
   Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' -and $_.InterfaceAlias -notlike 'Loopback*' } |
@@ -252,9 +250,7 @@ $routes =
   } |
   Sort-Object RouteMetric, InterfaceMetric
 $routes | Select-Object -First 1 | ConvertTo-Json -Compress
-''',
-      logs,
-    );
+''', logs);
     if (result.exitCode != 0) return null;
     final parsed = _decodeJson(result.stdout);
     if (parsed is! Map) return null;
@@ -322,8 +318,7 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
     required List<String> logs,
   }) async {
     final protectedJson = jsonEncode(protectedPrefixes);
-    final result = await _runPowerShell(
-      '''
+    final result = await _runPowerShell('''
 \$protected = ConvertFrom-Json @'
 $protectedJson
 '@
@@ -342,9 +337,7 @@ Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -
 Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -NextHop \$tunAddress -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-''',
-      logs,
-    );
+''', logs);
     return result.exitCode == 0;
   }
 
@@ -404,6 +397,7 @@ foreach ($iface in $ifaces) {
     bool tolerateFailure = false,
   }) async {
     try {
+      _processLaunchRecorder?.call(_categorize(executable));
       final result = await _processRunner(executable, arguments);
       logs.add('$executable ${arguments.join(' ')} => ${result.exitCode}');
       final stderr = '${result.stderr}'.trim();
@@ -424,16 +418,21 @@ foreach ($iface in $ifaces) {
   }) {
     return _run(
       'powershell',
-      [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        script,
-      ],
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
       logs,
       tolerateFailure: tolerateFailure,
     );
+  }
+
+  String _categorize(String executable) {
+    final normalized = executable.toLowerCase();
+    if (normalized == 'powershell' || normalized.endsWith('\\powershell.exe')) {
+      return 'powershell';
+    }
+    if (normalized == 'netsh' || normalized.endsWith('\\netsh.exe')) {
+      return 'netsh';
+    }
+    return normalized;
   }
 
   dynamic _decodeJson(Object? raw) {

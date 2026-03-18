@@ -308,7 +308,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   _WindowsView _windowsView = _WindowsView.connection;
   bool _showLoadingScreen = Platform.isWindows && !debugForceMobileShell;
   late final PageController _windowsPageController;
-  bool _singBoxWatchdogStarted = false;
   static const List<_WindowsView> _windowsViewOrder = [
     _WindowsView.connection,
     _WindowsView.splitTunneling,
@@ -333,7 +332,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   final ScrollController _logScrollController = ScrollController();
   Timer? _logFlushTimer;
   final List<String> _pendingLogLines = <String>[];
-  bool _trafficFetchInProgress = false;
   final List<double> _trafficHistory = <double>[];
   final List<double> _trafficUplinkHistory = <double>[];
   final List<double> _trafficDownlinkHistory = <double>[];
@@ -564,7 +562,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       _trayManager.addListener(this);
       unawaited(_initDesktopShell());
       if (_isWindowsShellPlatform) {
-        unawaited(_startVpnCoreWatchdog());
+        unawaited(_prepareWindowsRuntime());
         WidgetsBinding.instance.addPostFrameCallback((_) {
           unawaited(_fitWindowToDisplay());
         });
@@ -577,8 +575,16 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   Future<void> _bootstrapInitialState() async {
     await _loadInitialData();
+    await _prepareWindowsRuntime();
     await _handleInitialLaunchArgs();
     await _handleInitialAndroidLaunchUri();
+  }
+
+  Future<void> _prepareWindowsRuntime() async {
+    if (!_isWindowsShellPlatform) return;
+    await _vpnCoreController.prepareWindowsRuntime(
+      onLog: (line) => _appendLogs([line]),
+    );
   }
 
   Future<void> _ensureWindowsUriProtocolRegistered() async {
@@ -1307,6 +1313,7 @@ $regItems = foreach ($rp in $regPaths) {
       _trafficDownlinkHistory.addAll(List<double>.filled(20, 0));
     }
     unawaited(_vpnCoreController.startTrafficStream());
+    unawaited(_syncTrafficSamplingMode());
     _trafficSub = _vpnCoreController.trafficSampleStream.listen((sample) {
       if (!mounted) return;
       setState(() {
@@ -1368,7 +1375,6 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _stopTrafficMonitor() async {
     _trafficSub?.cancel();
     _trafficSub = null;
-    _trafficFetchInProgress = false;
     _trafficHistory.clear();
     _trafficUplinkHistory.clear();
     _trafficDownlinkHistory.clear();
@@ -1378,6 +1384,36 @@ $regItems = foreach ($rp in $regPaths) {
     if (_isWindowsShellPlatform) {
       // Даем немного времени для полной остановки Windows traffic stream.
       await Future.delayed(const Duration(milliseconds: 200));
+    }
+  }
+
+  Future<void> _syncTrafficSamplingMode() async {
+    if (!Platform.isWindows) return;
+    if (!_isRunning) {
+      await _vpnCoreController.setTrafficSamplingMode(
+        TrafficSamplingMode.stopped,
+      );
+      return;
+    }
+    if (_trayPopupMode) {
+      await _vpnCoreController.setTrafficSamplingMode(
+        TrafficSamplingMode.background,
+      );
+      return;
+    }
+    try {
+      final isVisible = _isDesktopPlatform
+          ? await windowManager.isVisible()
+          : true;
+      await _vpnCoreController.setTrafficSamplingMode(
+        isVisible
+            ? TrafficSamplingMode.foreground
+            : TrafficSamplingMode.background,
+      );
+    } catch (_) {
+      await _vpnCoreController.setTrafficSamplingMode(
+        TrafficSamplingMode.foreground,
+      );
     }
   }
 
@@ -2002,35 +2038,6 @@ $regItems = foreach ($rp in $regPaths) {
     await _setupTrayIcon();
   }
 
-  Future<void> _startVpnCoreWatchdog() async {
-    if (_singBoxWatchdogStarted || !Platform.isWindows) return;
-    _singBoxWatchdogStarted = true;
-    final parentPid = pid;
-    final command =
-        '\$parent=$parentPid;'
-        'while (Get-Process -Id \$parent -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 };'
-        'Start-Sleep -Milliseconds 200;'
-        "Stop-Process -Name 'xray' -Force -ErrorAction SilentlyContinue;"
-        r"$ifaces = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | "
-        r"Where-Object { $_.Name -like 'xray*' -or $_.Name -like 'tun-in*' -or $_.Name -like 'wintun*' };"
-        r"foreach ($iface in $ifaces) { "
-        r"Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
-        r"Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
-        r"Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue; "
-        r"}";
-    try {
-      await Process.start('powershell', [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-Command',
-        command,
-      ], mode: ProcessStartMode.detached);
-    } catch (_) {
-      // Ignore: best-effort watchdog for forced app termination.
-    }
-  }
-
   Future<void> _fitWindowToDisplay() async {
     final displayWorkArea =
         await _resolveCurrentDisplayWorkAreaSize() ??
@@ -2127,6 +2134,7 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _hideToTray({bool showHint = false}) async {
     if (!_isDesktopPlatform) return;
     await windowManager.hide();
+    unawaited(_syncTrafficSamplingMode());
     if (showHint && mounted) {
       _showFastSnack('Свернуто в трей');
     }
@@ -2166,6 +2174,8 @@ $regItems = foreach ($rp in $regPaths) {
       unawaited(_fitWindowToDisplay());
     }
 
+    unawaited(_syncTrafficSamplingMode());
+
     _trayRestoreBounds = null;
     _trayRestoreWasVisible = false;
   }
@@ -2195,6 +2205,7 @@ $regItems = foreach ($rp in $regPaths) {
     await windowManager.setAlwaysOnTop(true);
     await windowManager.show();
     await windowManager.focus();
+    unawaited(_syncTrafficSamplingMode());
   }
 
   Offset _getCursorPosition() {
@@ -2211,6 +2222,7 @@ $regItems = foreach ($rp in $regPaths) {
       await windowManager.show();
     }
     await windowManager.focus();
+    unawaited(_syncTrafficSamplingMode());
   }
 
   Future<Size?> _resolveCurrentDisplayWorkAreaSize() async {
@@ -2794,6 +2806,7 @@ $regItems = foreach ($rp in $regPaths) {
         unawaited(_updateTrayMenu());
         _updateConnectGlowTicker();
         _stopTrafficMonitor();
+        unawaited(_syncTrafficSamplingMode());
         return;
       }
 
@@ -2815,6 +2828,7 @@ $regItems = foreach ($rp in $regPaths) {
       unawaited(_updateTrayMenu());
       _updateConnectGlowTicker();
       _stopTrafficMonitor();
+      unawaited(_syncTrafficSamplingMode());
       return;
     }
 
@@ -2827,8 +2841,11 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
     _startTrafficMonitor();
+    unawaited(_syncTrafficSamplingMode());
     unawaited(_applyDpiEvasionInjector());
-    unawaited(_refreshMetrics(silent: true));
+    if (_smartRouting) {
+      unawaited(_refreshMetrics(silent: true));
+    }
   }
 
   void _onMainConnectButtonPressed({
@@ -2912,6 +2929,7 @@ $regItems = foreach ($rp in $regPaths) {
     }
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
+    unawaited(_syncTrafficSamplingMode());
   }
 
   Future<void> _applyDpiEvasionInjector() async {
