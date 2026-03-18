@@ -89,7 +89,6 @@ class WindowsRouteManager {
     }
 
     final logs = <String>[];
-    await cleanupStale(logs: logs);
 
     final tun = await _findTunInterface(preferredTunInterface, logs);
     if (tun == null) {

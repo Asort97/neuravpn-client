@@ -137,6 +137,8 @@ class VpnCoreController {
   bool _connectionLogFlushInProgress = false;
   bool _connectionLogDiskEnabled = false;
   bool _developerModeEnabled = false;
+  String? _verifiedWindowsBinaryPath;
+  String? _verifiedWindowsBinarySignature;
   int _droppedConnectionLogLines = 0;
   bool _connectionLogThrottleMarkerQueued = false;
   int _sessionEpoch = 0;
@@ -793,6 +795,10 @@ class VpnCoreController {
 
   Future<String?> _verifyWindowsCoreBinary(String executablePath) async {
     if (!_isWindows) return null;
+    if (_verifiedWindowsBinaryPath == executablePath &&
+        _verifiedWindowsBinarySignature == _windowsCoreAdapter.processName) {
+      return null;
+    }
     try {
       final result = await _runMeasuredProcess(executablePath, const [
         'version',
@@ -806,6 +812,8 @@ class VpnCoreController {
       if (!output.contains(expected)) {
         return 'Неверный Windows core binary: ожидается xray-core';
       }
+      _verifiedWindowsBinaryPath = executablePath;
+      _verifiedWindowsBinarySignature = _windowsCoreAdapter.processName;
       return null;
     } catch (e) {
       return 'Не удалось проверить xray-core binary: $e';
@@ -840,7 +848,7 @@ class VpnCoreController {
     final jsonConfig = _buildConfigJson(
       parsed: _parsedLink!,
       splitConfig: splitConfig,
-      inboundTag: _activeInterfaceName ?? WindowsTunGuard.defaultInboundTag,
+      inboundTag: _activeWindowsInboundTag,
       interfaceName:
           _activeInterfaceName ?? WindowsTunGuard.defaultInterfaceName,
       interfaceAddresses: const ['172.19.0.1/30'],
@@ -1123,13 +1131,10 @@ class VpnCoreController {
     if (!_isWindows) return null;
     if (_process == null) return null;
     try {
-      final exePath = await _binaryManager.resolveExecutable();
-      if (exePath == null) {
-        return null;
-      }
       int? down;
       int? up;
       String? source;
+      String? exePath;
 
       // 1) Default steady-state source: Windows adapter byte counters.
       final adapterPair = await _fetchAdapterTrafficPair();
@@ -1141,6 +1146,10 @@ class VpnCoreController {
 
       // 2) Fallback: exact TUN inbound counters via `api stats`.
       if (down == null && up == null) {
+        exePath ??= await _binaryManager.resolveExecutable();
+        if (exePath == null) {
+          return null;
+        }
         final tunPair = await _fetchTrafficPairByStatsApi(
           exePath: exePath,
           downlinkName:
@@ -1156,6 +1165,10 @@ class VpnCoreController {
 
       // 3) Secondary API source: active outbound counters.
       if (down == null && up == null) {
+        exePath ??= await _binaryManager.resolveExecutable();
+        if (exePath == null) {
+          return null;
+        }
         final activePair = await _fetchTrafficPairByStatsApi(
           exePath: exePath,
           downlinkName:
@@ -1172,6 +1185,10 @@ class VpnCoreController {
 
       // 4) Final compatibility fallback: full statsquery parser.
       if (down == null && up == null) {
+        exePath ??= await _binaryManager.resolveExecutable();
+        if (exePath == null) {
+          return null;
+        }
         final result = await _runMeasuredProcess(exePath, [
           'api',
           'statsquery',
@@ -1854,7 +1871,7 @@ if (-not \$s) { exit 0 }
     process.kill(ProcessSignal.sigterm);
     try {
       await process.exitCode.timeout(
-        const Duration(milliseconds: 1800),
+        const Duration(milliseconds: 900),
         onTimeout: () {
           process.kill(ProcessSignal.sigkill);
           return -1;
@@ -1871,7 +1888,7 @@ if (-not \$s) { exit 0 }
     try {
       try {
         final exitCode = await process.exitCode.timeout(
-          const Duration(milliseconds: 550),
+          const Duration(milliseconds: 250),
         );
         final hint =
             _lastStartError ??
@@ -1886,28 +1903,28 @@ if (-not \$s) { exit 0 }
       }
       if (_isWindows) {
         _appendConnectionLog('Waiting for TUN adapter to come up...');
-        final deadline = DateTime.now().add(const Duration(seconds: 6));
+        final deadline = DateTime.now().add(const Duration(seconds: 3));
         while (DateTime.now().isBefore(deadline)) {
-          if (_hasTunReadySignal()) {
-            final apiReady = await _isWindowsCoreApiResponsive();
-            if (apiReady) {
-              _appendConnectionLog(
-                'Windows core is ready via xray runtime signal/API',
-              );
-              return null;
-            }
+          final apiReady = await _isWindowsCoreApiResponsive();
+          if (apiReady) {
+            _appendConnectionLog(
+              'Windows core is ready via xray runtime signal/API',
+            );
+            return null;
           }
 
-          final adapterUp = await _tunGuard.waitForAdapterUp(
-            interfaceName,
-            timeout: const Duration(milliseconds: 250),
-          );
+          final adapterUp = await _tunGuard.isAdapterUp(interfaceName);
           if (adapterUp) {
             _appendConnectionLog('TUN adapter is up and ready');
             return null;
           }
 
-          await Future.delayed(const Duration(milliseconds: 180));
+          if (_hasTunReadySignal()) {
+            _appendConnectionLog('Windows core reported TUN ready signal');
+            return null;
+          }
+
+          await Future.delayed(const Duration(milliseconds: 120));
         }
 
         final hint =
@@ -1936,14 +1953,13 @@ if (-not \$s) { exit 0 }
   Future<bool> _isWindowsCoreApiResponsive() async {
     if (!_isWindows || _process == null) return false;
     try {
-      final exePath = await _binaryManager.resolveExecutable();
-      if (exePath == null) return false;
-      final result = await _runMeasuredProcess(exePath, [
-        'api',
-        'statsquery',
-        '--server=127.0.0.1:$_xrayApiPort',
-      ]);
-      return result.exitCode == 0;
+      final socket = await Socket.connect(
+        '127.0.0.1',
+        _xrayApiPort,
+        timeout: const Duration(milliseconds: 120),
+      );
+      socket.destroy();
+      return true;
     } catch (_) {
       return false;
     }

@@ -1845,6 +1845,24 @@ $regItems = foreach ($rp in $regPaths) {
     if (!Platform.isWindows) return;
     if (!_isRunning || _isConnecting || _isDisconnecting) return;
     final nextConfig = _configForConnection;
+    final requiresSessionReset =
+        previousConfig != null &&
+        _requiresWindowsSessionResetForRuleChange(previousConfig, nextConfig);
+    if (requiresSessionReset) {
+      _appendLogs([
+        '[xray] Rules changed, doing controlled reconnect to apply fresh routing',
+      ]);
+      if (mounted) {
+        _showFastSnack(
+          'Правила изменены. Переподключаем для применения новых маршрутов.',
+        );
+      }
+      await _stop();
+      if (!mounted) return;
+      await _start();
+      return;
+    }
+
     final applied = await _vpnCoreController.hotReloadWindowsRules(
       splitConfig: nextConfig,
       developerMode: _developerMode,
@@ -1853,23 +1871,6 @@ $regItems = foreach ($rp in $regPaths) {
       onLog: (line) => _appendLogs([line]),
     );
     if (applied) {
-      final requiresSessionReset =
-          previousConfig != null &&
-          _requiresWindowsSessionResetForRuleChange(previousConfig, nextConfig);
-      if (requiresSessionReset) {
-        _appendLogs([
-          '[xray] Rules applied, reconnecting to drop stale sessions',
-        ]);
-        if (mounted) {
-          _showFastSnack(
-            'Правила применены. Переподключаем для сброса старых сессий.',
-          );
-        }
-        await _stop();
-        if (!mounted) return;
-        await _start();
-        return;
-      }
       _appendLogs(['[xray] Routing rules updated without reconnect']);
       if (mounted) {
         _showFastSnack('Правило применено');
@@ -1895,22 +1896,24 @@ $regItems = foreach ($rp in $regPaths) {
     if (previous.smartRouting != next.smartRouting) {
       return true;
     }
-    if (_hasRemovedRuleEntries(previous.domains, next.domains)) {
+    if (_haveRuleEntriesChanged(previous.domains, next.domains)) {
       return true;
     }
-    if (_hasRemovedRuleEntries(previous.applications, next.applications)) {
+    if (_haveRuleEntriesChanged(previous.applications, next.applications)) {
       return true;
     }
-    if (_hasRemovedRuleEntries(previous.smartDomains, next.smartDomains)) {
+    if (_haveRuleEntriesChanged(previous.smartDomains, next.smartDomains)) {
       return true;
     }
     return false;
   }
 
-  bool _hasRemovedRuleEntries(List<String> previous, List<String> next) {
+  bool _haveRuleEntriesChanged(List<String> previous, List<String> next) {
     final previousSet = previous.map(_normalizeRuleEntry).toSet();
     final nextSet = next.map(_normalizeRuleEntry).toSet();
-    return previousSet.difference(nextSet).isNotEmpty;
+    return previousSet.length != nextSet.length ||
+        previousSet.difference(nextSet).isNotEmpty ||
+        nextSet.difference(previousSet).isNotEmpty;
   }
 
   String _normalizeRuleEntry(String value) => value.trim().toLowerCase();
@@ -2765,8 +2768,7 @@ $regItems = foreach ($rp in $regPaths) {
       await _stop();
       // Проверяем что действительно отключилось
       await _ensureDisconnected();
-      // Даем дополнительное время для полной очистки ресурсов
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(milliseconds: 150));
     }
 
     setState(() {
@@ -2777,7 +2779,6 @@ $regItems = foreach ($rp in $regPaths) {
     });
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
-    _startTrafficMonitor();
     final result = await _vpnCoreController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
@@ -2870,17 +2871,17 @@ $regItems = foreach ($rp in $regPaths) {
   /// Дополнительная проверка полного отключения with retry logic
   Future<void> _ensureDisconnected() async {
     int retries = 0;
-    const maxRetries = 3;
+    const maxRetries = 8;
 
     while (_isRunning && retries < maxRetries) {
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(milliseconds: 150));
       retries++;
     }
 
     if (_isRunning) {
       // Если после попыток еще подключено - попробуем еще раз отключить
       await _vpnCoreController.disconnect(onStatus: (_) {}, onLog: (_) {});
-      await Future.delayed(const Duration(seconds: 1));
+      await Future.delayed(const Duration(milliseconds: 200));
     }
   }
 
@@ -3108,40 +3109,45 @@ $regItems = foreach ($rp in $regPaths) {
   void _showConfigDialog(BuildContext context) {
     showNeuraDialog(
       context: context,
-      builder: (ctx) => NeuraOverlayDialog(
-        title: const Text('Конфигурация VPN core'),
-        width: math.min(MediaQuery.of(ctx).size.width - 24, 920),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Закрыть'),
-          ),
-        ],
-        child: SizedBox(
-          width: math.min(MediaQuery.of(ctx).size.width, 900),
-          child: NeuraGlassSurface(
-            borderRadius: 18,
-            blur: 18,
-            padding: const EdgeInsets.all(12),
-            fillColor: Colors.white.withOpacity(0.03),
-            child: Scrollbar(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
+      builder: (ctx) {
+        final size = MediaQuery.of(ctx).size;
+        return NeuraOverlayDialog(
+          title: const Text('Конфигурация VPN core'),
+          width: math.min(size.width - 24, 920),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Закрыть'),
+            ),
+          ],
+          child: SizedBox(
+            width: math.min(size.width - 48, 900),
+            height: math.min(size.height * 0.7, 620),
+            child: NeuraGlassSurface(
+              borderRadius: 18,
+              blur: 18,
+              padding: const EdgeInsets.all(12),
+              fillColor: Colors.white.withOpacity(0.03),
+              child: Scrollbar(
+                thumbVisibility: true,
                 child: SingleChildScrollView(
-                  child: SelectableText(
-                    _generatedConfig ?? '',
-                    style: const TextStyle(
-                      fontFamily: 'monospace',
-                      fontSize: 11,
-                      color: Colors.white,
+                  scrollDirection: Axis.horizontal,
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      _generatedConfig ?? '',
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        color: Colors.white,
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 

@@ -326,6 +326,13 @@ class WindowsTunGuard {
     return false;
   }
 
+  Future<bool> isAdapterUp(String name) async {
+    if (!_isWindows) return true;
+    if (name.isEmpty) return false;
+    final status = await _readAdapterStatus(name);
+    return status == 'up';
+  }
+
   Future<List<TunAdapterInfo>> _listTunAdapters(List<String> logs) async {
     const includeHiddenCommand = r'''
 Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
