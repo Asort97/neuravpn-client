@@ -33,9 +33,7 @@ class ProfileListView extends StatefulWidget {
 
 class _ProfileListViewState extends State<ProfileListView> {
   void _toast(String message, {NeuraToastTone tone = NeuraToastTone.neutral}) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(buildNeuraSnackBar(context, message, tone: tone));
+    showNeuraToast(context, message, tone: tone);
   }
 
   String _formatVlessSummary(String uri) {
@@ -122,9 +120,7 @@ class _ProfileListViewState extends State<ProfileListView> {
       decoration: BoxDecoration(
         color: _surfaceColor,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: Colors.white.withOpacity(0.08),
-        ),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
       child: Text(
         text,
@@ -298,9 +294,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       child: Text(
         title,
         style: Theme.of(context).textTheme.titleSmall?.copyWith(
-              color: NeuraUi.neutral.withOpacity(0.5),
-              fontWeight: FontWeight.bold,
-            ),
+          color: NeuraUi.neutral.withOpacity(0.5),
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }
@@ -319,7 +315,9 @@ class _ProfileListViewState extends State<ProfileListView> {
             borderRadius: BorderRadius.circular(8),
             color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              color: isSelected
+                  ? _accentColor.withOpacity(0.95)
+                  : Colors.transparent,
               width: isSelected ? 1.3 : 0,
             ),
             boxShadow: isSelected
@@ -335,7 +333,10 @@ class _ProfileListViewState extends State<ProfileListView> {
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            title: _configTitleMarquee(_formatVlessSummary(profile.uri), enabled: true),
+            title: _configTitleMarquee(
+              _formatVlessSummary(profile.uri),
+              enabled: true,
+            ),
             trailing: IconButton(
               tooltip: 'Удалить профиль',
               icon: const Icon(Icons.delete, size: 18, color: NeuraUi.danger),
@@ -492,7 +493,9 @@ class _ProfileListViewState extends State<ProfileListView> {
             borderRadius: BorderRadius.circular(8),
             color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              color: isSelected
+                  ? _accentColor.withOpacity(0.95)
+                  : Colors.transparent,
               width: isSelected ? 1.3 : 0,
             ),
             boxShadow: isSelected

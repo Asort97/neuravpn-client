@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path/path.dart' as path;
+import 'package:screen_retriever/screen_retriever.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:intl/date_symbol_data_local.dart';
@@ -49,6 +50,94 @@ const MethodChannel _windowsLaunchChannel = MethodChannel(
 const MethodChannel _androidLaunchChannel = MethodChannel(
   'neuravpn/android_launch',
 );
+
+const Size _windowsPreferredShellSize = Size(420, 720);
+const Size _desktopPreferredShellSize = Size(1100, 760);
+const Size _desktopPreferredMinSize = Size(900, 640);
+const double _windowSafeMargin = 10.0;
+const double _windowsScreenWidthFraction = 0.18;
+const double _windowsScreenHeightFraction = 0.65;
+
+Size _resolveAdaptiveWindowSize({
+  required Size preferredSize,
+  required Size minimumSize,
+  required Size workAreaSize,
+}) {
+  if (workAreaSize.width <= 0 || workAreaSize.height <= 0) {
+    return preferredSize;
+  }
+
+  final maxWidth = workAreaSize.width > _windowSafeMargin
+      ? workAreaSize.width - _windowSafeMargin
+      : workAreaSize.width;
+  final maxHeight = workAreaSize.height > _windowSafeMargin
+      ? workAreaSize.height - _windowSafeMargin
+      : workAreaSize.height;
+
+  final minWidth = math.min(minimumSize.width, maxWidth);
+  final minHeight = math.min(minimumSize.height, maxHeight);
+
+  final width = preferredSize.width.clamp(minWidth, maxWidth).toDouble();
+  final height = preferredSize.height.clamp(minHeight, maxHeight).toDouble();
+  return Size(width, height);
+}
+
+Future<Size?> _resolvePrimaryDisplayWorkAreaSize() async {
+  try {
+    final display = await screenRetriever.getPrimaryDisplay();
+    return display.size;
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<Size> _resolveStartupWindowSize({
+  required Size preferredSize,
+  required Size minimumSize,
+}) async {
+  final workArea = await _resolvePrimaryDisplayWorkAreaSize();
+  if (workArea == null) {
+    return preferredSize;
+  }
+  return _resolveAdaptiveWindowSize(
+    preferredSize: preferredSize,
+    minimumSize: minimumSize,
+    workAreaSize: workArea,
+  );
+}
+
+Size _resolveWindowsFractionalWindowSize(Size workAreaSize) {
+  if (workAreaSize.width <= 0 || workAreaSize.height <= 0) {
+    return _windowsPreferredShellSize;
+  }
+
+  final maxWidth = workAreaSize.width;
+  final maxHeight = workAreaSize.height;
+
+  if (maxWidth <= 0 || maxHeight <= 0) {
+    return _windowsPreferredShellSize;
+  }
+
+  const minWidth = 220.0;
+  const minHeight = 220.0;
+  final width = (maxWidth * _windowsScreenWidthFraction).clamp(
+    minWidth,
+    maxWidth,
+  );
+  final height = (maxHeight * _windowsScreenHeightFraction).clamp(
+    minHeight,
+    maxHeight,
+  );
+  return Size(width.toDouble(), height.toDouble());
+}
+
+Future<Size> _resolveWindowsStartupWindowSize() async {
+  final workArea = await _resolvePrimaryDisplayWorkAreaSize();
+  if (workArea == null) {
+    return _windowsPreferredShellSize;
+  }
+  return _resolveWindowsFractionalWindowSize(workArea);
+}
 
 @visibleForTesting
 bool isSupportedLaunchImportValue(String value) {
@@ -140,12 +229,20 @@ Future<void> main(List<String> args) async {
   await DomainRuleNormalizer.initializeDefaultRules();
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
     await windowManager.ensureInitialized();
+    final isWindowsDesktop = Platform.isWindows;
+    final startupSize = isWindowsDesktop
+        ? await _resolveWindowsStartupWindowSize()
+        : await _resolveStartupWindowSize(
+            preferredSize: _desktopPreferredShellSize,
+            minimumSize: _desktopPreferredMinSize,
+          );
     final windowOptions = WindowOptions(
-      size: Platform.isWindows ? Size(420, 720) : Size(1100, 760),
-      minimumSize: Platform.isWindows ? Size(320, 560) : Size(900, 640),
+      size: startupSize,
+      minimumSize: isWindowsDesktop ? startupSize : _desktopPreferredMinSize,
+      maximumSize: isWindowsDesktop ? startupSize : null,
       center: true,
       backgroundColor: Colors.transparent,
-      titleBarStyle: Platform.isWindows
+      titleBarStyle: isWindowsDesktop
           ? TitleBarStyle.hidden
           : TitleBarStyle.normal,
       title: 'neuravpn',
@@ -198,6 +295,8 @@ class VlessHomePage extends StatefulWidget {
 
 class _VlessHomePageState extends State<VlessHomePage>
     with TrayListener, WindowListener, SingleTickerProviderStateMixin {
+  static const int _trafficGraphInterpolationSteps = 10;
+  static const double _trafficGraphSmoothingFactor = 0.34;
   static const String _updateOwner = 'Asort97';
   static const String _updateRepo = 'neuravpn-client';
   static const String _updateDismissedTagKey = 'update_dismissed_tag';
@@ -657,7 +756,10 @@ class _VlessHomePageState extends State<VlessHomePage>
             children: [
               Text(
                 '\u0412\u0435\u0440\u0441\u0438\u044f ${result.latestVersion} \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 (\u0443 \u0432\u0430\u0441 ${result.currentVersion}).',
-                style: TextStyle(color: Colors.white.withOpacity(0.75), height: 1.3),
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.75),
+                  height: 1.3,
+                ),
               ),
               if (result.releaseNotes.trim().isNotEmpty) ...[
                 const SizedBox(height: 12),
@@ -1211,17 +1313,17 @@ $regItems = foreach ($rp in $regPaths) {
         _appendTrafficTransition(
           _trafficHistory,
           sample.totalBps.toDouble(),
-          steps: 6,
+          steps: _trafficGraphInterpolationSteps,
         );
         _appendTrafficTransition(
           _trafficUplinkHistory,
           sample.uplinkBps.toDouble(),
-          steps: 6,
+          steps: _trafficGraphInterpolationSteps,
         );
         _appendTrafficTransition(
           _trafficDownlinkHistory,
           sample.downlinkBps.toDouble(),
-          steps: 6,
+          steps: _trafficGraphInterpolationSteps,
         );
         _latestUplinkBps = sample.uplinkBps;
         _latestDownlinkBps = sample.downlinkBps;
@@ -1240,9 +1342,12 @@ $regItems = foreach ($rp in $regPaths) {
     }
     final clampedSteps = math.max(1, steps);
     final last = target.last;
+    final smoothedTarget =
+        last + ((nextValue - last) * _trafficGraphSmoothingFactor);
     for (int i = 1; i <= clampedSteps; i++) {
       final t = i / clampedSteps;
-      final interpolated = last + ((nextValue - last) * t);
+      final easedT = Curves.easeInOutCubic.transform(t.clamp(0.0, 1.0));
+      final interpolated = last + ((smoothedTarget - last) * easedT);
       target.add(interpolated);
     }
     while (target.length > 160) {
@@ -1714,10 +1819,7 @@ $regItems = foreach ($rp in $regPaths) {
     if (applied) {
       final requiresSessionReset =
           previousConfig != null &&
-          _requiresWindowsSessionResetForRuleChange(
-            previousConfig,
-            nextConfig,
-          );
+          _requiresWindowsSessionResetForRuleChange(previousConfig, nextConfig);
       if (requiresSessionReset) {
         _appendLogs([
           '[xray] Rules applied, reconnecting to drop stale sessions',
@@ -1930,16 +2032,15 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _fitWindowToDisplay() async {
-    const targetWidth = 420.0;
-    const targetHeight = 720.0;
-    final current = await windowManager.getSize();
-    final nextWidth = current.width > targetWidth ? targetWidth : current.width;
-    final nextHeight = current.height > targetHeight
-        ? targetHeight
-        : current.height;
-    await windowManager.setSize(Size(nextWidth, nextHeight));
-    await windowManager.setMinimumSize(const Size(420, 720));
-    await windowManager.setMaximumSize(const Size(420, 720));
+    final displayWorkArea =
+        await _resolveCurrentDisplayWorkAreaSize() ??
+        await _resolvePrimaryDisplayWorkAreaSize();
+    final targetSize = _resolveWindowsFractionalWindowSize(
+      displayWorkArea ?? _windowsPreferredShellSize,
+    );
+    await windowManager.setSize(targetSize);
+    await windowManager.setMinimumSize(targetSize);
+    await windowManager.setMaximumSize(targetSize);
     await windowManager.setResizable(false);
     await windowManager.center();
     await windowManager.setTitleBarStyle(
@@ -2102,11 +2203,72 @@ $regItems = foreach ($rp in $regPaths) {
 
   Future<void> _restoreWindowFromTray() async {
     if (!_isDesktopPlatform) return;
+    if (Platform.isWindows) {
+      await _fitWindowToDisplay();
+    }
     final isVisible = await windowManager.isVisible();
     if (!isVisible) {
       await windowManager.show();
     }
     await windowManager.focus();
+  }
+
+  Future<Size?> _resolveCurrentDisplayWorkAreaSize() async {
+    try {
+      final bounds = await windowManager.getBounds();
+      final displays = await screenRetriever.getAllDisplays();
+      if (displays.isEmpty) {
+        return null;
+      }
+
+      Display? selectedDisplay;
+      var selectedIntersection = 0.0;
+      for (final display in displays) {
+        final area = _displayWorkAreaRect(display);
+        final intersection = _rectIntersectionArea(bounds, area);
+        if (intersection > selectedIntersection) {
+          selectedIntersection = intersection;
+          selectedDisplay = display;
+        }
+      }
+
+      if (selectedDisplay == null) {
+        final windowCenter = bounds.center;
+        var bestDistance = double.infinity;
+        for (final display in displays) {
+          final area = _displayWorkAreaRect(display);
+          final distanceSquared =
+              math.pow(windowCenter.dx - area.center.dx, 2) +
+              math.pow(windowCenter.dy - area.center.dy, 2);
+          final distance = distanceSquared.toDouble();
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            selectedDisplay = display;
+          }
+        }
+      }
+
+      if (selectedDisplay == null) {
+        return null;
+      }
+      return selectedDisplay.size;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Rect _displayWorkAreaRect(Display display) {
+    final size = display.size;
+    final position = display.visiblePosition ?? Offset.zero;
+    return Rect.fromLTWH(position.dx, position.dy, size.width, size.height);
+  }
+
+  double _rectIntersectionArea(Rect a, Rect b) {
+    final intersection = a.intersect(b);
+    if (intersection.width <= 0 || intersection.height <= 0) {
+      return 0;
+    }
+    return intersection.width * intersection.height;
   }
 
   Future<void> _handleTrayExit() async {
@@ -2193,7 +2355,7 @@ $regItems = foreach ($rp in $regPaths) {
       _presetDirty = false;
     });
     unawaited(_persistSplitState());
-      _showFastSnack('Пресет сохранён');
+    _showFastSnack('Пресет сохранён');
   }
 
   void _overwriteActivePreset() {
@@ -2443,11 +2605,7 @@ $regItems = foreach ($rp in $regPaths) {
         );
       }
     } catch (e) {
-      showNeuraToast(
-        context,
-        'Ошибка: $e',
-        tone: NeuraToastTone.error,
-      );
+      showNeuraToast(context, 'Ошибка: $e', tone: NeuraToastTone.error);
     }
   }
 
@@ -2852,9 +3010,8 @@ $regItems = foreach ($rp in $regPaths) {
                 borderRadius: 30,
                 blur: 28,
                 padding: const EdgeInsets.all(20),
-                fillColor: theme.colorScheme.surfaceContainerHighest.withOpacity(
-                  0.82,
-                ),
+                fillColor: theme.colorScheme.surfaceContainerHighest
+                    .withOpacity(0.82),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -2875,7 +3032,9 @@ $regItems = foreach ($rp in $regPaths) {
                         IconButton(
                           tooltip: 'Скопировать лог',
                           onPressed: () async {
-                            await Clipboard.setData(ClipboardData(text: logText));
+                            await Clipboard.setData(
+                              ClipboardData(text: logText),
+                            );
                             if (mounted) {
                               showNeuraToast(
                                 context,
@@ -3230,7 +3389,9 @@ $regItems = foreach ($rp in $regPaths) {
                             ),
                             Padding(
                               padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
-                              child: NeuraReveal(child: _buildWindowsTitleBar()),
+                              child: NeuraReveal(
+                                child: _buildWindowsTitleBar(),
+                              ),
                             ),
                           ],
                         ),
@@ -3463,59 +3624,59 @@ $regItems = foreach ($rp in $regPaths) {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 240),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) =>
-                    FadeTransition(opacity: animation, child: child),
-                child: Text(
-                  _tabLabelForView(currentView),
-                  key: ValueKey(currentView),
-                  textAlign: TextAlign.center,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontWeight: FontWeight.w600,
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 240),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  transitionBuilder: (child, animation) =>
+                      FadeTransition(opacity: animation, child: child),
+                  child: Text(
+                    _tabLabelForView(currentView),
+                    key: ValueKey(currentView),
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 10),
+                const SizedBox(height: 10),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: _windowsViewOrder.asMap().entries.map((entry) {
-                  final index = entry.key;
-                  final view = entry.value;
-                  final distance = (page - index).abs().clamp(0.0, 1.0);
-                  final t = 1.0 - distance;
-                  final size = 8.0 + 6.0 * t;
-                  final isActive = _windowsView == view;
+                    final index = entry.key;
+                    final view = entry.value;
+                    final distance = (page - index).abs().clamp(0.0, 1.0);
+                    final t = 1.0 - distance;
+                    final size = 8.0 + 6.0 * t;
+                    final isActive = _windowsView == view;
 
-                  return GestureDetector(
-                    onTap: () => _setWindowsView(view),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 160),
-                      curve: Curves.easeOutCubic,
-                      width: size,
-                      height: size,
-                      margin: const EdgeInsets.symmetric(horizontal: 8),
-                      decoration: BoxDecoration(
-                        color: isActive
-                            ? _neuraRed
-                            : Colors.white.withOpacity(0.28),
-                        shape: BoxShape.circle,
-                        boxShadow: isActive
-                            ? [
-                                BoxShadow(
-                                  color: _neuraRed.withOpacity(0.45),
-                                  blurRadius: 8,
-                                ),
-                              ]
-                            : null,
+                    return GestureDetector(
+                      onTap: () => _setWindowsView(view),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 160),
+                        curve: Curves.easeOutCubic,
+                        width: size,
+                        height: size,
+                        margin: const EdgeInsets.symmetric(horizontal: 8),
+                        decoration: BoxDecoration(
+                          color: isActive
+                              ? _neuraRed
+                              : Colors.white.withOpacity(0.28),
+                          shape: BoxShape.circle,
+                          boxShadow: isActive
+                              ? [
+                                  BoxShadow(
+                                    color: _neuraRed.withOpacity(0.45),
+                                    blurRadius: 8,
+                                  ),
+                                ]
+                              : null,
+                        ),
                       ),
-                    ),
-                  );
+                    );
                   }).toList(),
                 ),
               ],
@@ -3920,10 +4081,7 @@ $regItems = foreach ($rp in $regPaths) {
                     gradient: RadialGradient(
                       center: const Alignment(0, -0.12),
                       radius: 1.0,
-                      colors: [
-                        _neuraRed.withOpacity(0.06),
-                        Colors.transparent,
-                      ],
+                      colors: [_neuraRed.withOpacity(0.06), Colors.transparent],
                       stops: const [0.0, 1.0],
                     ),
                   ),
@@ -4035,7 +4193,9 @@ $regItems = foreach ($rp in $regPaths) {
                             : 1.0;
                         final pulse = _isConnecting
                             ? 1 + 0.03 * math.sin(rotation)
-                            : (isRunning ? 1 + 0.012 * math.sin(rotation) : 1.0);
+                            : (isRunning
+                                  ? 1 + 0.012 * math.sin(rotation)
+                                  : 1.0);
                         final ring = Container(
                           width: 140,
                           height: 140,
@@ -4076,10 +4236,7 @@ $regItems = foreach ($rp in $regPaths) {
                                   ),
                                 ),
                                 if (_isConnecting)
-                                  Transform.rotate(
-                                    angle: rotation,
-                                    child: ring,
-                                  )
+                                  Transform.rotate(angle: rotation, child: ring)
                                 else
                                   ring,
                                 AnimatedContainer(
@@ -4133,10 +4290,16 @@ $regItems = foreach ($rp in $regPaths) {
                                         color: _neuraRed.withOpacity(
                                           isRunning
                                               ? 0.34
-                                              : (_connectButtonHovered ? 0.16 : 0.08),
+                                              : (_connectButtonHovered
+                                                    ? 0.16
+                                                    : 0.08),
                                         ),
-                                        blurRadius: _connectButtonPressed ? 16 : 24,
-                                        spreadRadius: _connectButtonHovered ? 1 : 0,
+                                        blurRadius: _connectButtonPressed
+                                            ? 16
+                                            : 24,
+                                        spreadRadius: _connectButtonHovered
+                                            ? 1
+                                            : 0,
                                       ),
                                     ],
                                   ),
@@ -4196,10 +4359,8 @@ $regItems = foreach ($rp in $regPaths) {
                 duration: NeuraUi.fast,
                 switchInCurve: NeuraUi.curve,
                 switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) => FadeTransition(
-                  opacity: animation,
-                  child: child,
-                ),
+                transitionBuilder: (child, animation) =>
+                    FadeTransition(opacity: animation, child: child),
                 child: Text(
                   throughputLabel,
                   key: ValueKey(throughputLabel),
@@ -5562,7 +5723,9 @@ $regItems = foreach ($rp in $regPaths) {
                         blurRadius: _connectButtonPressed
                             ? 16
                             : (isRunning ? 28 : 18),
-                        spreadRadius: isRunning || _connectButtonHovered ? 2 : 0,
+                        spreadRadius: isRunning || _connectButtonHovered
+                            ? 2
+                            : 0,
                       ),
                     ],
                   ),
@@ -6818,9 +6981,7 @@ class _TrafficGraphPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 10)
-      ..color = downColor.withOpacity(
-        emphasizeBackground ? 0.12 : 0.08,
-      );
+      ..color = downColor.withOpacity(emphasizeBackground ? 0.12 : 0.08);
     final uplinkPaint = Paint()
       ..style = PaintingStyle.stroke
       ..strokeWidth = emphasizeBackground ? 2.1 : 1.8
@@ -6903,9 +7064,7 @@ class _TrafficGraphPainter extends CustomPainter {
           upColor.withOpacity(0.04),
           upColor.withOpacity(emphasizeBackground ? 0.16 : 0.1),
         ],
-      ).createShader(
-        Rect.fromLTWH(0, centerY, size.width, chartHeight * 0.5),
-      );
+      ).createShader(Rect.fromLTWH(0, centerY, size.width, chartHeight * 0.5));
     final downlinkFillPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
@@ -6915,9 +7074,7 @@ class _TrafficGraphPainter extends CustomPainter {
           downColor.withOpacity(0.04),
           Colors.transparent,
         ],
-      ).createShader(
-        Rect.fromLTWH(0, topY, size.width, chartHeight * 0.5),
-      );
+      ).createShader(Rect.fromLTWH(0, topY, size.width, chartHeight * 0.5));
     canvas.drawPath(uplinkFillPath, uplinkFillPaint);
     canvas.drawPath(downlinkFillPath, downlinkFillPaint);
     canvas.drawPath(uplinkPath, uplinkGlowPaint);
@@ -7158,4 +7315,3 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
-

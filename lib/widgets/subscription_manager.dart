@@ -19,9 +19,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
   bool _isLoading = false;
 
   void _toast(String message, {NeuraToastTone tone = NeuraToastTone.neutral}) {
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(buildNeuraSnackBar(context, message, tone: tone));
+    showNeuraToast(context, message, tone: tone);
   }
 
   @override
@@ -192,7 +190,11 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.cloud_off, size: 64, color: NeuraUi.neutral.withOpacity(0.7)),
+                  Icon(
+                    Icons.cloud_off,
+                    size: 64,
+                    color: NeuraUi.neutral.withOpacity(0.7),
+                  ),
                   const SizedBox(height: 16),
                   const Text('Нет подписок'),
                   const SizedBox(height: 16),
@@ -218,7 +220,9 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
                   child: ExpansionTile(
                     leading: Icon(
                       isSelected ? Icons.check_circle : Icons.cloud_download,
-                      color: isSelected ? NeuraUi.success : NeuraUi.neutral.withOpacity(0.6),
+                      color: isSelected
+                          ? NeuraUi.success
+                          : NeuraUi.neutral.withOpacity(0.6),
                     ),
                     title: Text(subscription.name),
                     subtitle: Text('Профилей: ${subscription.profileCount}'),

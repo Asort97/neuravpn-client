@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
@@ -124,6 +125,83 @@ class NeuraUi {
 
 enum NeuraToastTone { neutral, success, warning, error }
 
+OverlayEntry? _neuraToastOverlayEntry;
+AnimationController? _neuraToastAnimationController;
+Timer? _neuraToastDismissTimer;
+
+Widget _buildNeuraToastSurface(
+  String message, {
+  required Color toneColor,
+  required IconData toneIcon,
+  bool showIcon = false,
+}) {
+  return NeuraGlassSurface(
+    borderRadius: 18,
+    blur: 20,
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+    fillColor: NeuraUi.black.withOpacity(0.86),
+    borderColor: toneColor.withOpacity(0.22),
+    glowColor: toneColor,
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        if (showIcon) ...<Widget>[
+          Container(
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: toneColor.withOpacity(0.14),
+              shape: BoxShape.circle,
+            ),
+            child: Icon(toneIcon, color: toneColor, size: 16),
+          ),
+          const SizedBox(width: 10),
+        ],
+        Expanded(
+          child: Text(
+            message,
+            maxLines: 4,
+            overflow: TextOverflow.ellipsis,
+            textScaler: const TextScaler.linear(1),
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              height: 1.2,
+              decoration: TextDecoration.none,
+            ),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+Future<void> _dismissActiveNeuraToast({bool animate = true}) async {
+  _neuraToastDismissTimer?.cancel();
+  _neuraToastDismissTimer = null;
+
+  final entry = _neuraToastOverlayEntry;
+  final controller = _neuraToastAnimationController;
+  _neuraToastOverlayEntry = null;
+  _neuraToastAnimationController = null;
+
+  if (entry == null || controller == null) {
+    entry?.remove();
+    controller?.dispose();
+    return;
+  }
+
+  if (animate && controller.status != AnimationStatus.dismissed) {
+    try {
+      await controller.reverse();
+    } catch (_) {}
+  }
+
+  entry.remove();
+  controller.dispose();
+}
+
 class NeuraGlassSurface extends StatelessWidget {
   const NeuraGlassSurface({
     super.key,
@@ -157,9 +235,7 @@ class NeuraGlassSurface extends StatelessWidget {
     final decoration = BoxDecoration(
       borderRadius: BorderRadius.circular(borderRadius),
       color: fillColor ?? NeuraUi.card.withOpacity(0.72),
-      border: Border.all(
-        color: borderColor ?? Colors.white.withOpacity(0.08),
-      ),
+      border: Border.all(color: borderColor ?? Colors.white.withOpacity(0.08)),
       boxShadow: <BoxShadow>[
         BoxShadow(
           color: Colors.black.withOpacity(0.28),
@@ -345,7 +421,8 @@ Future<T?> showNeuraDialog<T>({
     barrierDismissible: barrierDismissible,
     barrierColor: Colors.black.withOpacity(0.58),
     transitionDuration: NeuraUi.normal,
-    pageBuilder: (context, _, __) => builder(context),
+    pageBuilder: (context, _, __) =>
+        Material(type: MaterialType.transparency, child: builder(context)),
     transitionBuilder: (context, animation, _, child) {
       final curved = CurvedAnimation(
         parent: animation,
@@ -426,7 +503,8 @@ SnackBar buildNeuraSnackBar(
     NeuraToastTone.warning => NeuraUi.warning,
     NeuraToastTone.error => NeuraUi.danger,
   };
-  final toneIcon = icon ??
+  final toneIcon =
+      icon ??
       switch (tone) {
         NeuraToastTone.neutral => Icons.notifications_active_outlined,
         NeuraToastTone.success => Icons.check_circle_outline,
@@ -434,37 +512,11 @@ SnackBar buildNeuraSnackBar(
         NeuraToastTone.error => Icons.error_outline,
       };
   return SnackBar(
-    content: NeuraGlassSurface(
-      borderRadius: 22,
-      blur: 24,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-      fillColor: NeuraUi.black.withOpacity(0.86),
-      borderColor: toneColor.withOpacity(0.22),
-      glowColor: toneColor,
-      child: Row(
-        children: <Widget>[
-          Container(
-            width: 34,
-            height: 34,
-            decoration: BoxDecoration(
-              color: toneColor.withOpacity(0.14),
-              shape: BoxShape.circle,
-            ),
-            child: Icon(toneIcon, color: toneColor, size: 18),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              message,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w600,
-                height: 1.25,
-              ),
-            ),
-          ),
-        ],
-      ),
+    content: _buildNeuraToastSurface(
+      message,
+      toneColor: toneColor,
+      toneIcon: toneIcon,
+      showIcon: false,
     ),
     backgroundColor: Colors.transparent,
     elevation: 0,
@@ -480,9 +532,100 @@ void showNeuraToast(
   NeuraToastTone tone = NeuraToastTone.neutral,
   IconData? icon,
 }) {
-  final messenger = ScaffoldMessenger.of(context);
-  messenger.hideCurrentSnackBar();
-  messenger.showSnackBar(
-    buildNeuraSnackBar(context, message, tone: tone, icon: icon),
+  unawaited(_showNeuraToastInternal(context, message, tone: tone, icon: icon));
+}
+
+Future<void> _showNeuraToastInternal(
+  BuildContext context,
+  String message, {
+  NeuraToastTone tone = NeuraToastTone.neutral,
+  IconData? icon,
+}) async {
+  final toneColor = switch (tone) {
+    NeuraToastTone.neutral => Colors.white,
+    NeuraToastTone.success => NeuraUi.success,
+    NeuraToastTone.warning => NeuraUi.warning,
+    NeuraToastTone.error => NeuraUi.danger,
+  };
+  final toneIcon =
+      icon ??
+      switch (tone) {
+        NeuraToastTone.neutral => Icons.notifications_active_outlined,
+        NeuraToastTone.success => Icons.check_circle_outline,
+        NeuraToastTone.warning => Icons.warning_amber_rounded,
+        NeuraToastTone.error => Icons.error_outline,
+      };
+
+  final overlay = Overlay.maybeOf(context, rootOverlay: true);
+  if (overlay == null) {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      buildNeuraSnackBar(context, message, tone: tone, icon: icon),
+    );
+    return;
+  }
+
+  await _dismissActiveNeuraToast();
+
+  final controller = AnimationController(
+    vsync: overlay,
+    duration: const Duration(milliseconds: 280),
+    reverseDuration: const Duration(milliseconds: 240),
   );
+  final animation = CurvedAnimation(
+    parent: controller,
+    curve: Curves.easeOutCubic,
+    reverseCurve: Curves.easeInCubic,
+  );
+
+  late final OverlayEntry entry;
+  entry = OverlayEntry(
+    builder: (context) => Positioned.fill(
+      child: IgnorePointer(
+        ignoring: true,
+        child: SafeArea(
+          child: Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: FadeTransition(
+                opacity: animation,
+                child: SlideTransition(
+                  position: Tween<Offset>(
+                    begin: const Offset(0, 0.18),
+                    end: Offset.zero,
+                  ).animate(animation),
+                  child: ScaleTransition(
+                    scale: Tween<double>(
+                      begin: 0.97,
+                      end: 1.0,
+                    ).animate(animation),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 420),
+                      child: _buildNeuraToastSurface(
+                        message,
+                        toneColor: toneColor,
+                        toneIcon: toneIcon,
+                        showIcon: false,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  _neuraToastOverlayEntry = entry;
+  _neuraToastAnimationController = controller;
+  overlay.insert(entry);
+
+  await controller.forward();
+  _neuraToastDismissTimer = Timer(const Duration(seconds: 2), () {
+    unawaited(_dismissActiveNeuraToast());
+  });
 }
