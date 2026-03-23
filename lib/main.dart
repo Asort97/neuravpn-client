@@ -427,6 +427,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   int _profileNameCounter = 0;
   int _subscriptionsRefreshToken = 0;
   Timer? _subscriptionRefreshTimer;
+  Timer? _androidStateSyncTimer;
   static const String _profileMetricsKey = 'vpn_profile_metrics';
   static const String _profileCounterKey = 'vpn_profile_counter';
   bool _developerMode = false;
@@ -567,6 +568,12 @@ class _VlessHomePageState extends State<VlessHomePage>
       const Duration(minutes: 10),
       (_) => unawaited(_refreshAllSubscriptions()),
     );
+    if (Platform.isAndroid) {
+      _androidStateSyncTimer = Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_pollAndroidVpnState()),
+      );
+    }
     if (_isWindowsShellPlatform) {
       unawaited(_checkWintun());
       unawaited(_ensureWindowsUriProtocolRegistered());
@@ -1782,6 +1789,34 @@ $regItems = foreach ($rp in $regPaths) {
       _isDisconnecting = false;
     });
     _updateConnectGlowTicker();
+  }
+
+  bool _androidStatePollInProgress = false;
+
+  Future<void> _pollAndroidVpnState() async {
+    if (!Platform.isAndroid || !mounted) return;
+    if (_androidStatePollInProgress) return;
+    if (_isConnecting || _isDisconnecting) return;
+    _androidStatePollInProgress = true;
+    try {
+      final wasRunning = _isRunning;
+      final nowRunning = await _vpnCoreController.syncRuntimeState();
+      if (!mounted || wasRunning == nowRunning) return;
+      // State changed externally (e.g. Quick Settings Tile)
+      setState(() {
+        _status = nowRunning ? 'Подключено' : 'Остановлено';
+        _isConnecting = false;
+        _isDisconnecting = false;
+      });
+      _updateConnectGlowTicker();
+      if (nowRunning) {
+        _startTrafficMonitor();
+      } else {
+        await _stopTrafficMonitor();
+      }
+    } finally {
+      _androidStatePollInProgress = false;
+    }
   }
 
   String _normalizeSplitMode(String? raw) {
@@ -3303,6 +3338,7 @@ $regItems = foreach ($rp in $regPaths) {
   @override
   @override
   void dispose() {
+    _androidStateSyncTimer?.cancel();
     _subscriptionRefreshTimer?.cancel();
     _logFlushTimer?.cancel();
     if (_isWindowsShellPlatform) {
