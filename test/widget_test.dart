@@ -37,7 +37,7 @@ void main() {
     await tester.fling(find.byType(PageView), const Offset(-900, 0), 1800);
     await tester.pump(const Duration(milliseconds: 500));
     expect(
-      find.text('Конфигурация sing-box', skipOffstage: false),
+      find.text('Конфигурация VPN core', skipOffstage: false),
       findsOneWidget,
     );
     expect(find.text('Developer mode', skipOffstage: false), findsNothing);

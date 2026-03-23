@@ -7,6 +7,7 @@ import '../models/vpn_subscription.dart';
 import '../services/subscription_manager.dart';
 import '../services/subscription_repository.dart';
 import '../vless/vless_parser.dart';
+import 'neura_ui.dart';
 
 class ProfileListView extends StatefulWidget {
   const ProfileListView({
@@ -31,6 +32,10 @@ class ProfileListView extends StatefulWidget {
 }
 
 class _ProfileListViewState extends State<ProfileListView> {
+  void _toast(String message, {NeuraToastTone tone = NeuraToastTone.neutral}) {
+    showNeuraToast(context, message, tone: tone);
+  }
+
   String _formatVlessSummary(String uri) {
     final parsed = parseVlessUri(uri);
     if (parsed == null) return uri;
@@ -115,9 +120,7 @@ class _ProfileListViewState extends State<ProfileListView> {
       decoration: BoxDecoration(
         color: _surfaceColor,
         borderRadius: BorderRadius.circular(999),
-        border: Border.all(
-          color: Colors.white.withOpacity(0.08),
-        ),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
       child: Text(
         text,
@@ -218,37 +221,51 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _repository.updateSubscription(updated);
       await _loadSubscriptions();
 
+      // Re-select the same index profile after refresh so selection is not lost.
+      if (widget.selectedProfile != null) {
+        final oldUri = widget.selectedProfile!.uri;
+        // If old URI is still in the new list, keep it; otherwise pick same index.
+        final oldIndex = subscription.profiles.indexOf(oldUri);
+        final newIndex = (oldIndex >= 0 && oldIndex < profiles.length)
+            ? oldIndex
+            : (subscription.selectedIndex < profiles.length
+                ? subscription.selectedIndex
+                : 0);
+        if (newIndex < profiles.length) {
+          final newUri = profiles[newIndex];
+          final profile = VpnProfile(
+            name: _formatVlessSummary(newUri),
+            uri: newUri,
+          );
+          widget.onProfileSelected(profile);
+        }
+      }
+
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Подписка обновлена.')),
-      );
+      _toast('Подписка обновлена.', tone: NeuraToastTone.success);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось обновить подписку: $e')),
-      );
+      _toast('Не удалось обновить подписку: $e', tone: NeuraToastTone.error);
     }
   }
 
   Future<void> _deleteSubscription(VpnSubscription subscription) async {
-    final confirm = await showDialog<bool>(
+    final confirm = await showNeuraDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => NeuraOverlayDialog(
         title: const Text('Удалить подписку?'),
-        content: Text(
+        child: Text(
           'Удалить "${subscription.name}" с устройства? Это действие нельзя отменить.',
+          style: TextStyle(color: Colors.white.withOpacity(0.78)),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
             child: const Text('Отмена'),
           ),
-          TextButton(
+          FilledButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text(
-              'Удалить',
-              style: TextStyle(color: Colors.red),
-            ),
+            child: const Text('Удалить'),
           ),
         ],
       ),
@@ -261,9 +278,7 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _loadSubscriptions();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Не удалось удалить подписку: $e')),
-      );
+      _toast('Не удалось удалить подписку: $e', tone: NeuraToastTone.error);
     }
   }
 
@@ -299,9 +314,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       child: Text(
         title,
         style: Theme.of(context).textTheme.titleSmall?.copyWith(
-              color: Colors.grey[500],
-              fontWeight: FontWeight.bold,
-            ),
+          color: NeuraUi.neutral.withOpacity(0.5),
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }
@@ -320,7 +335,9 @@ class _ProfileListViewState extends State<ProfileListView> {
             borderRadius: BorderRadius.circular(8),
             color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              color: isSelected
+                  ? _accentColor.withOpacity(0.95)
+                  : Colors.transparent,
               width: isSelected ? 1.3 : 0,
             ),
             boxShadow: isSelected
@@ -336,27 +353,30 @@ class _ProfileListViewState extends State<ProfileListView> {
           child: ListTile(
             dense: true,
             contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            title: _configTitleMarquee(_formatVlessSummary(profile.uri), enabled: true),
+            title: _configTitleMarquee(
+              _formatVlessSummary(profile.uri),
+              enabled: true,
+            ),
             trailing: IconButton(
               tooltip: 'Удалить профиль',
-              icon: const Icon(Icons.delete, size: 18, color: Colors.redAccent),
+              icon: const Icon(Icons.delete, size: 18, color: NeuraUi.danger),
               onPressed: () async {
-                final confirm = await showDialog<bool>(
+                final confirm = await showNeuraDialog<bool>(
                   context: context,
-                  builder: (context) => AlertDialog(
+                  builder: (context) => NeuraOverlayDialog(
                     title: const Text('Удалить профиль?'),
-                    content: Text('Удалить "${profile.name}" с этого устройства?'),
+                    child: Text(
+                      'Удалить "${profile.name}" с этого устройства?',
+                      style: TextStyle(color: Colors.white.withOpacity(0.78)),
+                    ),
                     actions: [
                       TextButton(
                         onPressed: () => Navigator.pop(context, false),
                         child: const Text('Отмена'),
                       ),
-                      TextButton(
+                      FilledButton(
                         onPressed: () => Navigator.pop(context, true),
-                        child: const Text(
-                          'Удалить',
-                          style: TextStyle(color: Colors.red),
-                        ),
+                        child: const Text('Удалить'),
                       ),
                     ],
                   ),
@@ -438,7 +458,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                             tooltip: 'Удалить',
                             onPressed: () => _deleteSubscription(subscription),
                             icon: const Icon(Icons.delete),
-                            color: Colors.redAccent,
+                            color: NeuraUi.danger,
                           ),
                         ],
                       )
@@ -464,9 +484,9 @@ class _ProfileListViewState extends State<ProfileListView> {
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.white,
                               side: BorderSide(
-                                color: Colors.redAccent.withOpacity(0.6),
+                                color: NeuraUi.danger.withOpacity(0.6),
                               ),
-                              backgroundColor: Colors.redAccent.withOpacity(0.2),
+                              backgroundColor: NeuraUi.danger.withOpacity(0.2),
                             ),
                           ),
                         ],
@@ -493,7 +513,9 @@ class _ProfileListViewState extends State<ProfileListView> {
             borderRadius: BorderRadius.circular(8),
             color: isSelected ? _accentColor.withOpacity(0.14) : null,
             border: Border.all(
-              color: isSelected ? _accentColor.withOpacity(0.95) : Colors.transparent,
+              color: isSelected
+                  ? _accentColor.withOpacity(0.95)
+                  : Colors.transparent,
               width: isSelected ? 1.3 : 0,
             ),
             boxShadow: isSelected

@@ -44,7 +44,7 @@ VlessLink? parseVlessUri(String raw) {
   raw = raw.trim();
   if (raw.isEmpty) return null;
   if (!raw.startsWith('vless://')) return null;
-  
+
   // Базовая валидация длины
   if (raw.length < 50) return null;
 
@@ -54,7 +54,12 @@ VlessLink? parseVlessUri(String raw) {
   String mainPart = withoutScheme;
   final hashIndex = withoutScheme.indexOf('#');
   if (hashIndex != -1) {
-    tag = withoutScheme.substring(hashIndex + 1).trim();
+    final rawTag = withoutScheme.substring(hashIndex + 1).trim();
+    try {
+      tag = Uri.decodeComponent(rawTag);
+    } catch (_) {
+      tag = rawTag;
+    }
     mainPart = withoutScheme.substring(0, hashIndex);
   }
 
@@ -75,7 +80,9 @@ VlessLink? parseVlessUri(String raw) {
 
   // Валидация UUID (базовая)
   if (uuid.isEmpty || uuid.length < 32) return null;
-  final uuidRegex = RegExp(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$');
+  final uuidRegex = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
   if (!uuidRegex.hasMatch(uuid)) return null;
 
   final colonIndex = hostPort.lastIndexOf(':');
@@ -84,7 +91,7 @@ VlessLink? parseVlessUri(String raw) {
   final portStr = hostPort.substring(colonIndex + 1);
   final port = int.tryParse(portStr);
   if (port == null || port < 1 || port > 65535) return null;
-  
+
   // Валидация хоста
   if (host.isEmpty) return null;
 
@@ -103,5 +110,11 @@ VlessLink? parseVlessUri(String raw) {
     }
   }
 
-  return VlessLink(uuid: uuid, host: host, port: port, params: params, tag: tag);
+  return VlessLink(
+    uuid: uuid,
+    host: host,
+    port: port,
+    params: params,
+    tag: tag,
+  );
 }

@@ -35,26 +35,42 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
   static const Color _accentColor = Color(0xFFEF4444);
 
   bool get _isAggressive =>
-      widget.config.profile == DpiEvasionProfile.aggressive;
+      widget.config.enableTtlPhantom &&
+      widget.config.enableFragmentation &&
+      widget.config.enableTlsFragment;
 
-  bool get _isFragmentationEnabled => widget.config.enableFragmentation;
-  bool get _isTlsFragmentEnabled => widget.config.enableTlsFragment;
-  bool get _isTlsRecordFragmentEnabled =>
-      widget.config.enableTlsRecordFragment;
-  bool get _isTrafficNoiseEnabled => widget.config.enableTrafficNoise;
-  bool get _isMultiplexPaddingEnabled => widget.config.enableMultiplexPadding;
+  bool get _isXrayTlsFragmentationEnabled =>
+      widget.config.enableFragmentation && widget.config.enableTlsFragment;
   bool get _isTcpWindowClampEnabled => widget.config.enableTcpWindowClamp;
   bool get _isSniCaseRandomEnabled => widget.config.enableSniCaseRandomization;
+
+  DpiEvasionConfig _normalizeProfile(DpiEvasionConfig config) {
+    final isAggressive =
+        config.enableTtlPhantom &&
+        config.enableFragmentation &&
+        config.enableTlsFragment;
+    return config.copyWith(
+      profile: isAggressive
+          ? DpiEvasionProfile.aggressive
+          : DpiEvasionProfile.balanced,
+    );
+  }
 
   Future<void> _onToggle(bool value) async {
     if (!widget.enabled || !Platform.isWindows) return;
     if (_busy) return;
 
     setState(() => _busy = true);
-    final nextConfig = widget.config.copyWith(
-      profile:
-          value ? DpiEvasionProfile.aggressive : DpiEvasionProfile.balanced,
-      enableTtlPhantom: value,
+    final nextConfig = _normalizeProfile(
+      widget.config.copyWith(
+        enableTtlPhantom: value,
+        enableFragmentation: value,
+        enableTlsFragment: value,
+        tlsFragmentFallbackDelay: value
+            ? (widget.config.tlsFragmentFallbackDelay ??
+                  const Duration(milliseconds: 500))
+            : null,
+      ),
     );
     widget.onConfigChanged?.call(nextConfig);
 
@@ -75,51 +91,34 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
     }
   }
 
-  Future<void> _onFragmentationToggle(bool value) async {
+  Future<void> _onXrayTlsFragmentationToggle(bool value) async {
     if (!widget.enabled || !Platform.isWindows) return;
-    final nextConfig = widget.config.copyWithFragmentation(value);
+    final nextConfig = _normalizeProfile(
+      widget.config.copyWith(
+        enableFragmentation: value,
+        enableTlsFragment: value,
+        tlsFragmentFallbackDelay: value
+            ? (widget.config.tlsFragmentFallbackDelay ??
+                  const Duration(milliseconds: 500))
+            : null,
+      ),
+    );
     widget.onConfigChanged?.call(nextConfig);
-  }
-
-  void _onTlsFragmentToggle(bool value) {
-    if (!widget.enabled || !Platform.isWindows) return;
-    widget.onConfigChanged?.call(
-      widget.config.copyWith(enableTlsFragment: value),
-    );
-  }
-
-  void _onTlsRecordFragmentToggle(bool value) {
-    if (!widget.enabled || !Platform.isWindows) return;
-    widget.onConfigChanged?.call(
-      widget.config.copyWith(enableTlsRecordFragment: value),
-    );
-  }
-
-  void _onTrafficNoiseToggle(bool value) {
-    if (!widget.enabled || !Platform.isWindows) return;
-    widget.onConfigChanged?.call(
-      widget.config.copyWith(enableTrafficNoise: value),
-    );
-  }
-
-  void _onMultiplexPaddingToggle(bool value) {
-    if (!widget.enabled || !Platform.isWindows) return;
-    widget.onConfigChanged?.call(
-      widget.config.copyWith(enableMultiplexPadding: value),
-    );
   }
 
   void _onTcpWindowClampToggle(bool value) {
     if (!widget.enabled || !Platform.isWindows) return;
     widget.onConfigChanged?.call(
-      widget.config.copyWith(enableTcpWindowClamp: value),
+      _normalizeProfile(widget.config.copyWith(enableTcpWindowClamp: value)),
     );
   }
 
   void _onSniCaseRandomToggle(bool value) {
     if (!widget.enabled || !Platform.isWindows) return;
     widget.onConfigChanged?.call(
-      widget.config.copyWith(enableSniCaseRandomization: value),
+      _normalizeProfile(
+        widget.config.copyWith(enableSniCaseRandomization: value),
+      ),
     );
   }
 
@@ -153,13 +152,10 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    disabled
-                        ? 'Доступно только на Windows'
-                        : subtitle,
-                    style: Theme.of(context)
-                        .textTheme
-                        .bodySmall
-                        ?.copyWith(color: Theme.of(context).hintColor),
+                    disabled ? 'Доступно только на Windows' : subtitle,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: Theme.of(context).hintColor,
+                    ),
                   ),
                 ],
               ),
@@ -182,85 +178,16 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
     final disabled = !isSupported || !widget.enabled;
     final subtitle = disabled
         ? '\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u043d\u0430 Windows'
-        : '\u0414\u043e\u0431\u0430\u0432\u043b\u044f\u0435\u0442 \u0444\u0440\u0430\u0433\u043c\u0435\u043d\u0442\u0430\u0446\u0438\u044e \u0438 TTL phantom \u0434\u043b\u044f \u043e\u0431\u0445\u043e\u0434\u0430 DPI.';
+        : '\u0412\u043a\u043b\u044e\u0447\u0430\u0435\u0442 TTL phantom \u0438 Xray TLS fragmentation \u0434\u043b\u044f \u0431\u043e\u043b\u0435\u0435 \u0436\u0435\u0441\u0442\u043a\u043e\u0433\u043e DPI bypass.';
 
     return Column(
       children: [
         _buildToggleCard(
-          title: 'Агрессивная маскировка',
-          subtitle: subtitle,
-          value: _isAggressive,
-          onChanged: _onToggle,
-          disabled: disabled,
-        ),
-        if (_busy)
-          const Padding(
-            padding: EdgeInsets.only(top: 6),
-            child: SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'Фрагментация TLS (transport)',
-          subtitle: 'Дробит TLS hello для снижения DPI-блокировок.',
-          value: _isFragmentationEnabled,
-          onChanged: _onFragmentationToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'TLS handshake fragmentation',
-          subtitle: 'Экспериментальная настройка. Разбивает ClientHello на части.',
-          value: _isTlsFragmentEnabled,
-          onChanged: _onTlsFragmentToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'TLS record fragmentation',
+          title: 'TLS fragmentation (Xray)',
           subtitle:
-              'Экспериментальная настройка. Дробит TLS записи на уровне протокола.',
-          value: _isTlsRecordFragmentEnabled,
-          onChanged: _onTlsRecordFragmentToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'Traffic noise',
-          subtitle:
-              'Экспериментальная настройка. Добавляет фоновый трафик для маскировки.',
-          value: _isTrafficNoiseEnabled,
-          onChanged: _onTrafficNoiseToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'Multiplex padding',
-          subtitle:
-              'Экспериментальная настройка. Маскирует длины пакетов внутри туннеля.',
-          value: _isMultiplexPaddingEnabled,
-          onChanged: _onMultiplexPaddingToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'TCP Window Size clamp',
-          subtitle:
-              'Экспериментальная настройка. Ограничивает окно TCP до 64–512 байт.',
-          value: _isTcpWindowClampEnabled,
-          onChanged: _onTcpWindowClampToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'SNI case randomization',
-          subtitle:
-              'Экспериментальная настройка. Случайно меняет регистр домена в SNI.',
-          value: _isSniCaseRandomEnabled,
-          onChanged: _onSniCaseRandomToggle,
+              'Включает transport-level fragmentation для TLS-трафика в Xray.',
+          value: _isXrayTlsFragmentationEnabled,
+          onChanged: _onXrayTlsFragmentationToggle,
           disabled: disabled,
         ),
       ],

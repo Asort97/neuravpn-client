@@ -209,6 +209,322 @@ String generateSingBoxConfig(
   return const JsonEncoder.withIndent('  ').convert(config);
 }
 
+/// Генерация конфигурационного JSON для xray-core (Windows runtime).
+String generateXrayConfig(
+  VlessLink link,
+  SplitTunnelConfig splitConfig, {
+  String inboundTag = 'tun-in',
+  String interfaceName = 'wintun0',
+  List<String>? addresses,
+  String? outboundInterfaceName,
+  String? outboundBindAddress,
+  String tunStack = 'system',
+  bool smartRouting = false,
+  List<String> smartDomains = const <String>[],
+  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  int apiPort = 10085,
+  String logLevel = 'info',
+}) {
+  final p = link.params;
+  final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
+  final security = (p['security'] ?? '').trim().toLowerCase();
+  final isReality = security == 'reality';
+  final useTls = security == 'tls' || isReality;
+  final serverName = p['sni'] ?? p['host'] ?? link.host;
+  final flow = p['flow'] ?? '';
+  final fingerprint = p['fp'] ?? 'chrome';
+  final path = p['path'];
+  final realityPublicKey = p['pbk'];
+  final realityShortId = p['sid'];
+  final vpnTag = link.tag ?? 'proxy';
+  final trimmedInterfaceName = outboundInterfaceName?.trim();
+  final trimmedBindAddress = outboundBindAddress?.trim();
+
+  final user = <String, dynamic>{
+    'id': link.uuid,
+    'encryption': 'none',
+    if (flow.isNotEmpty) 'flow': flow,
+  };
+
+  final outbound = <String, dynamic>{
+    'tag': vpnTag,
+    'protocol': 'vless',
+    'settings': {
+      'vnext': [
+        {
+          'address': link.host,
+          'port': link.port,
+          'users': [user],
+        },
+      ],
+    },
+    'streamSettings': _buildXrayStreamSettings(
+      transportType: transportType,
+      params: p,
+      path: path,
+      headerHost: p['host'] ?? link.host,
+      serverName: serverName,
+      useTls: useTls,
+      isReality: isReality,
+      fingerprint: fingerprint,
+      realityPublicKey: realityPublicKey,
+      realityShortId: realityShortId,
+    ),
+  };
+  _applyXrayOutboundBinding(
+    outbound,
+    interfaceName: trimmedInterfaceName,
+    bindAddress: trimmedBindAddress,
+  );
+  final directOutbound = <String, dynamic>{
+    'tag': 'direct',
+    'protocol': 'freedom',
+  };
+  _applyXrayOutboundBinding(
+    directOutbound,
+    interfaceName: trimmedInterfaceName,
+    bindAddress: trimmedBindAddress,
+  );
+  final primaryOutbounds = splitConfig.mode == 'whitelist'
+      ? <Map<String, dynamic>>[directOutbound, outbound]
+      : <Map<String, dynamic>>[outbound, directOutbound];
+
+  final routeRules = <Map<String, dynamic>>[
+    {
+      'type': 'field',
+      'inboundTag': ['api-in'],
+      'outboundTag': 'api',
+    },
+    // Prevent Windows link-local broadcast/multicast UDP loops via TUN.
+    // These packets are not useful for the VPN session and may recurse back
+    // into the TUN device, exhausting socket buffers and starving real traffic.
+    {
+      'type': 'field',
+      'inboundTag': [inboundTag],
+      'network': 'udp',
+      'ip': ['169.254.0.0/16', '224.0.0.0/4', '255.255.255.255/32'],
+      'outboundTag': 'block',
+    },
+    {
+      'type': 'field',
+      'ip': [
+        '0.0.0.0/8',
+        '10.0.0.0/8',
+        '127.0.0.0/8',
+        '169.254.0.0/16',
+        '172.16.0.0/12',
+        '192.168.0.0/16',
+        '224.0.0.0/4',
+        '240.0.0.0/4',
+      ],
+      'outboundTag': 'direct',
+    },
+  ];
+
+  if (smartRouting) {
+    routeRules.addAll(_buildSmartRulesXray(smartDomains, 'direct'));
+  }
+  routeRules.addAll(_buildRouteRulesXray(splitConfig, vpnTag));
+  routeRules.addAll(_buildApplicationRulesXray(splitConfig, vpnTag));
+  routeRules.addAll(
+    extraRouteRules.map(_mapExtraRuleToXray).whereType<Map<String, dynamic>>(),
+  );
+
+  final config = <String, dynamic>{
+    'log': {'loglevel': logLevel},
+    'api': {
+      'tag': 'api',
+      'services': ['StatsService', 'RoutingService'],
+    },
+    'stats': <String, dynamic>{},
+    'policy': {
+      'system': {
+        'statsInboundUplink': true,
+        'statsInboundDownlink': true,
+        'statsOutboundUplink': true,
+        'statsOutboundDownlink': true,
+      },
+    },
+    'dns': {
+      'servers': ['8.8.8.8', '1.1.1.1'],
+      'queryStrategy': 'UseIPv4',
+    },
+    'inbounds': [
+      {
+        'tag': inboundTag,
+        'protocol': 'tun',
+        'settings': {
+          'interfaceName': interfaceName,
+          'mtu': 1280,
+          'address': addresses ?? const ['172.19.0.1/30'],
+          'autoRoute': true,
+          'strictRoute': true,
+          'stack': tunStack,
+        },
+        'sniffing': {
+          'enabled': true,
+          'destOverride': ['http', 'tls', 'quic'],
+        },
+      },
+      {
+        'tag': 'api-in',
+        'listen': '127.0.0.1',
+        'port': apiPort,
+        'protocol': 'dokodemo-door',
+        'settings': {'address': '127.0.0.1'},
+      },
+    ],
+    'outbounds': [
+      ...primaryOutbounds,
+      {'tag': 'block', 'protocol': 'blackhole'},
+      _buildXrayApiOutbound(
+        {'tag': 'api', 'protocol': 'freedom'},
+        trimmedInterfaceName,
+        trimmedBindAddress,
+      ),
+    ],
+    'routing': {'domainStrategy': 'AsIs', 'rules': routeRules},
+  };
+
+  return const JsonEncoder.withIndent('  ').convert(config);
+}
+
+/// Android-oriented Xray config generation.
+/// Package include/exclude split tunneling remains enforced by Android VpnService.
+String generateAndroidXrayConfig(
+  VlessLink link,
+  SplitTunnelConfig splitConfig, {
+  String inboundTag = 'socks-in',
+  bool smartRouting = false,
+  List<String> smartDomains = const <String>[],
+  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  String logLevel = 'info',
+}) {
+  final p = link.params;
+  final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
+  final security = (p['security'] ?? '').trim().toLowerCase();
+  final isReality = security == 'reality';
+  final useTls = security == 'tls' || isReality;
+  final serverName = p['sni'] ?? p['host'] ?? link.host;
+  final flow = p['flow'] ?? '';
+  final fingerprint = p['fp'] ?? 'chrome';
+  final path = p['path'];
+  final realityPublicKey = p['pbk'];
+  final realityShortId = p['sid'];
+  final vpnTag = link.tag ?? 'proxy';
+
+  final user = <String, dynamic>{
+    'id': link.uuid,
+    'encryption': 'none',
+    if (flow.isNotEmpty) 'flow': flow,
+  };
+
+  final routeRules = <Map<String, dynamic>>[];
+  if (smartRouting) {
+    routeRules.addAll(_buildSmartRulesXray(smartDomains, 'direct'));
+  }
+  routeRules.addAll(_buildRouteRulesXray(splitConfig, vpnTag));
+  routeRules.addAll(
+    extraRouteRules.map(_mapExtraRuleToXray).whereType<Map<String, dynamic>>(),
+  );
+
+  final config = <String, dynamic>{
+    'log': {'loglevel': logLevel},
+    'dns': {
+      'servers': ['1.1.1.1', '8.8.8.8'],
+      'queryStrategy': 'UseIPv4',
+    },
+    'inbounds': [
+      {
+        'tag': inboundTag,
+        'listen': '127.0.0.1',
+        'port': 10808,
+        'protocol': 'socks',
+        'settings': {
+          'auth': 'noauth',
+          'udp': true,
+        },
+        'sniffing': {
+          'enabled': true,
+          'destOverride': ['http', 'tls', 'quic'],
+        },
+      },
+    ],
+    'outbounds': [
+      {
+        'tag': vpnTag,
+        'protocol': 'vless',
+        'settings': {
+          'vnext': [
+            {
+              'address': link.host,
+              'port': link.port,
+              'users': [user],
+            },
+          ],
+        },
+        'streamSettings': _buildXrayStreamSettings(
+          transportType: transportType,
+          params: p,
+          path: path,
+          headerHost: p['host'] ?? link.host,
+          serverName: serverName,
+          useTls: useTls,
+          isReality: isReality,
+          fingerprint: fingerprint,
+          realityPublicKey: realityPublicKey,
+          realityShortId: realityShortId,
+        ),
+      },
+      {'tag': 'direct', 'protocol': 'freedom'},
+      {'tag': 'block', 'protocol': 'blackhole'},
+    ],
+    'routing': {'domainStrategy': 'IPIfNonMatch', 'rules': routeRules},
+  };
+
+  return const JsonEncoder.withIndent('  ').convert(config);
+}
+
+Map<String, dynamic> _buildXrayApiOutbound(
+  Map<String, dynamic> outbound,
+  String? interfaceName,
+  String? bindAddress,
+) {
+  final clone = Map<String, dynamic>.from(outbound);
+  _applyXrayOutboundBinding(
+    clone,
+    interfaceName: interfaceName,
+    bindAddress: bindAddress,
+  );
+  return clone;
+}
+
+void _applyXrayOutboundBinding(
+  Map<String, dynamic> outbound, {
+  String? interfaceName,
+  String? bindAddress,
+}) {
+  if (bindAddress != null && bindAddress.isNotEmpty) {
+    outbound['sendThrough'] = bindAddress;
+  }
+  if (interfaceName == null || interfaceName.isEmpty) {
+    return;
+  }
+  final streamSettings = outbound['streamSettings'] is Map<String, dynamic>
+      ? Map<String, dynamic>.from(
+          outbound['streamSettings'] as Map<String, dynamic>,
+        )
+      : <String, dynamic>{};
+  final sockopt = streamSettings['sockopt'] is Map<String, dynamic>
+      ? Map<String, dynamic>.from(
+          streamSettings['sockopt'] as Map<String, dynamic>,
+        )
+      : <String, dynamic>{};
+  sockopt['interface'] = interfaceName;
+  streamSettings['sockopt'] = sockopt;
+  outbound['streamSettings'] = streamSettings;
+}
+
 void _applyFragmentation(Map<String, dynamic> outbound, String? transportType) {
   const fragment = {
     'packets': 'tlshello',
@@ -615,6 +931,16 @@ class _RouteTargets {
     if (geosite.isNotEmpty) 'geosite': geosite,
   };
 
+  List<String> toXrayDomains() {
+    final items = <String>[];
+    items.addAll(domainFull);
+    items.addAll(domainSuffix.map((e) => 'domain:$e'));
+    items.addAll(domainKeyword.map((e) => 'keyword:$e'));
+    items.addAll(domainRegex.map((e) => 'regexp:$e'));
+    items.addAll(geosite.map((e) => 'geosite:$e'));
+    return items;
+  }
+
   static _RouteTargets fromEntries(List<String> entries) {
     final domainFull = <String>[];
     final domainSuffix = <String>[];
@@ -736,4 +1062,237 @@ class _RouteTargets {
     }
     return null;
   }
+}
+
+Map<String, dynamic> _buildXrayStreamSettings({
+  required String transportType,
+  required Map<String, String> params,
+  required String? path,
+  required String headerHost,
+  required String serverName,
+  required bool useTls,
+  required bool isReality,
+  required String fingerprint,
+  required String? realityPublicKey,
+  required String? realityShortId,
+}) {
+  final settings = <String, dynamic>{
+    'network': _normalizeXrayNetwork(transportType),
+  };
+
+  if (isReality) {
+    settings['security'] = 'reality';
+    settings['realitySettings'] = {
+      'serverName': serverName,
+      'fingerprint': fingerprint,
+      if (realityPublicKey != null && realityPublicKey.isNotEmpty)
+        'publicKey': realityPublicKey,
+      if (realityShortId != null && realityShortId.isNotEmpty)
+        'shortId': realityShortId.split(',').first.trim(),
+    };
+  } else if (useTls) {
+    settings['security'] = 'tls';
+    settings['tlsSettings'] = {
+      'serverName': serverName,
+      'fingerprint': fingerprint,
+      if ((params['alpn'] ?? '').trim().isNotEmpty)
+        'alpn': _splitCsv(params['alpn']),
+    };
+  } else {
+    settings['security'] = 'none';
+  }
+
+  switch (_normalizeXrayNetwork(transportType)) {
+    case 'ws':
+      settings['wsSettings'] = {
+        if (path != null && path.isNotEmpty) 'path': path,
+        'headers': {'Host': headerHost},
+      };
+      break;
+    case 'grpc':
+      final serviceName =
+          _firstParam(params, ['serviceName', 'service_name', 'servicename']) ??
+          path?.replaceFirst(RegExp(r'^/'), '');
+      settings['grpcSettings'] = {
+        if (serviceName != null && serviceName.isNotEmpty)
+          'serviceName': serviceName,
+        if ((params['authority'] ?? '').trim().isNotEmpty)
+          'authority': params['authority'],
+      };
+      break;
+    case 'http':
+      settings['httpSettings'] = {
+        if (path != null && path.isNotEmpty) 'path': path,
+        'host': _splitCsv(params['host']).isEmpty
+            ? [headerHost]
+            : _splitCsv(params['host']),
+      };
+      break;
+    case 'httpupgrade':
+      settings['httpupgradeSettings'] = {
+        if (path != null && path.isNotEmpty) 'path': path,
+        'host': headerHost,
+      };
+      break;
+    case 'xhttp':
+      settings['xhttpSettings'] = {
+        if (path != null && path.isNotEmpty) 'path': path,
+        'host': headerHost,
+      };
+      break;
+    case 'quic':
+      settings['quicSettings'] = {
+        'security':
+            _firstParam(params, ['quicSecurity', 'quic_security']) ?? 'none',
+        if ((_firstParam(params, ['key', 'quicKey', 'quic_key']) ?? '')
+            .isNotEmpty)
+          'key': _firstParam(params, ['key', 'quicKey', 'quic_key']),
+        'header': {'type': 'none'},
+      };
+      break;
+  }
+
+  return settings;
+}
+
+String _normalizeXrayNetwork(String transportType) {
+  switch (transportType) {
+    case 'h2':
+      return 'http';
+    default:
+      return transportType.isEmpty ? 'tcp' : transportType;
+  }
+}
+
+List<Map<String, dynamic>> _buildRouteRulesXray(
+  SplitTunnelConfig config,
+  String vpnTag,
+) {
+  final rules = <Map<String, dynamic>>[];
+  if (config.domains.isEmpty) return rules;
+
+  final targets = _RouteTargets.fromEntries(config.domains);
+  final domains = targets.toXrayDomains();
+  final outboundTag = config.mode == 'blacklist' ? 'direct' : vpnTag;
+
+  if (domains.isEmpty && targets.ipCidrs.isEmpty) {
+    return rules;
+  }
+
+  if (config.mode == 'whitelist' || config.mode == 'blacklist') {
+    rules.add({
+      'type': 'field',
+      if (domains.isNotEmpty) 'domain': domains,
+      if (targets.ipCidrs.isNotEmpty) 'ip': targets.ipCidrs,
+      'outboundTag': outboundTag,
+    });
+  }
+
+  return rules;
+}
+
+List<Map<String, dynamic>> _buildApplicationRulesXray(
+  SplitTunnelConfig config,
+  String vpnTag,
+) {
+  if (config.mode == 'all' || config.applications.isEmpty) {
+    return const <Map<String, dynamic>>[];
+  }
+  final processes = <String>{};
+  for (final entry in config.applications) {
+    final value = entry.trim();
+    if (value.isEmpty) continue;
+    for (final rule in _parseApplicationRules(value)) {
+      if (rule.key == 'process_name' || rule.key == 'process_path') {
+        processes.add(rule.value);
+      }
+    }
+  }
+  if (processes.isEmpty) {
+    return const <Map<String, dynamic>>[];
+  }
+  return <Map<String, dynamic>>[
+    {
+      'type': 'field',
+      'process': processes.toList(),
+      'outboundTag': config.mode == 'blacklist' ? 'direct' : vpnTag,
+    },
+  ];
+}
+
+List<Map<String, dynamic>> _buildSmartRulesXray(
+  List<String> smartDomains,
+  String outboundTag,
+) {
+  if (smartDomains.isEmpty) return const <Map<String, dynamic>>[];
+  final domains = <String>[];
+  for (final entry in smartDomains) {
+    final value = entry.trim();
+    if (value.isEmpty) continue;
+    if (value.startsWith('.')) {
+      domains.add('domain:${value.substring(1)}');
+    } else if (value.contains('.')) {
+      domains.add(value);
+    } else {
+      domains.add('domain:$value');
+    }
+  }
+  if (domains.isEmpty) return const <Map<String, dynamic>>[];
+  return <Map<String, dynamic>>[
+    {'type': 'field', 'domain': domains, 'outboundTag': outboundTag},
+  ];
+}
+
+Map<String, dynamic>? _mapExtraRuleToXray(Map<String, dynamic> rule) {
+  final outboundTag = (rule['outboundTag'] ?? rule['outbound'])?.toString();
+  if (outboundTag == null || outboundTag.isEmpty) {
+    return null;
+  }
+  final mapped = <String, dynamic>{'type': 'field', 'outboundTag': outboundTag};
+
+  final domain = rule['domain'];
+  if (domain is List && domain.isNotEmpty) {
+    mapped['domain'] = domain.map((e) => e.toString()).toList();
+  }
+  final domainSuffix = rule['domain_suffix'];
+  if (domainSuffix is List && domainSuffix.isNotEmpty) {
+    final existing = (mapped['domain'] as List<dynamic>? ?? <dynamic>[])
+        .map((e) => e.toString())
+        .toList();
+    existing.addAll(domainSuffix.map((e) => 'domain:${e.toString()}'));
+    mapped['domain'] = existing;
+  }
+  final domainKeyword = rule['domain_keyword'];
+  if (domainKeyword is List && domainKeyword.isNotEmpty) {
+    final existing = (mapped['domain'] as List<dynamic>? ?? <dynamic>[])
+        .map((e) => e.toString())
+        .toList();
+    existing.addAll(domainKeyword.map((e) => 'keyword:${e.toString()}'));
+    mapped['domain'] = existing;
+  }
+  final domainRegex = rule['domain_regex'];
+  if (domainRegex is List && domainRegex.isNotEmpty) {
+    final existing = (mapped['domain'] as List<dynamic>? ?? <dynamic>[])
+        .map((e) => e.toString())
+        .toList();
+    existing.addAll(domainRegex.map((e) => 'regexp:${e.toString()}'));
+    mapped['domain'] = existing;
+  }
+  final geosite = rule['geosite'];
+  if (geosite is List && geosite.isNotEmpty) {
+    final existing = (mapped['domain'] as List<dynamic>? ?? <dynamic>[])
+        .map((e) => e.toString())
+        .toList();
+    existing.addAll(geosite.map((e) => 'geosite:${e.toString()}'));
+    mapped['domain'] = existing;
+  }
+  final ip = rule['ip_cidr'];
+  if (ip is List && ip.isNotEmpty) {
+    mapped['ip'] = ip.map((e) => e.toString()).toList();
+  }
+
+  if (mapped.length <= 2) {
+    return null;
+  }
+  return mapped;
 }

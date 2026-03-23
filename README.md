@@ -77,6 +77,12 @@ Build Windows release:
 
 Version storage file: `tool/release_versions.json`
 
+## Windows Runtime Core
+
+- Windows runtime now uses `xray-core` (`assets/bin/xray.exe`).
+- Keep `assets/bin/xray.exe` up to date before Windows release builds.
+- Android runtime remains on Libbox/sing-box for now.
+
 ## Privacy Policy
 
 Google Play listing should point to a public copy of [PRIVACY_POLICY.md](PRIVACY_POLICY.md).

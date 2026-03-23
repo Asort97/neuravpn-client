@@ -76,7 +76,7 @@ class TunSessionPlan {
 class WindowsTunGuard {
   WindowsTunGuard({
     this.removalTimeout = const Duration(seconds: 8),
-    this.pollInterval = const Duration(milliseconds: 250),
+    this.pollInterval = const Duration(milliseconds: 400),
     this.cleanupBudget = const Duration(seconds: 15),
     this.adapterUpTimeout = const Duration(seconds: 30),
     TunProcessRunner? processRunner,
@@ -84,11 +84,13 @@ class WindowsTunGuard {
     Future<bool> Function()? elevationChecker,
     DateTime Function()? clock,
     int Function(int max)? randomInt,
+    void Function(String category)? processLaunchRecorder,
   }) : _processRunner = processRunner ?? _defaultProcessRunner,
        _isWindowsOverride = isWindowsOverride,
        _elevationChecker = elevationChecker,
        _clock = clock ?? DateTime.now,
-       _randomInt = randomInt ?? Random().nextInt;
+       _randomInt = randomInt ?? Random().nextInt,
+       _processLaunchRecorder = processLaunchRecorder;
 
   static const String defaultInboundTag = 'tun-in';
   static const String defaultInterfaceName = 'wintun0';
@@ -103,11 +105,12 @@ class WindowsTunGuard {
   final Future<bool> Function()? _elevationChecker;
   final DateTime Function() _clock;
   final int Function(int max) _randomInt;
+  final void Function(String category)? _processLaunchRecorder;
   int _sessionCounter = 0;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
 
-  Future<TunSessionPlan> prepare() async {
+  Future<TunSessionPlan> prepare({bool detectExistingAdapters = false}) async {
     if (!_isWindows) {
       return TunSessionPlan(
         success: true,
@@ -137,15 +140,21 @@ class WindowsTunGuard {
       );
     }
 
-    final discovered = await _listTunAdapters(logs);
-    final staleAdapters = discovered.map((e) => e.name).toSet().toList();
-    if (staleAdapters.isEmpty) {
-      logs.add('No stale TUN adapters detected (including hidden adapters).');
+    List<TunAdapterInfo> discovered = const <TunAdapterInfo>[];
+    List<String> staleAdapters = const <String>[];
+    if (detectExistingAdapters) {
+      discovered = await _listTunAdapters(logs);
+      staleAdapters = discovered.map((e) => e.name).toSet().toList();
+      if (staleAdapters.isEmpty) {
+        logs.add('No stale TUN adapters detected (including hidden adapters).');
+      } else {
+        logs.add(
+          'Stale TUN adapters detected: ${staleAdapters.join(', ')} '
+          '(hidden: ${discovered.where((e) => e.hidden).length})',
+        );
+      }
     } else {
-      logs.add(
-        'Stale TUN adapters detected: ${staleAdapters.join(', ')} '
-        '(hidden: ${discovered.where((e) => e.hidden).length})',
-      );
+      logs.add('Skipping stale TUN adapter scan for normal startup path.');
     }
 
     var sessionName = _buildSessionInterfaceName();
@@ -252,7 +261,9 @@ class WindowsTunGuard {
     if (success) {
       logs.add('Bulk cleanup completed; removed ${cleaned.length} adapters.');
     } else {
-      logs.add('Bulk cleanup incomplete; still present: ${stillPresent.join(', ')}');
+      logs.add(
+        'Bulk cleanup incomplete; still present: ${stillPresent.join(', ')}',
+      );
     }
 
     return TunBulkCleanupResult(
@@ -313,6 +324,13 @@ class WindowsTunGuard {
       await Future.delayed(pollInterval);
     }
     return false;
+  }
+
+  Future<bool> isAdapterUp(String name) async {
+    if (!_isWindows) return true;
+    if (name.isEmpty) return false;
+    final status = await _readAdapterStatus(name);
+    return status == 'up';
   }
 
   Future<List<TunAdapterInfo>> _listTunAdapters(List<String> logs) async {
@@ -386,21 +404,30 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
   }) async {
     var success = true;
 
-    final disable = await _runNetsh(
-      ['interface', 'set', 'interface', 'name="$adapter"', 'admin=disabled'],
-      logs,
-    );
+    final disable = await _runNetsh([
+      'interface',
+      'set',
+      'interface',
+      'name="$adapter"',
+      'admin=disabled',
+    ], logs);
     if (disable.exitCode != 0) success = false;
 
-    final delete = await _runNetsh(
-      ['interface', 'ipv4', 'delete', 'interface', 'name="$adapter"'],
-      logs,
-    );
+    final delete = await _runNetsh([
+      'interface',
+      'ipv4',
+      'delete',
+      'interface',
+      'name="$adapter"',
+    ], logs);
     if (delete.exitCode != 0) success = false;
-    final deleteIpv6 = await _runNetsh(
-      ['interface', 'ipv6', 'delete', 'interface', 'name="$adapter"'],
-      logs,
-    );
+    final deleteIpv6 = await _runNetsh([
+      'interface',
+      'ipv6',
+      'delete',
+      'interface',
+      'name="$adapter"',
+    ], logs);
     if (deleteIpv6.exitCode != 0) success = false;
 
     await _releaseAdapterAddresses(adapter, logs);
@@ -430,7 +457,10 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     return success;
   }
 
-  Future<void> _releaseAdapterAddresses(String adapter, List<String> logs) async {
+  Future<void> _releaseAdapterAddresses(
+    String adapter,
+    List<String> logs,
+  ) async {
     final command =
         "Import-Module NetTCPIP -ErrorAction SilentlyContinue; Get-NetIPAddress -InterfaceAlias '${_escapePs(adapter)}' -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:\$false";
     final result = await _runPowerShell(command, logs);
@@ -444,6 +474,7 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
       return _elevationChecker.call();
     }
     try {
+      _processLaunchRecorder?.call('powershell');
       final result = await _processRunner('powershell', [
         '-NoProfile',
         '-Command',
@@ -458,6 +489,7 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
 
   Future<ProcessResult> _runNetsh(List<String> args, List<String>? logs) async {
     try {
+      _processLaunchRecorder?.call('netsh');
       final result = await _processRunner('netsh', args);
       logs?.add('netsh ${args.join(' ')} => ${result.exitCode}');
       final stderr = _cleanOutput(result.stderr);
@@ -471,14 +503,20 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     }
   }
 
-  Future<ProcessResult> _runPowerShell(String command, List<String>? logs) async {
+  Future<ProcessResult> _runPowerShell(
+    String command,
+    List<String>? logs,
+  ) async {
     try {
+      _processLaunchRecorder?.call('powershell');
       final result = await _processRunner('powershell', [
         '-NoProfile',
         '-Command',
         command,
       ]);
-      logs?.add('powershell: ${command.split('\n').first} => ${result.exitCode}');
+      logs?.add(
+        'powershell: ${command.split('\n').first} => ${result.exitCode}',
+      );
       final stderr = _cleanOutput(result.stderr);
       if (result.exitCode != 0 && stderr.isNotEmpty) {
         logs?.add('  stderr: $stderr');
@@ -516,7 +554,10 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
 
   String _escapePs(String input) => input.replaceAll("'", "''");
 
-  List<TunAdapterInfo> _parseAdapterLines(Object? output, Set<String> visibleSet) {
+  List<TunAdapterInfo> _parseAdapterLines(
+    Object? output,
+    Set<String> visibleSet,
+  ) {
     final result = <TunAdapterInfo>[];
     for (final line in _parseLines(output)) {
       final parts = line.split('|');
@@ -535,7 +576,10 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     return result;
   }
 
-  List<TunAdapterInfo> _parseCimAdapterLines(Object? output, Set<String> visibleSet) {
+  List<TunAdapterInfo> _parseCimAdapterLines(
+    Object? output,
+    Set<String> visibleSet,
+  ) {
     final result = <TunAdapterInfo>[];
     for (final line in _parseLines(output)) {
       final parts = line.split('|');
