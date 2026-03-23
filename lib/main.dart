@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as path;
 import 'package:screen_retriever/screen_retriever.dart';
 import 'package:tray_manager/tray_manager.dart';
@@ -425,6 +426,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   final List<String> _logLines = <String>[];
   int _profileNameCounter = 0;
   int _subscriptionsRefreshToken = 0;
+  Timer? _subscriptionRefreshTimer;
   static const String _profileMetricsKey = 'vpn_profile_metrics';
   static const String _profileCounterKey = 'vpn_profile_counter';
   bool _developerMode = false;
@@ -561,6 +563,10 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
     unawaited(_bootstrapInitialState());
     unawaited(_initVersionAndUpdates());
+    _subscriptionRefreshTimer = Timer.periodic(
+      const Duration(minutes: 10),
+      (_) => unawaited(_refreshAllSubscriptions()),
+    );
     if (_isWindowsShellPlatform) {
       unawaited(_checkWintun());
       unawaited(_ensureWindowsUriProtocolRegistered());
@@ -586,6 +592,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _prepareWindowsRuntime();
     await _handleInitialLaunchArgs();
     await _handleInitialAndroidLaunchUri();
+    unawaited(_refreshAllSubscriptions());
   }
 
   Future<void> _prepareWindowsRuntime() async {
@@ -655,7 +662,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _initVersionAndUpdates() async {
-    if (!_isWindowsShellPlatform) return;
     try {
       final info = await PackageInfo.fromPlatform();
       if (!mounted) return;
@@ -669,7 +675,6 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _maybeCheckForUpdates({bool manual = false}) async {
-    if (!_isWindowsShellPlatform) return;
     if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
         _updateRepo == 'YOUR_GITHUB_REPO') {
       return;
@@ -680,15 +685,6 @@ class _VlessHomePageState extends State<VlessHomePage>
     try {
       final prefs = await SharedPreferences.getInstance();
       final now = DateTime.now();
-      final lastMs = prefs.getInt(_updateLastCheckKey);
-      final last = lastMs == null
-          ? null
-          : DateTime.fromMillisecondsSinceEpoch(lastMs);
-      final shouldSkip =
-          !manual &&
-          last != null &&
-          now.difference(last) < const Duration(hours: 12);
-      if (shouldSkip) return;
       await prefs.setInt(_updateLastCheckKey, now.millisecondsSinceEpoch);
 
       final service = GithubUpdateService();
@@ -1140,6 +1136,19 @@ $regItems = foreach ($rp in $regPaths) {
     _addApplication(path);
   }
 
+  Future<void> _pickExecutableManually() async {
+    if (!Platform.isWindows) return;
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['exe'],
+      dialogTitle: 'Выберите исполняемый файл (.exe)',
+    );
+    if (result == null || result.files.isEmpty) return;
+    final filePath = result.files.single.path;
+    if (filePath == null || filePath.isEmpty) return;
+    _addApplication(filePath);
+  }
+
   Widget _buildWindowsAppActions(ThemeData theme) {
     final canPick = _windowsAppsLoaded || !_windowsAppsLoading;
     return Column(
@@ -1153,6 +1162,11 @@ $regItems = foreach ($rp in $regPaths) {
               onPressed: canPick ? _showWindowsAppPicker : null,
               icon: const Icon(Icons.apps_outlined),
               label: const Text('Выбрать приложение из списка'),
+            ),
+            TextButton.icon(
+              onPressed: _pickExecutableManually,
+              icon: const Icon(Icons.folder_open_outlined),
+              label: const Text('Выбрать вручную'),
             ),
             TextButton.icon(
               onPressed: _windowsAppsLoading
@@ -2677,6 +2691,84 @@ $regItems = foreach ($rp in $regPaths) {
     });
   }
 
+  Future<void> _refreshAllSubscriptions() async {
+    try {
+      final repository = SubscriptionRepository();
+      final manager = SubscriptionService();
+      final subs = await repository.getAllSubscriptions();
+      if (subs.isEmpty) return;
+      for (final sub in subs) {
+        try {
+          final profiles = await manager.fetchSubscription(sub.url);
+          if (profiles.isEmpty) continue;
+          final updated = sub.copyWith(
+            profiles: profiles,
+            lastUpdated: DateTime.now(),
+          );
+          await repository.updateSubscription(updated);
+        } catch (_) {
+          // skip failed subscription silently
+        }
+      }
+      if (!mounted) return;
+      await _reloadSubscriptions();
+      await _resyncSelectedProfileFromSubscriptions();
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  /// Re-validate [_selectedProfile] against current subscriptions.
+  /// If the old URI is gone, pick the best available replacement.
+  Future<void> _resyncSelectedProfileFromSubscriptions() async {
+    final repository = SubscriptionRepository();
+    final subs = await repository.getAllSubscriptions();
+    if (subs.isEmpty) return;
+
+    // If selectedProfile is still in some subscription — nothing to do.
+    if (_selectedProfile != null) {
+      for (final sub in subs) {
+        if (sub.profiles.contains(_selectedProfile!.uri)) return;
+      }
+    }
+
+    // Also check manual profiles — don't override manual selection.
+    if (_selectedProfile != null &&
+        _profiles.any((p) => p.uri == _selectedProfile!.uri)) {
+      return;
+    }
+
+    // Pick first available subscription profile.
+    for (final sub in subs) {
+      final uri = sub.selectedProfile ??
+          (sub.profiles.isNotEmpty ? sub.profiles.first : null);
+      if (uri != null && uri.isNotEmpty && _isSecureProfileUri(uri)) {
+        final autoName = _deriveProfileNameFromUri(uri);
+        final profile = VpnProfile(
+          name: autoName.isEmpty
+              ? _deriveSubscriptionNameFromUrl(sub.url)
+              : autoName,
+          uri: uri,
+        );
+        if (!mounted) return;
+        setState(() {
+          _selectedProfile = profile;
+          _controller.text = profile.uri;
+          _syncMetricsFromProfile(profile);
+        });
+        return;
+      }
+    }
+
+    // No valid profiles found — clear selection.
+    if (!mounted) return;
+    setState(() {
+      _selectedProfile = null;
+      _controller.text = '';
+      _syncMetricsFromProfile(null);
+    });
+  }
+
   Future<void> _clearAllProfilesForSubscriptionMode() async {
     if (!mounted) return;
     setState(() {
@@ -3208,6 +3300,7 @@ $regItems = foreach ($rp in $regPaths) {
   @override
   @override
   void dispose() {
+    _subscriptionRefreshTimer?.cancel();
     _logFlushTimer?.cancel();
     if (_isWindowsShellPlatform) {
       _windowsLaunchChannel.setMethodCallHandler(null);
@@ -4191,37 +4284,30 @@ $regItems = foreach ($rp in $regPaths) {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: AnimatedSwitcher(
-                      duration: NeuraUi.fast,
-                      switchInCurve: NeuraUi.curve,
-                      switchOutCurve: Curves.easeInCubic,
-                      transitionBuilder: (child, animation) {
-                        return FadeTransition(
-                          opacity: animation,
-                          child: SlideTransition(
-                            position: Tween<Offset>(
-                              begin: const Offset(0, 0.08),
-                              end: Offset.zero,
-                            ).animate(animation),
-                            child: child,
-                          ),
-                        );
-                      },
-                      child: Text(
-                        statusText,
-                        key: ValueKey(statusText),
-                        style: const TextStyle(color: Colors.white70),
-                      ),
+                  const Spacer(),
+                  AnimatedSwitcher(
+                    duration: NeuraUi.fast,
+                    switchInCurve: NeuraUi.curve,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) {
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(
+                          position: Tween<Offset>(
+                            begin: const Offset(0, 0.08),
+                            end: Offset.zero,
+                          ).animate(animation),
+                          child: child,
+                        ),
+                      );
+                    },
+                    child: Text(
+                      statusText,
+                      key: ValueKey(statusText),
+                      style: const TextStyle(color: Colors.white70),
                     ),
                   ),
-                  if (isRunning)
-                    IconButton(
-                      icon: const Icon(Icons.refresh, size: 18),
-                      color: Colors.white54,
-                      onPressed: canRefreshMetrics ? _refreshMetrics : null,
-                    ),
+                  const Spacer(),
                 ],
               ),
               const SizedBox(height: 20),
@@ -4467,12 +4553,25 @@ $regItems = foreach ($rp in $regPaths) {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Row(
-                              children: const [
-                                Icon(Icons.bolt, size: 16, color: _neuraRed),
-                                SizedBox(width: 6),
-                                Text(
+                              children: [
+                                const Icon(Icons.bolt, size: 16, color: _neuraRed),
+                                const SizedBox(width: 6),
+                                const Text(
                                   'Задержка',
                                   style: TextStyle(color: Colors.white54),
+                                ),
+                                const Spacer(),
+                                SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: IconButton(
+                                    padding: EdgeInsets.zero,
+                                    constraints: const BoxConstraints(),
+                                    iconSize: 16,
+                                    icon: const Icon(Icons.refresh),
+                                    color: Colors.white54,
+                                    onPressed: canRefreshMetrics ? _refreshMetrics : null,
+                                  ),
                                 ),
                               ],
                             ),
@@ -6913,6 +7012,30 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                       ),
                     ),
                     const SizedBox(height: 8),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: TextButton.icon(
+                          onPressed: () async {
+                            final result = await FilePicker.platform.pickFiles(
+                              type: FileType.custom,
+                              allowedExtensions: ['exe'],
+                              dialogTitle: 'Выберите исполняемый файл (.exe)',
+                            );
+                            if (result == null || result.files.isEmpty) return;
+                            final picked = result.files.single.path;
+                            if (picked == null || picked.isEmpty) return;
+                            if (context.mounted) {
+                              Navigator.of(context).pop(picked);
+                            }
+                          },
+                          icon: const Icon(Icons.folder_open_outlined, size: 18),
+                          label: const Text('Выбрать вручную (.exe)'),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
                     SizedBox(
                       height: height * 0.6,
                       child: filtered.isEmpty
