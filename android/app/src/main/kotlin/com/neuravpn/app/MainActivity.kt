@@ -6,7 +6,7 @@ import android.net.VpnService
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import com.neuravpn.app.vpn.LibboxVpnService
+import com.neuravpn.app.vpn.AndroidVpnRuntimeManager
 
 class MainActivity : FlutterActivity() {
 
@@ -22,12 +22,21 @@ class MainActivity : FlutterActivity() {
 				METHOD_START -> {
 					try {
 						val config = call.argument<String>(ARG_CONFIG)
+						val runtime = call.argument<String>(ARG_RUNTIME)
+						val executablePath = call.argument<String>(ARG_EXECUTABLE_PATH)
 						val includePackages = call.argument<List<String>>(ARG_INCLUDE_PACKAGES)
 						val excludePackages = call.argument<List<String>>(ARG_EXCLUDE_PACKAGES)
 						if (config.isNullOrBlank()) {
 							result.error("INVALID_CONFIG", "Config payload required", null)
 						} else {
-							LibboxVpnService.start(applicationContext, config, includePackages, excludePackages)
+							AndroidVpnRuntimeManager.start(
+								context = applicationContext,
+								runtimeId = runtime,
+								config = config,
+								executablePath = executablePath,
+								includePackages = includePackages,
+								excludePackages = excludePackages,
+							)
 							result.success(null)
 						}
 					} catch (t: Throwable) {
@@ -36,7 +45,7 @@ class MainActivity : FlutterActivity() {
 				}
 				METHOD_STOP -> {
 					try {
-						LibboxVpnService.stop(applicationContext)
+						AndroidVpnRuntimeManager.stop(applicationContext, null)
 						result.success(null)
 					} catch (t: Throwable) {
 						result.error("STOP_VPN_FAILED", t.message, null)
@@ -44,9 +53,45 @@ class MainActivity : FlutterActivity() {
 				}
 				METHOD_STATUS -> {
 					try {
-						result.success(LibboxVpnService.isRunning())
+						result.success(AndroidVpnRuntimeManager.isRunning(applicationContext))
 					} catch (t: Throwable) {
 						result.error("STATUS_VPN_FAILED", t.message, null)
+					}
+				}
+				METHOD_READ_DEBUG_LOG -> {
+					try {
+						val runtime = call.argument<String>(ARG_RUNTIME)
+						result.success(AndroidVpnRuntimeManager.readDebugLog(applicationContext, runtime))
+					} catch (t: Throwable) {
+						result.error("READ_DEBUG_LOG_FAILED", t.message, null)
+					}
+				}
+				METHOD_CLEAR_DEBUG_LOG -> {
+					try {
+						val runtime = call.argument<String>(ARG_RUNTIME)
+						AndroidVpnRuntimeManager.clearDebugLog(applicationContext, runtime)
+						result.success(null)
+					} catch (t: Throwable) {
+						result.error("CLEAR_DEBUG_LOG_FAILED", t.message, null)
+					}
+				}
+				METHOD_LAST_ERROR -> {
+					try {
+						result.success(AndroidVpnRuntimeManager.lastStartupError(applicationContext))
+					} catch (t: Throwable) {
+						result.error("LAST_ERROR_FAILED", t.message, null)
+					}
+				}
+				METHOD_TRAFFIC_STATS -> {
+					try {
+						val stats = com.neuravpn.app.vpn.XrayVpnService.readTrafficStats(applicationContext)
+						if (stats != null && stats.size >= 2) {
+							result.success(mapOf("tx" to stats[0], "rx" to stats[1]))
+						} else {
+							result.success(null)
+						}
+					} catch (t: Throwable) {
+						result.error("TRAFFIC_STATS_FAILED", t.message, null)
 					}
 				}
 				else -> result.notImplemented()
@@ -134,9 +179,15 @@ class MainActivity : FlutterActivity() {
 		private const val METHOD_START = "startVpn"
 		private const val METHOD_STOP = "stopVpn"
 		private const val METHOD_STATUS = "getVpnStatus"
+		private const val METHOD_READ_DEBUG_LOG = "getNativeVpnDebugLog"
+		private const val METHOD_CLEAR_DEBUG_LOG = "clearNativeVpnDebugLog"
+		private const val METHOD_LAST_ERROR = "getLastStartupError"
+		private const val METHOD_TRAFFIC_STATS = "getTrafficStats"
 		private const val METHOD_GET_INITIAL_LAUNCH_URI = "getInitialLaunchUri"
 		private const val METHOD_HANDLE_LAUNCH_URI = "handleLaunchUri"
 		private const val ARG_CONFIG = "config"
+		private const val ARG_RUNTIME = "runtime"
+		private const val ARG_EXECUTABLE_PATH = "executablePath"
 		private const val ARG_INCLUDE_PACKAGES = "includePackages"
 		private const val ARG_EXCLUDE_PACKAGES = "excludePackages"
 		private const val REQUEST_PREPARE_VPN = 1001

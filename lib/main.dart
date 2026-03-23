@@ -818,7 +818,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     try {
       final apps = await DeviceApps.getInstalledApplications(
         includeAppIcons: false,
-        includeSystemApps: false,
+        includeSystemApps: true,
         onlyAppsWithLaunchIntent: true,
       );
       apps.sort(
@@ -1305,7 +1305,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _startTrafficMonitor() {
-    if (!Platform.isWindows) return;
+    if (!Platform.isWindows && !Platform.isAndroid) return;
     if (_trafficSub != null) return;
     if (_trafficHistory.isEmpty) {
       _trafficHistory.addAll(List<double>.filled(20, 0));
@@ -1428,7 +1428,7 @@ $regItems = foreach ($rp in $regPaths) {
     final storedCounter = prefs.getInt(_profileCounterKey) ?? 0;
     final metricsRaw = prefs.getString(_profileMetricsKey);
     final restoredPings = <String, int>{};
-    bool splitEnabled = prefs.getBool(_splitToggleKey) ?? true;
+    bool splitEnabled = prefs.getBool(_splitToggleKey) ?? false;
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
@@ -1620,6 +1620,11 @@ $regItems = foreach ($rp in $regPaths) {
         _presetDirty = false;
       }
       _splitEnabled = splitEnabled;
+      // If split tunneling is enabled but mode is 'all' (invalid for UI),
+      // auto-correct to 'blacklist'.
+      if (_splitEnabled && _splitMode == 'all') {
+        _splitMode = 'blacklist';
+      }
       _profilePings
         ..clear()
         ..addAll(restoredPings);
@@ -1842,8 +1847,32 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _maybeHotReloadWindowsRules({
     SplitTunnelConfig? previousConfig,
   }) async {
-    if (!Platform.isWindows) return;
+    if (!Platform.isWindows && !Platform.isAndroid) return;
     if (!_isRunning || _isConnecting || _isDisconnecting) return;
+
+    // Android: any split tunnel change requires a full reconnect because
+    // VpnService.Builder rules are immutable after establish().
+    if (Platform.isAndroid) {
+      if (previousConfig == null) return;
+      final nextConfig = _configForConnection;
+      if (!_requiresWindowsSessionResetForRuleChange(previousConfig, nextConfig)) return;
+      _appendLogs([
+        '[android] Split tunnel rules changed, reconnecting to apply',
+      ]);
+      if (mounted) {
+        _showFastSnack(
+          'Правила изменены. Переподключаем для применения новых маршрутов.',
+        );
+      }
+      await _stop();
+      if (!mounted) return;
+      // Small grace period so the service process executor finishes
+      // the stop task before the new start intent arrives.
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (!mounted) return;
+      await _start();
+      return;
+    }
     final nextConfig = _configForConnection;
     final requiresSessionReset =
         previousConfig != null &&
@@ -1962,7 +1991,13 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _setSplitEnabled(bool enabled) async {
     if (_splitEnabled == enabled) return;
     final previousConfig = _configForConnection;
-    setState(() => _splitEnabled = enabled);
+    setState(() {
+      _splitEnabled = enabled;
+      // When enabling, ensure a valid mode is selected (not 'all').
+      if (enabled && _splitMode == 'all') {
+        _splitMode = 'blacklist';
+      }
+    });
     await _persistSplitState();
     await _maybeHotReloadWindowsRules(previousConfig: previousConfig);
   }
@@ -2861,7 +2896,7 @@ $regItems = foreach ($rp in $regPaths) {
     }
 
     if (!isEnabled) {
-      _showFastSnack('Добавьте профиль или вставьте VLESS-конфиг');
+      _showFastSnack('Выберите подписку для подключения');
       return;
     }
 
@@ -2994,6 +3029,9 @@ $regItems = foreach ($rp in $regPaths) {
   void _appendLogs(Iterable<String> entries) {
     final iterable = entries.where((e) => e.trim().isNotEmpty).toList();
     if (iterable.isEmpty) return;
+    for (final line in iterable) {
+      debugPrint(line);
+    }
     _pendingLogLines.addAll(iterable);
     _logFlushTimer ??= Timer(const Duration(milliseconds: 200), () {
       _logFlushTimer = null;
@@ -3012,9 +3050,17 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _openFullLogView() async {
-    final logText = _logLines.isEmpty
+    var logText = _logLines.isEmpty
         ? 'Лог пуст. Подключитесь к VPN для просмотра сообщений.'
         : _logLines.join('\n');
+    if (Platform.isAndroid) {
+      final nativeLog = await _vpnCoreController.getAndroidNativeDebugLog();
+      if (nativeLog.trim().isNotEmpty) {
+        logText = logText.trim().isEmpty || logText.startsWith('Лог пуст.')
+            ? nativeLog.trim()
+            : '$logText\n\n=== Android Native Runtime Log ===\n$nativeLog';
+      }
+    }
     final controller = ScrollController();
     await showNeuraDialog(
       context: context,
@@ -3908,13 +3954,19 @@ $regItems = foreach ($rp in $regPaths) {
                 ],
               ),
               const SizedBox(height: 16),
-              DpiEvasionWidget(
-                manager: _dpiEvasionManager,
-                config: _dpiEvasionConfig,
-                serverHost: _currentLink?.host,
-                serverPort: _currentLink?.port,
-                onConfigChanged: _updateDpiConfig,
-              ),
+              if (Platform.isWindows)
+                DpiEvasionWidget(
+                  manager: _dpiEvasionManager,
+                  config: _dpiEvasionConfig,
+                  serverHost: _currentLink?.host,
+                  serverPort: _currentLink?.port,
+                  onConfigChanged: _updateDpiConfig,
+                )
+              else
+                Text(
+                  'Windows-only DPI/evasion controls are hidden on Android.',
+                  style: TextStyle(color: Colors.white.withOpacity(0.7)),
+                ),
             ],
           ),
         ),
@@ -4029,8 +4081,7 @@ $regItems = foreach ($rp in $regPaths) {
 
   Widget _buildWindowsConnectionModule() {
     final isRunning = _isRunning;
-    final isEnabled =
-        _selectedProfile != null || _controller.text.trim().isNotEmpty;
+    final isEnabled = _selectedProfile != null;
     final canInteract = !_isConnecting && !_isDisconnecting;
     final statusColor = isRunning
         ? _neuraRed
@@ -5613,8 +5664,7 @@ $regItems = foreach ($rp in $regPaths) {
         : [const Color(0xFF1A1B22), const Color(0xFF08090F)];
     final screenWidth = MediaQuery.of(context).size.width;
     final compact = screenWidth < 640;
-    final isEnabled =
-        _selectedProfile != null || _controller.text.trim().isNotEmpty;
+    final isEnabled = _selectedProfile != null;
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
 
     final statusText = Text(

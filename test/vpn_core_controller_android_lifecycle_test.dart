@@ -25,6 +25,8 @@ class _FakeAndroidVpnController extends AndroidVpnController {
   @override
   Future<void> startVpn(
     String config, {
+    String? runtime,
+    String? executablePath,
     List<String>? includePackages,
     List<String>? excludePackages,
   }) async {
@@ -46,6 +48,11 @@ class _FakeAndroidVpnController extends AndroidVpnController {
 
   @override
   Future<bool> isRunning() async => running;
+
+  @override
+  Future<String?> getLastStartupError() async => lastStartupError;
+
+  String? lastStartupError;
 }
 
 const _validUri =
