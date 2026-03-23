@@ -671,10 +671,13 @@ class _VlessHomePageState extends State<VlessHomePage>
     } catch (_) {
       // ignore
     }
-    await _maybeCheckForUpdates();
+    if (!Platform.isAndroid) {
+      await _maybeCheckForUpdates();
+    }
   }
 
   Future<void> _maybeCheckForUpdates({bool manual = false}) async {
+    if (Platform.isAndroid) return;
     if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
         _updateRepo == 'YOUR_GITHUB_REPO') {
       return;
@@ -4556,11 +4559,14 @@ $regItems = foreach ($rp in $regPaths) {
                               children: [
                                 const Icon(Icons.bolt, size: 16, color: _neuraRed),
                                 const SizedBox(width: 6),
-                                const Text(
-                                  'Задержка',
-                                  style: TextStyle(color: Colors.white54),
+                                Flexible(
+                                  child: Text(
+                                    'Задержка',
+                                    style: TextStyle(color: Colors.white54),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
                                 ),
-                                const Spacer(),
+                                const SizedBox(width: 4),
                                 SizedBox(
                                   width: 24,
                                   height: 24,
