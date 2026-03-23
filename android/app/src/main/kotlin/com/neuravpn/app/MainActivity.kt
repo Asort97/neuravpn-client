@@ -7,6 +7,7 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import com.neuravpn.app.vpn.AndroidVpnRuntimeManager
+import com.neuravpn.app.vpn.XrayVpnService
 
 class MainActivity : FlutterActivity() {
 
@@ -29,6 +30,11 @@ class MainActivity : FlutterActivity() {
 						if (config.isNullOrBlank()) {
 							result.error("INVALID_CONFIG", "Config payload required", null)
 						} else {
+							// Save config for Quick Settings Tile before starting
+							XrayVpnService.saveLastConfig(
+								applicationContext, config, executablePath,
+								includePackages, excludePackages,
+							)
 							AndroidVpnRuntimeManager.start(
 								context = applicationContext,
 								runtimeId = runtime,

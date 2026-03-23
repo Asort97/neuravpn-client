@@ -189,6 +189,7 @@ class XrayVpnService : VpnService(), DialerController {
 
             runningState.set(true)
             AndroidVpnRuntimeStateStore.markRunning(applicationContext, XrayAndroidRuntime.id)
+            saveLastConfig(applicationContext, config, executablePath, includePackages, excludePackages)
             startStatsWriter()
             updateNotification("Connected")
             debugLog("android xray vpn connected")
@@ -464,6 +465,28 @@ class XrayVpnService : VpnService(), DialerController {
         const val EXTRA_EXECUTABLE_PATH = "com.neuravpn.app.vpn.EXTRA_EXECUTABLE_PATH"
         const val EXTRA_INCLUDE_PACKAGES = "com.neuravpn.app.vpn.EXTRA_INCLUDE_PACKAGES"
         const val EXTRA_EXCLUDE_PACKAGES = "com.neuravpn.app.vpn.EXTRA_EXCLUDE_PACKAGES"
+        private const val LAST_CONFIG_FILE = "neuravpn_last_config.json"
+
+        fun saveLastConfig(
+            context: Context,
+            config: String,
+            executablePath: String?,
+            includePackages: List<String>?,
+            excludePackages: List<String>?,
+        ) {
+            runCatching {
+                val json = JSONObject()
+                json.put("config", config)
+                if (!executablePath.isNullOrBlank()) json.put("executablePath", executablePath)
+                if (!includePackages.isNullOrEmpty()) {
+                    json.put("includePackages", org.json.JSONArray(includePackages))
+                }
+                if (!excludePackages.isNullOrEmpty()) {
+                    json.put("excludePackages", org.json.JSONArray(excludePackages))
+                }
+                File(context.filesDir, LAST_CONFIG_FILE).writeText(json.toString())
+            }
+        }
 
         private val runningState = AtomicBoolean(false)
         private val stopInProgress = AtomicBoolean(false)
