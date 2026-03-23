@@ -33,6 +33,10 @@ android {
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -87,6 +91,6 @@ flutter {
 }
 
 dependencies {
-    implementation(files("libs/libbox.aar"))
+    implementation(files("libs/libXray.aar"))
     implementation("androidx.activity:activity-ktx:1.9.3")
 }

@@ -52,9 +52,10 @@
         </activity>
 
         <service
-            android:name=".vpn.LibboxVpnService"
+            android:name=".vpn.XrayVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false"
+            android:process=":xray_vpn"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"

@@ -389,6 +389,102 @@ String generateXrayConfig(
   return const JsonEncoder.withIndent('  ').convert(config);
 }
 
+/// Android-oriented Xray config generation.
+/// Package include/exclude split tunneling remains enforced by Android VpnService.
+String generateAndroidXrayConfig(
+  VlessLink link,
+  SplitTunnelConfig splitConfig, {
+  String inboundTag = 'socks-in',
+  bool smartRouting = false,
+  List<String> smartDomains = const <String>[],
+  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  String logLevel = 'info',
+}) {
+  final p = link.params;
+  final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
+  final security = (p['security'] ?? '').trim().toLowerCase();
+  final isReality = security == 'reality';
+  final useTls = security == 'tls' || isReality;
+  final serverName = p['sni'] ?? p['host'] ?? link.host;
+  final flow = p['flow'] ?? '';
+  final fingerprint = p['fp'] ?? 'chrome';
+  final path = p['path'];
+  final realityPublicKey = p['pbk'];
+  final realityShortId = p['sid'];
+  final vpnTag = link.tag ?? 'proxy';
+
+  final user = <String, dynamic>{
+    'id': link.uuid,
+    'encryption': 'none',
+    if (flow.isNotEmpty) 'flow': flow,
+  };
+
+  final routeRules = <Map<String, dynamic>>[];
+  if (smartRouting) {
+    routeRules.addAll(_buildSmartRulesXray(smartDomains, 'direct'));
+  }
+  routeRules.addAll(_buildRouteRulesXray(splitConfig, vpnTag));
+  routeRules.addAll(
+    extraRouteRules.map(_mapExtraRuleToXray).whereType<Map<String, dynamic>>(),
+  );
+
+  final config = <String, dynamic>{
+    'log': {'loglevel': logLevel},
+    'dns': {
+      'servers': ['1.1.1.1', '8.8.8.8'],
+      'queryStrategy': 'UseIPv4',
+    },
+    'inbounds': [
+      {
+        'tag': inboundTag,
+        'listen': '127.0.0.1',
+        'port': 10808,
+        'protocol': 'socks',
+        'settings': {
+          'auth': 'noauth',
+          'udp': true,
+        },
+        'sniffing': {
+          'enabled': true,
+          'destOverride': ['http', 'tls', 'quic'],
+        },
+      },
+    ],
+    'outbounds': [
+      {
+        'tag': vpnTag,
+        'protocol': 'vless',
+        'settings': {
+          'vnext': [
+            {
+              'address': link.host,
+              'port': link.port,
+              'users': [user],
+            },
+          ],
+        },
+        'streamSettings': _buildXrayStreamSettings(
+          transportType: transportType,
+          params: p,
+          path: path,
+          headerHost: p['host'] ?? link.host,
+          serverName: serverName,
+          useTls: useTls,
+          isReality: isReality,
+          fingerprint: fingerprint,
+          realityPublicKey: realityPublicKey,
+          realityShortId: realityShortId,
+        ),
+      },
+      {'tag': 'direct', 'protocol': 'freedom'},
+      {'tag': 'block', 'protocol': 'blackhole'},
+    ],
+    'routing': {'domainStrategy': 'IPIfNonMatch', 'rules': routeRules},
+  };
+
+  return const JsonEncoder.withIndent('  ').convert(config);
+}
+
 Map<String, dynamic> _buildXrayApiOutbound(
   Map<String, dynamic> outbound,
   String? interfaceName,
@@ -414,14 +510,12 @@ void _applyXrayOutboundBinding(
   if (interfaceName == null || interfaceName.isEmpty) {
     return;
   }
-  final streamSettings =
-      outbound['streamSettings'] is Map<String, dynamic>
+  final streamSettings = outbound['streamSettings'] is Map<String, dynamic>
       ? Map<String, dynamic>.from(
           outbound['streamSettings'] as Map<String, dynamic>,
         )
       : <String, dynamic>{};
-  final sockopt =
-      streamSettings['sockopt'] is Map<String, dynamic>
+  final sockopt = streamSettings['sockopt'] is Map<String, dynamic>
       ? Map<String, dynamic>.from(
           streamSettings['sockopt'] as Map<String, dynamic>,
         )

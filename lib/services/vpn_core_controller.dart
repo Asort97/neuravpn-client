@@ -62,6 +62,7 @@ class VpnCoreStartResult {
 }
 
 class VpnCoreController {
+  static const bool _androidXrayExperimental = true;
   VpnCoreController({
     WintunManager? wintunManager,
     WindowsTunGuard? tunGuard,
@@ -113,6 +114,8 @@ class VpnCoreController {
   bool _windowsConnected = false;
   bool _accessDeniedDetected = false;
   bool _startupCheckInProgress = false;
+  Timer? _androidNativeLogPollTimer;
+  int _lastAndroidNativeDebugLogLength = 0;
   Timer? _trafficPollTimer;
   bool _trafficPollInProgress = false;
   TrafficSamplingMode _trafficSamplingMode = TrafficSamplingMode.stopped;
@@ -209,8 +212,71 @@ class VpnCoreController {
     return _androidConnected;
   }
 
+  Future<String> getAndroidNativeDebugLog() async {
+    if (!_isAndroid) return '';
+    return _androidController.getNativeDebugLog(runtime: _androidRuntimeId);
+  }
+
+  Future<void> clearAndroidNativeDebugLog() async {
+    if (!_isAndroid) return;
+    _lastAndroidNativeDebugLogLength = 0;
+    await _androidController.clearNativeDebugLog(runtime: _androidRuntimeId);
+  }
+
+  void _startAndroidNativeLogPolling() {
+    if (!_isAndroid || !_useAndroidXrayRuntime) return;
+    _androidNativeLogPollTimer?.cancel();
+    _androidNativeLogPollTimer = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) {
+        unawaited(_drainAndroidNativeDebugLog());
+      },
+    );
+    unawaited(_drainAndroidNativeDebugLog());
+  }
+
+  Future<void> _stopAndroidNativeLogPolling({bool drain = false}) async {
+    _androidNativeLogPollTimer?.cancel();
+    _androidNativeLogPollTimer = null;
+    if (drain) {
+      await _drainAndroidNativeDebugLog();
+    }
+  }
+
+  Future<void> _drainAndroidNativeDebugLog() async {
+    if (!_isAndroid || !_useAndroidXrayRuntime) return;
+    try {
+      final fullLog = await getAndroidNativeDebugLog();
+      if (fullLog.isEmpty) {
+        return;
+      }
+      if (_lastAndroidNativeDebugLogLength > fullLog.length) {
+        _lastAndroidNativeDebugLogLength = 0;
+      }
+      final delta = fullLog.substring(_lastAndroidNativeDebugLogLength);
+      _lastAndroidNativeDebugLogLength = fullLog.length;
+      final lines = delta
+          .split(RegExp(r'[\r\n]+'))
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty)
+          .toList();
+      if (lines.isEmpty) {
+        return;
+      }
+      for (final line in lines) {
+        _rememberLogLine(line, isError: false);
+        _logSink?.call(line);
+        _appendConnectionLog(line);
+      }
+    } catch (_) {
+      // Ignore Android native debug log polling failures.
+    }
+  }
+
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
   bool get _isAndroid => _isAndroidOverride ?? Platform.isAndroid;
+  bool get _useAndroidXrayRuntime => _isAndroid && _androidXrayExperimental;
+  String get _androidRuntimeId => 'xray';
 
   Future<void> prepareWindowsRuntime({
     void Function(String log)? onLog,
@@ -340,6 +406,8 @@ class VpnCoreController {
     }
 
     if (_isAndroid) {
+      await clearAndroidNativeDebugLog();
+      _startAndroidNativeLogPolling();
       _notifyStatus('Генерация конфига');
       final jsonConfig = _buildConfigJson(
         parsed: parsed,
@@ -358,6 +426,11 @@ class VpnCoreController {
       );
       _generatedConfig = jsonConfig;
       _configFile = null;
+      // Log generated config for debugging (first 1000 chars)
+      _appendConnectionLog(
+        '[android] generated xray config (${jsonConfig.length} chars): '
+        '${jsonConfig.length > 1000 ? '${jsonConfig.substring(0, 1000)}...' : jsonConfig}',
+      );
       _notifyStatus('Запрос разрешения VPN');
       bool granted;
       try {
@@ -378,10 +451,25 @@ class VpnCoreController {
           ? androidPackages
           : <String>[];
 
-      _notifyStatus('Запуск Libbox сервиса');
+      String? androidExecutablePath;
+      if (_useAndroidXrayRuntime) {
+        _notifyStatus('Поиск Android xray-core');
+        androidExecutablePath = await _binaryManager.resolveExecutable(
+          androidRuntime: 'xray',
+        );
+        if (androidExecutablePath == null) {
+          return VpnCoreStartResult.failure(
+            'Не найден Android xray-core binary. Добавьте Android Xray runtime в assets/bin.',
+          );
+        }
+      }
+
+      _notifyStatus('Запуск Android Xray сервиса');
       try {
         await _androidController.startVpn(
           jsonConfig,
+          runtime: _androidRuntimeId,
+          executablePath: androidExecutablePath,
           includePackages: includePackages.isEmpty ? null : includePackages,
           excludePackages: excludePackages.isEmpty ? null : excludePackages,
         );
@@ -390,14 +478,33 @@ class VpnCoreController {
           'Не удалось запустить Android VPN сервис: $e',
         );
       }
-      final running = await _waitForAndroidServiceStartup();
-      _androidConnected = running;
-      if (!running) {
+      // Snapshot the current last-error BEFORE waiting.  A previous stop
+      // writes "stopped by request" which must not be mistaken for a new
+      // startup failure.
+      final preStartError = await _androidController.getLastStartupError();
+      final startup = await _waitForAndroidServiceStartup(
+        ignoreError: preStartError,
+      );
+      _androidConnected = startup.running;
+      if (!startup.running) {
+        final nativeLog = await getAndroidNativeDebugLog();
+        if (nativeLog.isNotEmpty) {
+          _emitLogs(nativeLog.split(RegExp(r'[\r\n]+')));
+        }
+        await _stopAndroidNativeLogPolling();
+        final errorDetail = startup.error;
+        if (errorDetail != null && errorDetail.isNotEmpty) {
+          return VpnCoreStartResult.failure(
+            'Android VPN сервис не запустился: $errorDetail',
+          );
+        }
         return VpnCoreStartResult.failure(
           'Android VPN сервис не запустился (проверьте совместимость конфигурации)',
         );
       }
-      _notifyStatus('Libbox сервис запущен');
+      _notifyStatus(
+        'Android Xray сервис запущен',
+      );
       unawaited(_warmupConnection());
       return VpnCoreStartResult.success();
     }
@@ -439,7 +546,9 @@ class VpnCoreController {
     _notifyStatus('Поиск xray-core');
     final exePath = await _measureConnectPhase(
       'binary_resolve',
-      () => _binaryManager.resolveExecutable(),
+      () => _binaryManager.resolveExecutable(
+        androidRuntime: _useAndroidXrayRuntime ? 'xray' : null,
+      ),
     );
     if (exePath == null) {
       return VpnCoreStartResult.failure('Не найден исполняемый файл xray-core');
@@ -742,6 +851,19 @@ class VpnCoreController {
         developerMode: developerMode,
       );
     }
+    if (_useAndroidXrayRuntime) {
+      return generateAndroidXrayConfig(
+        parsed,
+        splitConfig,
+        inboundTag: inboundTag,
+        smartRouting: splitConfig.smartRouting && !useSmartEngineRules,
+        smartDomains: splitConfig.smartRouting && !useSmartEngineRules
+            ? splitConfig.smartDomains
+            : const <String>[],
+        extraRouteRules: extraRouteRules,
+        logLevel: developerMode ? 'debug' : 'info',
+      );
+    }
     return generateSingBoxConfig(
       parsed,
       splitConfig,
@@ -772,15 +894,29 @@ class VpnCoreController {
   String get tunStackFromPlatform => _isAndroid ? 'gvisor' : 'system';
   int get _xrayApiPort => _windowsCoreAdapter.apiPort;
 
-  Future<bool> _waitForAndroidServiceStartup() async {
-    if (!_isAndroid) return true;
-    const attempts = 8;
+  Future<({bool running, String? error})> _waitForAndroidServiceStartup({
+    String? ignoreError,
+  }) async {
+    if (!_isAndroid) return (running: true, error: null);
+    // The service runs in a separate process. Give it enough time to
+    // bootstrap libXray, start the Xray core, establish TUN, and launch
+    // tun2socks. 20 × 300ms = 6 seconds — enough for cold-start.
+    const attempts = 20;
     for (var i = 0; i < attempts; i++) {
+      // Check for a startup error first — the service writes it BEFORE
+      // calling stopSelf(), so it may appear before isRunning flips.
+      // Ignore a stale error left over from a previous stop cycle.
+      final error = await _androidController.getLastStartupError();
+      if (error != null &&
+          error.isNotEmpty &&
+          error != ignoreError) {
+        return (running: false, error: error);
+      }
       final running = await _androidController.isRunning();
-      if (running) return true;
-      await Future.delayed(const Duration(milliseconds: 250));
+      if (running) return (running: true, error: null);
+      await Future.delayed(const Duration(milliseconds: 300));
     }
-    return false;
+    return (running: false, error: null);
   }
 
   Future<bool> _waitForAndroidServiceStop({int attempts = 16}) async {
@@ -956,6 +1092,7 @@ class VpnCoreController {
     if (_isAndroid) {
       final running = await syncRuntimeState();
       if (!running) {
+        await _stopAndroidNativeLogPolling(drain: true);
         _notifyStatus('Остановлено');
         return;
       }
@@ -975,6 +1112,7 @@ class VpnCoreController {
         }
       }
       _androidConnected = !stopped;
+      await _stopAndroidNativeLogPolling(drain: true);
       if (stopped) {
         _notifyStatus('Остановлено');
       } else {
@@ -1028,12 +1166,14 @@ class VpnCoreController {
           final stopped = await _waitForAndroidServiceStop();
           if (stopped) {
             _androidConnected = false;
+            await _stopAndroidNativeLogPolling(drain: true);
             return;
           }
         }
       }
       final stopped = await _waitForAndroidServiceStop();
       _androidConnected = !stopped;
+      await _stopAndroidNativeLogPolling(drain: true);
       return;
     }
 
@@ -1128,6 +1268,9 @@ class VpnCoreController {
   }
 
   Future<TrafficSample?> fetchTrafficSample({bool useDelta = false}) async {
+    if (_isAndroid) {
+      return _fetchAndroidTrafficSample(useDelta: useDelta);
+    }
     if (!_isWindows) return null;
     if (_process == null) return null;
     try {
@@ -1278,6 +1421,40 @@ class VpnCoreController {
     }
   }
 
+  Future<TrafficSample?> _fetchAndroidTrafficSample({
+    bool useDelta = false,
+  }) async {
+    if (!_androidConnected) return null;
+    try {
+      final stats = await _androidController.getTrafficStats();
+      if (stats == null) return null;
+      // stats.tx = upload (device → network), stats.rx = download (network → device)
+      final currentUp = stats.tx;
+      final currentDown = stats.rx;
+      if (_lastTrafficCounterSource != null &&
+          _lastTrafficCounterSource != 'android-tun2socks') {
+        _lastTrafficDownlinkCounter = null;
+        _lastTrafficUplinkCounter = null;
+      }
+      _lastTrafficCounterSource = 'android-tun2socks';
+      final deltaDown = _computeTrafficDelta(
+        current: currentDown,
+        previous: _lastTrafficDownlinkCounter,
+        useDelta: useDelta,
+      );
+      final deltaUp = _computeTrafficDelta(
+        current: currentUp,
+        previous: _lastTrafficUplinkCounter,
+        useDelta: useDelta,
+      );
+      _lastTrafficDownlinkCounter = currentDown;
+      _lastTrafficUplinkCounter = currentUp;
+      return TrafficSample(uplinkBps: deltaUp, downlinkBps: deltaDown);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<(int?, int?)> _fetchAdapterTrafficPair() async {
     if (!_isWindows) return (null, null);
     final preferred = _activeWindowsRouteSession?.tunInterfaceName ?? 'xray0';
@@ -1404,7 +1581,7 @@ if (-not \$s) { exit 0 }
   }
 
   Future<void> startTrafficStream() async {
-    if (!_isWindows) return;
+    if (!_isWindows && !_isAndroid) return;
     if (_trafficSamplingMode == TrafficSamplingMode.stopped) {
       _trafficSamplingMode = TrafficSamplingMode.foreground;
     }
