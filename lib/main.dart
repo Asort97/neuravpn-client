@@ -482,8 +482,16 @@ class _VlessHomePageState extends State<VlessHomePage>
       : (_pingMs != null ? '$_pingMs мс' : '--');
   SplitTunnelConfig get _activeSplitConfig =>
       _splitConfigs[_splitMode] ?? _splitConfigs['all']!;
-  SplitTunnelConfig get _effectiveSplitConfig =>
-      _splitEnabled ? _activeSplitConfig : SplitTunnelConfig(mode: 'all');
+  SplitTunnelConfig get _effectiveSplitConfig {
+    if (!_splitEnabled) return SplitTunnelConfig(mode: 'all');
+    final active = _activeSplitConfig;
+    // If split tunneling is on but both domains and apps lists are empty,
+    // treat it as disabled — there are no rules to apply.
+    if (active.domains.isEmpty && active.applications.isEmpty) {
+      return SplitTunnelConfig(mode: 'all');
+    }
+    return active;
+  }
 
   /// Раскрывает домены с предопределенными поддоменами (youtube.com -> все поддомены YouTube)
   List<String> _expandDomainsWithSubdomains(List<String> domains) {
