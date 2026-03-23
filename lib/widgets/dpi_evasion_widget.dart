@@ -183,46 +183,11 @@ class _DpiEvasionWidgetState extends State<DpiEvasionWidget> {
     return Column(
       children: [
         _buildToggleCard(
-          title: 'Агрессивная маскировка',
-          subtitle: subtitle,
-          value: _isAggressive,
-          onChanged: _onToggle,
-          disabled: disabled,
-        ),
-        if (_busy)
-          const Padding(
-            padding: EdgeInsets.only(top: 6),
-            child: SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-          ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
           title: 'TLS fragmentation (Xray)',
           subtitle:
               'Включает transport-level fragmentation для TLS-трафика в Xray.',
           value: _isXrayTlsFragmentationEnabled,
           onChanged: _onXrayTlsFragmentationToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'TCP Window Size clamp',
-          subtitle:
-              'Экспериментальная настройка. Ограничивает окно TCP до 64–512 байт.',
-          value: _isTcpWindowClampEnabled,
-          onChanged: _onTcpWindowClampToggle,
-          disabled: disabled,
-        ),
-        const SizedBox(height: 12),
-        _buildToggleCard(
-          title: 'SNI case randomization',
-          subtitle:
-              'Экспериментальная настройка. Случайно меняет регистр домена в SNI.',
-          value: _isSniCaseRandomEnabled,
-          onChanged: _onSniCaseRandomToggle,
           disabled: disabled,
         ),
       ],

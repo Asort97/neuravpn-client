@@ -221,6 +221,26 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _repository.updateSubscription(updated);
       await _loadSubscriptions();
 
+      // Re-select the same index profile after refresh so selection is not lost.
+      if (widget.selectedProfile != null) {
+        final oldUri = widget.selectedProfile!.uri;
+        // If old URI is still in the new list, keep it; otherwise pick same index.
+        final oldIndex = subscription.profiles.indexOf(oldUri);
+        final newIndex = (oldIndex >= 0 && oldIndex < profiles.length)
+            ? oldIndex
+            : (subscription.selectedIndex < profiles.length
+                ? subscription.selectedIndex
+                : 0);
+        if (newIndex < profiles.length) {
+          final newUri = profiles[newIndex];
+          final profile = VpnProfile(
+            name: _formatVlessSummary(newUri),
+            uri: newUri,
+          );
+          widget.onProfileSelected(profile);
+        }
+      }
+
       if (!mounted) return;
       _toast('Подписка обновлена.', tone: NeuraToastTone.success);
     } catch (e) {
