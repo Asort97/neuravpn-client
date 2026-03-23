@@ -86,6 +86,8 @@ flutter:
     - windows/runner/resources/hc_icon.ico
     - assets/images/logo.png
     - assets/images/11zon_cropped.png
+    - assets/images/anim_connect/
+    - assets/images/anim_disconnect/
     - assets/public_suffix/public_suffix_list.dat
 
 # Windows MSIX packaging (App Installer updates)

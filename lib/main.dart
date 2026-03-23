@@ -295,7 +295,7 @@ class VlessHomePage extends StatefulWidget {
 }
 
 class _VlessHomePageState extends State<VlessHomePage>
-    with TrayListener, WindowListener, SingleTickerProviderStateMixin {
+    with TrayListener, WindowListener, TickerProviderStateMixin {
   static const int _trafficGraphInterpolationSteps = 10;
   static const double _trafficGraphSmoothingFactor = 0.34;
   static const String _updateOwner = 'Asort97';
@@ -353,6 +353,17 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _trayRestoreWasVisible = false;
   late final AnimationController _connectGlowController;
   late final Animation<double> _connectGlowAnimation;
+  late final AnimationController _frameAnimController;
+  bool _frameAnimForward = false;
+
+  static final List<String> _connectFrames = [
+    for (int i = 35; i <= 60; i++)
+      'assets/images/anim_connect/${i.toString().padLeft(4, '0')}.png',
+  ];
+  static final List<String> _disconnectFrames = [
+    for (int i = 35; i <= 60; i++)
+      'assets/images/anim_disconnect/${i.toString().padLeft(4, '0')}.png',
+  ];
   bool _androidAppsLoaded = false;
   bool _androidAppsLoading = false;
   String? _androidAppLoadError;
@@ -555,7 +566,14 @@ class _VlessHomePageState extends State<VlessHomePage>
       parent: _connectGlowController,
       curve: Curves.linear,
     );
+    _frameAnimController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    );
     _updateConnectGlowTicker();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _precacheAnimationFrames(context);
+    });
     if (_isWindowsShellPlatform) {
       _installWindowsLaunchHandler();
     }
@@ -1336,6 +1354,34 @@ $regItems = foreach ($rp in $regPaths) {
     }
   }
 
+  void _updateFrameAnimation() {
+    if (_isConnecting) {
+      if (!_frameAnimForward || !_frameAnimController.isAnimating) {
+        _frameAnimForward = true;
+        _frameAnimController.repeat();
+      }
+    } else if (_isDisconnecting) {
+      if (_frameAnimForward || !_frameAnimController.isAnimating) {
+        _frameAnimForward = false;
+        _frameAnimController.repeat();
+      }
+    } else {
+      if (_frameAnimController.isAnimating) {
+        _frameAnimController.stop();
+      }
+      _frameAnimController.value = 0;
+    }
+  }
+
+  void _precacheAnimationFrames(BuildContext context) {
+    for (final path in _connectFrames) {
+      precacheImage(AssetImage(path), context);
+    }
+    for (final path in _disconnectFrames) {
+      precacheImage(AssetImage(path), context);
+    }
+  }
+
   void _startTrafficMonitor() {
     if (!Platform.isWindows && !Platform.isAndroid) return;
     if (_trafficSub != null) return;
@@ -1789,6 +1835,7 @@ $regItems = foreach ($rp in $regPaths) {
       _isDisconnecting = false;
     });
     _updateConnectGlowTicker();
+    _updateFrameAnimation();
   }
 
   bool _androidStatePollInProgress = false;
@@ -1809,6 +1856,7 @@ $regItems = foreach ($rp in $regPaths) {
         _isDisconnecting = false;
       });
       _updateConnectGlowTicker();
+      _updateFrameAnimation();
       if (nowRunning) {
         _startTrafficMonitor();
       } else {
@@ -2952,6 +3000,7 @@ $regItems = foreach ($rp in $regPaths) {
     });
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
+    _updateFrameAnimation();
     final result = await _vpnCoreController.connect(
       rawUri: _controller.text,
       splitConfig: _configForConnection,
@@ -2979,6 +3028,7 @@ $regItems = foreach ($rp in $regPaths) {
         });
         unawaited(_updateTrayMenu());
         _updateConnectGlowTicker();
+        _updateFrameAnimation();
         _stopTrafficMonitor();
         unawaited(_syncTrafficSamplingMode());
         return;
@@ -3001,6 +3051,7 @@ $regItems = foreach ($rp in $regPaths) {
       });
       unawaited(_updateTrayMenu());
       _updateConnectGlowTicker();
+      _updateFrameAnimation();
       _stopTrafficMonitor();
       unawaited(_syncTrafficSamplingMode());
       return;
@@ -3014,6 +3065,7 @@ $regItems = foreach ($rp in $regPaths) {
     });
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
+    _updateFrameAnimation();
     _startTrafficMonitor();
     unawaited(_syncTrafficSamplingMode());
     unawaited(_applyDpiEvasionInjector());
@@ -3069,6 +3121,7 @@ $regItems = foreach ($rp in $regPaths) {
     setState(() {
       _isDisconnecting = true;
     });
+    _updateFrameAnimation();
 
     // Сначала остановить мониторинг трафика
     await _stopTrafficMonitor();
@@ -3103,6 +3156,7 @@ $regItems = foreach ($rp in $regPaths) {
     }
     unawaited(_updateTrayMenu());
     _updateConnectGlowTicker();
+    _updateFrameAnimation();
     unawaited(_syncTrafficSamplingMode());
   }
 
@@ -3348,6 +3402,7 @@ $regItems = foreach ($rp in $regPaths) {
       _androidLaunchChannel.setMethodCallHandler(null);
     }
     _connectGlowController.dispose();
+    _frameAnimController.dispose();
     _windowsPageController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
@@ -4518,12 +4573,40 @@ $regItems = foreach ($rp in $regPaths) {
                                       child: AnimatedRotation(
                                         duration: NeuraUi.normal,
                                         turns: _isConnecting ? 0.0125 : 0,
-                                        child: Image.asset(
-                                          'assets/images/logo.png',
-                                          width: 48,
-                                          height: 48,
-                                          color: Colors.white,
-                                          filterQuality: FilterQuality.high,
+                                        child: AnimatedBuilder(
+                                          animation: _frameAnimController,
+                                          builder: (context, _) {
+                                            final String framePath;
+                                            if (_isConnecting ||
+                                                _isDisconnecting) {
+                                              final frames = _isConnecting
+                                                  ? _connectFrames
+                                                  : _disconnectFrames;
+                                              final idx =
+                                                  (_frameAnimController.value *
+                                                          (frames.length - 1))
+                                                      .round()
+                                                      .clamp(
+                                                        0,
+                                                        frames.length - 1,
+                                                      );
+                                              framePath = frames[idx];
+                                            } else if (isRunning) {
+                                              framePath =
+                                                  _connectFrames.last;
+                                            } else {
+                                              framePath =
+                                                  _connectFrames.first;
+                                            }
+                                            return Image.asset(
+                                              framePath,
+                                              width: 48,
+                                              height: 48,
+                                              filterQuality:
+                                                  FilterQuality.high,
+                                              gaplessPlayback: true,
+                                            );
+                                          },
                                         ),
                                       ),
                                     ),
