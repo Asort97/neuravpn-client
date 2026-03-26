@@ -295,7 +295,7 @@ class VlessHomePage extends StatefulWidget {
 }
 
 class _VlessHomePageState extends State<VlessHomePage>
-    with TrayListener, WindowListener, TickerProviderStateMixin {
+    with TrayListener, WindowListener, TickerProviderStateMixin, WidgetsBindingObserver {
   static const int _trafficGraphInterpolationSteps = 10;
   static const double _trafficGraphSmoothingFactor = 0.34;
   static const String _updateOwner = 'Asort97';
@@ -665,6 +665,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _windowsPageController = PageController(
       initialPage: _windowsViewIndex(_windowsView),
     );
@@ -719,6 +720,16 @@ class _VlessHomePageState extends State<VlessHomePage>
     }
     if (Platform.isAndroid) {
       unawaited(_loadAndroidApps());
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && Platform.isAndroid) {
+      unawaited(_pollAndroidVpnState());
+      if (_isRunning) {
+        unawaited(_vpnCoreController.refreshAndroidNetwork());
+      }
     }
   }
 
@@ -1946,6 +1957,9 @@ $regItems = foreach ($rp in $regPaths) {
     });
     _updateConnectGlowTicker();
     _updateFrameAnimation();
+    if (running) {
+      _startTrafficMonitor();
+    }
   }
 
   bool _androidStatePollInProgress = false;
@@ -3502,6 +3516,7 @@ $regItems = foreach ($rp in $regPaths) {
   @override
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _androidStateSyncTimer?.cancel();
     _subscriptionRefreshTimer?.cancel();
     _logFlushTimer?.cancel();

@@ -12,6 +12,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.os.Build
+import android.os.PowerManager
 import android.os.Process
 import android.util.Base64
 import android.util.Log
@@ -41,6 +42,7 @@ class XrayVpnService : VpnService(), DialerController {
     }
     private var defaultNetworkCallback: ConnectivityManager.NetworkCallback? = null
     private var statsScheduler: ScheduledExecutorService? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -50,6 +52,11 @@ class XrayVpnService : VpnService(), DialerController {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            ACTION_REFRESH_NETWORK -> {
+                debugLog("ACTION_REFRESH_NETWORK received")
+                refreshUnderlyingNetwork()
+                return START_STICKY
+            }
             ACTION_STOP -> {
                 if (!stopInProgress.compareAndSet(false, true)) {
                     debugLog("ACTION_STOP ignored: stop already in progress")
@@ -190,6 +197,7 @@ class XrayVpnService : VpnService(), DialerController {
             runningState.set(true)
             AndroidVpnRuntimeStateStore.markRunning(applicationContext, XrayAndroidRuntime.id)
             saveLastConfig(applicationContext, config, executablePath, includePackages, excludePackages)
+            acquireWakeLock()
             startStatsWriter()
             updateNotification("Connected")
             debugLog("android xray vpn connected")
@@ -228,6 +236,7 @@ class XrayVpnService : VpnService(), DialerController {
                 "error=${error ?: "-"}"
         )
         runningState.set(false)
+        releaseWakeLock()
         stopStatsWriter()
         AndroidVpnRuntimeStateStore.markStopped(applicationContext, XrayAndroidRuntime.id, error)
         if (shouldTerminate) {
@@ -450,6 +459,29 @@ class XrayVpnService : VpnService(), DialerController {
         runCatching { setUnderlyingNetworks(null) }
     }
 
+    private fun refreshUnderlyingNetwork() {
+        stopUnderlyingNetworkMonitor()
+        startUnderlyingNetworkMonitor()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock != null) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "neuravpn:vpn").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+        debugLog("WakeLock acquired")
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+            debugLog("WakeLock released")
+        }
+        wakeLock = null
+    }
+
     companion object {
         private const val TAG = "XrayVpnService"
         private const val CHANNEL_ID = "neuravpn_vpn"
@@ -461,6 +493,7 @@ class XrayVpnService : VpnService(), DialerController {
         private const val TUN_IPV6_CLIENT = "fdfe:dcba:9876::1"
         private const val TUN_IPV6_PREFIX = 126
         const val ACTION_STOP = "com.neuravpn.app.vpn.ACTION_STOP_XRAY"
+        const val ACTION_REFRESH_NETWORK = "com.neuravpn.app.vpn.ACTION_REFRESH_NETWORK"
         const val EXTRA_CONFIG = "com.neuravpn.app.vpn.EXTRA_CONFIG"
         const val EXTRA_EXECUTABLE_PATH = "com.neuravpn.app.vpn.EXTRA_EXECUTABLE_PATH"
         const val EXTRA_INCLUDE_PACKAGES = "com.neuravpn.app.vpn.EXTRA_INCLUDE_PACKAGES"
@@ -548,6 +581,14 @@ class XrayVpnService : VpnService(), DialerController {
                 AndroidVpnDebugLogStore.append(context, TAG, "failed to dispatch ACTION_STOP, using stopService")
                 runCatching { context.stopService(Intent(context, XrayVpnService::class.java)) }
             }
+        }
+
+        fun refreshNetwork(context: Context) {
+            if (!runningState.get()) return
+            val intent = Intent(context, XrayVpnService::class.java).apply {
+                action = ACTION_REFRESH_NETWORK
+            }
+            runCatching { context.startService(intent) }
         }
     }
 

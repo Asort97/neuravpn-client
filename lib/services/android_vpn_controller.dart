@@ -97,6 +97,16 @@ class AndroidVpnController {
     }
   }
 
+  /// Tells the VPN service to re-register its underlying network callback.
+  Future<void> refreshNetwork() async {
+    if (!isSupported) return;
+    try {
+      await _channel.invokeMethod('refreshNetwork');
+    } on PlatformException {
+      // Best-effort; ignore failures.
+    }
+  }
+
   /// Returns traffic stats {tx, rx} in bytes from the VPN service, or null.
   Future<({int tx, int rx})?> getTrafficStats() async {
     if (!isSupported) return null;

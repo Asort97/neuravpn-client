@@ -223,6 +223,12 @@ class VpnCoreController {
     await _androidController.clearNativeDebugLog(runtime: _androidRuntimeId);
   }
 
+  /// Asks the VPN service to re-register its underlying network callback.
+  Future<void> refreshAndroidNetwork() async {
+    if (!_isAndroid) return;
+    await _androidController.refreshNetwork();
+  }
+
   void _startAndroidNativeLogPolling() {
     if (!_isAndroid || !_useAndroidXrayRuntime) return;
     _androidNativeLogPollTimer?.cancel();

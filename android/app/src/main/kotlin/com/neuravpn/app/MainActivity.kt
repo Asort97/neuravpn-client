@@ -100,6 +100,14 @@ class MainActivity : FlutterActivity() {
 						result.error("TRAFFIC_STATS_FAILED", t.message, null)
 					}
 				}
+				METHOD_REFRESH_NETWORK -> {
+					try {
+						XrayVpnService.refreshNetwork(applicationContext)
+						result.success(null)
+					} catch (t: Throwable) {
+						result.error("REFRESH_NETWORK_FAILED", t.message, null)
+					}
+				}
 				else -> result.notImplemented()
 			}
 		}
@@ -189,6 +197,7 @@ class MainActivity : FlutterActivity() {
 		private const val METHOD_CLEAR_DEBUG_LOG = "clearNativeVpnDebugLog"
 		private const val METHOD_LAST_ERROR = "getLastStartupError"
 		private const val METHOD_TRAFFIC_STATS = "getTrafficStats"
+		private const val METHOD_REFRESH_NETWORK = "refreshNetwork"
 		private const val METHOD_GET_INITIAL_LAUNCH_URI = "getInitialLaunchUri"
 		private const val METHOD_HANDLE_LAUNCH_URI = "handleLaunchUri"
 		private const val ARG_CONFIG = "config"
