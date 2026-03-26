@@ -98,7 +98,10 @@ class VpnQuickSettingsTile : TileService() {
         tile.state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
         tile.label = "NeuraVPN"
         tile.subtitle = subtitle
-        tile.icon = Icon.createWithResource(this, R.mipmap.ic_launcher)
+        tile.icon = Icon.createWithResource(
+            this,
+            if (active) R.drawable.ic_tile_connected else R.drawable.ic_tile_disconnected,
+        )
         tile.updateTile()
     }
 }
