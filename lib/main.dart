@@ -1051,6 +1051,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     final safeIconDir = iconDir.path.replaceAll("'", "''");
     final script =
         r'''
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $paths = @(
   "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
   "$env:AppData\Microsoft\Windows\Start Menu\Programs"
@@ -1134,7 +1135,14 @@ $items = foreach ($base in $paths) {
           }
           $iconOut = ''
           if (Test-Path $iconPath) { $iconOut = $iconPath }
-          [PSCustomObject]@{ name = $_.BaseName; path = $exe; icon = $iconOut }
+          $appName = $null
+          try {
+            $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+            if ($vi.FileDescription) { $appName = $vi.FileDescription }
+            elseif ($vi.ProductName) { $appName = $vi.ProductName }
+          } catch {}
+          if (-not $appName) { $appName = $_.BaseName }
+          [PSCustomObject]@{ name = $appName; path = $exe; icon = $iconOut }
         }
       } catch {}
     }
@@ -1200,7 +1208,7 @@ $regItems = foreach ($rp in $regPaths) {
         'Bypass',
         '-File',
         scriptFile.path,
-      ]);
+      ], stdoutEncoding: utf8, stderrEncoding: utf8);
       if (result.exitCode != 0) {
         throw Exception(
           result.stderr?.toString().trim().isNotEmpty == true
