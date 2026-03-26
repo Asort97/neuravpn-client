@@ -429,6 +429,84 @@ class _VlessHomePageState extends State<VlessHomePage>
       'discordstatus.com',
     ],
   };
+
+  /// Маппинг exe-файлов приложений -> дополнительные домены, которые нужно
+  /// маршрутизировать вместе с приложением (для kernel-драйверов и т.д.).
+  /// Ключи — имена .exe в нижнем регистре.
+  static const Map<String, List<String>> _appExtraDomainsMap = {
+    // Riot Games / Valorant — трафик vgk.sys (kernel anti-cheat) не ловится
+    // по процессу, поэтому добавляем домены Riot для полного обхода.
+    'valorant.exe': [
+      'riotgames.com',
+      'riotgames.net',
+      'playvalorant.com',
+      'riotcdn.net',
+      'pvp.net',
+      'leagueoflegends.com',
+      'lolesports.com',
+      'bacon.gg',
+      'riotgames.cn',
+      'valorantesports.com',
+      'riotsecure.com',
+    ],
+    'riotclientservices.exe': [
+      'riotgames.com',
+      'riotgames.net',
+      'playvalorant.com',
+      'riotcdn.net',
+      'pvp.net',
+      'leagueoflegends.com',
+      'riotsecure.com',
+    ],
+    'vgc.exe': [
+      'riotgames.com',
+      'riotgames.net',
+      'playvalorant.com',
+      'riotcdn.net',
+      'pvp.net',
+      'riotsecure.com',
+    ],
+    'leagueclient.exe': [
+      'riotgames.com',
+      'riotgames.net',
+      'riotcdn.net',
+      'pvp.net',
+      'leagueoflegends.com',
+      'lolesports.com',
+    ],
+  };
+
+  /// Маппинг exe-файлов приложений -> дополнительные процессы, которые нужно
+  /// маршрутизировать вместе (помимо автообнаружения _collectDescendantExecutables).
+  static const Map<String, List<String>> _appExtraProcessesMap = {
+    'valorant.exe': [
+      'VALORANT-Win64-Shipping.exe',
+      'RiotClientServices.exe',
+      'RiotClientCrashHandler.exe',
+      'vgc.exe',
+      'vgtray.exe',
+      'vgm.exe',
+      'log-uploader.exe',
+    ],
+    'riotclientservices.exe': [
+      'VALORANT-Win64-Shipping.exe',
+      'RiotClientCrashHandler.exe',
+      'vgc.exe',
+      'vgtray.exe',
+      'vgm.exe',
+      'log-uploader.exe',
+    ],
+    'leagueclient.exe': [
+      'LeagueClientUx.exe',
+      'League of Legends.exe',
+      'RiotClientServices.exe',
+      'RiotClientCrashHandler.exe',
+      'vgc.exe',
+      'vgtray.exe',
+      'vgm.exe',
+      'log-uploader.exe',
+    ],
+  };
   int? _pingMs;
   bool _pingInProgress = false;
   bool _splitEnabled = false;
@@ -523,6 +601,34 @@ class _VlessHomePageState extends State<VlessHomePage>
     return expanded;
   }
 
+  /// Раскрывает приложения: для известных exe добавляет дополнительные
+  /// домены и процессы (kernel-драйверы, античиты и т.д.).
+  /// Возвращает ({расширенные приложения}, {дополнительные домены}).
+  ({List<String> apps, List<String> extraDomains}) _expandAppsWithExtras(
+    List<String> applications,
+  ) {
+    final extraDomains = <String>{};
+    final extraProcesses = <String>{};
+    for (final app in applications) {
+      final exeName = app.contains('\\') || app.contains('/')
+          ? path.basename(app).toLowerCase()
+          : app.toLowerCase();
+      final domains = _appExtraDomainsMap[exeName];
+      if (domains != null) extraDomains.addAll(domains);
+      final processes = _appExtraProcessesMap[exeName];
+      if (processes != null) extraProcesses.addAll(processes);
+    }
+    // Добавляем доп. процессы которых ещё нет в списке приложений
+    final appsLower = applications.map((a) => a.toLowerCase()).toSet();
+    final mergedApps = List<String>.from(applications);
+    for (final proc in extraProcesses) {
+      if (!appsLower.contains(proc.toLowerCase())) {
+        mergedApps.add(proc);
+      }
+    }
+    return (apps: mergedApps, extraDomains: extraDomains.toList());
+  }
+
   SplitTunnelConfig get _configForConnection {
     final effective = _effectiveSplitConfig;
     final normalizedDomains = _domainRuleNormalizer.normalizeForConnection(
@@ -532,10 +638,14 @@ class _VlessHomePageState extends State<VlessHomePage>
           ? (message) => _appendLogs(['[domain-normalizer] $message'])
           : null,
     );
-    // Раскрываем домены с поддоменами под капотом.
-    final expandedDomains = _expandDomainsWithSubdomains(normalizedDomains);
+    // Раскрываем приложения: добавляем доп. процессы и домены для kernel-драйверов.
+    final appExpansion = _expandAppsWithExtras(effective.applications);
+    // Раскрываем домены с поддоменами + добавляем домены от приложений.
+    final allDomains = <String>[...normalizedDomains, ...appExpansion.extraDomains];
+    final expandedDomains = _expandDomainsWithSubdomains(allDomains);
     return effective.copyWith(
       domains: expandedDomains,
+      applications: appExpansion.apps,
       smartRouting: _smartRouting,
       smartDomains: _smartRouteEngine.exportLegacyRuleEntries(),
     );
