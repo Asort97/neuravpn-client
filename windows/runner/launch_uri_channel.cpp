@@ -41,3 +41,14 @@ void DispatchLaunchUri(const std::string& payload) {
       "handleLaunchUri",
       std::make_unique<flutter::EncodableValue>(payload));
 }
+
+void DispatchDuplicateInstanceSignal() {
+  if (g_channel == nullptr) {
+    return;
+  }
+
+  LogDebug("dispatching duplicate instance signal");
+  g_channel->InvokeMethod(
+      "handleDuplicateInstance",
+      std::make_unique<flutter::EncodableValue>(true));
+}

@@ -759,6 +759,10 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   void _installWindowsLaunchHandler() {
     _windowsLaunchChannel.setMethodCallHandler((call) async {
+      if (call.method == 'handleDuplicateInstance') {
+        await _handleDuplicateInstance();
+        return;
+      }
       if (call.method != 'handleLaunchUri') {
         return;
       }
@@ -777,6 +781,15 @@ class _VlessHomePageState extends State<VlessHomePage>
         await windowManager.focus();
       }
     });
+  }
+
+  Future<void> _handleDuplicateInstance() async {
+    if (_isWindowsShellPlatform) {
+      await _restoreWindowFromTray();
+    }
+    if (mounted) {
+      _showFastSnack('Приложение уже запущено');
+    }
   }
 
   void _installAndroidLaunchHandler() {

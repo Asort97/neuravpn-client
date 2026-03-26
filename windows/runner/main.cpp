@@ -209,26 +209,18 @@ void EnableKillOnJobClose() {
 }
 
 bool AcquireInstanceSlot() {
-  const wchar_t* mutex_names[] = {
-      L"HappycatVpnClientInstanceSlot1",
-      L"HappycatVpnClientInstanceSlot2",
-  };
-
-  for (const auto* name : mutex_names) {
-    HANDLE handle = ::CreateMutexW(nullptr, FALSE, name);
-    if (handle == nullptr) {
-      continue;
-    }
-
-    const DWORD wait = ::WaitForSingleObject(handle, 0);
-    if (wait == WAIT_OBJECT_0) {
-      g_instance_mutex = handle;
-      return true;
-    }
-
-    ::CloseHandle(handle);
+  HANDLE handle = ::CreateMutexW(nullptr, FALSE, L"HappycatVpnClientInstanceSlot1");
+  if (handle == nullptr) {
+    return false;
   }
 
+  const DWORD wait = ::WaitForSingleObject(handle, 0);
+  if (wait == WAIT_OBJECT_0) {
+    g_instance_mutex = handle;
+    return true;
+  }
+
+  ::CloseHandle(handle);
   return false;
 }
 
@@ -339,10 +331,23 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return EXIT_SUCCESS;
   }
   if (!AcquireInstanceSlot()) {
-    ::MessageBoxW(nullptr,
-                  L"\u041e\u0434\u043d\u043e\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u043c\u043e\u0436\u043d\u043e \u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u044c \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u0432\u0430 \u044d\u043a\u0437\u0435\u043c\u043f\u043b\u044f\u0440\u0430.",
-                  L"happycat_vpnclient",
-                  MB_OK | MB_ICONWARNING);
+    HWND existing = FindExistingInstanceWindow();
+    if (existing != nullptr) {
+      COPYDATASTRUCT copy_data = {};
+      copy_data.dwData = kDuplicateInstanceCopyDataId;
+      copy_data.cbData = 0;
+      copy_data.lpData = nullptr;
+
+      DWORD_PTR send_result = 0;
+      ::SendMessageTimeoutW(
+          existing,
+          WM_COPYDATA,
+          0,
+          reinterpret_cast<LPARAM>(&copy_data),
+          SMTO_BLOCK | SMTO_ABORTIFHUNG,
+          4000,
+          &send_result);
+    }
     return EXIT_SUCCESS;
   }
 

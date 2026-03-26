@@ -84,6 +84,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
           return 1;
         }
       }
+      if (copy_data != nullptr &&
+          copy_data->dwData == kDuplicateInstanceCopyDataId) {
+        DispatchDuplicateInstanceSignal();
+        return 1;
+      }
       break;
     }
     case WM_FONTCHANGE:
