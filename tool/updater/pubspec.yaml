@@ -1,0 +1,11 @@
+name: neuravpn_updater
+description: Standalone updater for neuravpn Windows app
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  archive: ^4.0.2
+  args: ^2.4.0

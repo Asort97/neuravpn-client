@@ -10,6 +10,7 @@ class GithubReleaseInfo {
     required this.htmlUrl,
     required this.isPrerelease,
     required this.publishedAt,
+    this.assets = const [],
   });
 
   final String tag;
@@ -18,6 +19,19 @@ class GithubReleaseInfo {
   final Uri htmlUrl;
   final bool isPrerelease;
   final DateTime? publishedAt;
+  final List<GithubReleaseAsset> assets;
+}
+
+class GithubReleaseAsset {
+  const GithubReleaseAsset({
+    required this.name,
+    required this.downloadUrl,
+    required this.size,
+  });
+
+  final String name;
+  final Uri downloadUrl;
+  final int size;
 }
 
 class UpdateCheckResult {
@@ -28,6 +42,7 @@ class UpdateCheckResult {
     required this.releaseUrl,
     required this.releaseNotes,
     required this.isUpdateAvailable,
+    this.assets = const [],
   });
 
   final String currentVersion;
@@ -36,6 +51,7 @@ class UpdateCheckResult {
   final Uri releaseUrl;
   final String releaseNotes;
   final bool isUpdateAvailable;
+  final List<GithubReleaseAsset> assets;
 }
 
 class GithubUpdateService {
@@ -55,7 +71,7 @@ class GithubUpdateService {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'neuravpn',
       },
-    );
+    ).timeout(const Duration(seconds: 10));
     if (response.statusCode != 200) return null;
     final decoded = jsonDecode(response.body);
     if (decoded is! List) return null;
@@ -82,6 +98,24 @@ class GithubUpdateService {
       publishedAt = DateTime.tryParse(publishedAtRaw);
     }
 
+    final rawAssets = pick['assets'];
+    final assets = <GithubReleaseAsset>[];
+    if (rawAssets is List) {
+      for (final a in rawAssets) {
+        if (a is! Map) continue;
+        final assetName = (a['name'] as String?)?.trim() ?? '';
+        final url = (a['browser_download_url'] as String?)?.trim() ?? '';
+        final size = a['size'] as int? ?? 0;
+        if (assetName.isNotEmpty && url.isNotEmpty) {
+          assets.add(GithubReleaseAsset(
+            name: assetName,
+            downloadUrl: Uri.parse(url),
+            size: size,
+          ));
+        }
+      }
+    }
+
     return GithubReleaseInfo(
       tag: tag,
       name: name,
@@ -89,6 +123,7 @@ class GithubUpdateService {
       htmlUrl: Uri.parse(html),
       isPrerelease: pick['prerelease'] == true,
       publishedAt: publishedAt,
+      assets: assets,
     );
   }
 
@@ -109,6 +144,7 @@ class GithubUpdateService {
       releaseUrl: latest.htmlUrl,
       releaseNotes: latest.body,
       isUpdateAvailable: isNewer,
+      assets: latest.assets,
     );
   }
 

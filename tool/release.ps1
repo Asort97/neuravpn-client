@@ -41,6 +41,16 @@ function Assert-PlatformAndVersion {
   }
 }
 
+function Update-Pubspec([string]$buildName, [int]$buildNumber) {
+  $pubspecPath = Join-Path $repoRoot 'pubspec.yaml'
+  $content = [System.IO.File]::ReadAllText($pubspecPath)
+  $content = $content -replace '(?m)^version:\s*\S+', "version: $buildName+$buildNumber"
+  $content = $content -replace '(?m)^(\s+msix_version:\s*)\S+', "`${1}$buildName.0"
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($pubspecPath, $content, $utf8NoBom)
+  Write-Host "Updated pubspec.yaml: version=$buildName+$buildNumber, msix_version=$buildName.0" -ForegroundColor Green
+}
+
 function Show-Config([object]$config) {
   Write-Host "Current release versions:" -ForegroundColor Cyan
   Write-Host "  Android: buildName=$($config.android.buildName), buildNumber=$($config.android.buildNumber)"
@@ -68,8 +78,31 @@ function Build-Android([object]$config) {
   }
 }
 
+function Build-Updater {
+  $updaterDir = Join-Path $repoRoot "tool\updater"
+  $outputExe = Join-Path $updaterDir "build\updater.exe"
+
+  Write-Host "Building updater.exe..." -ForegroundColor Cyan
+  Push-Location $updaterDir
+  try {
+    & dart pub get | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "dart pub get failed for updater" }
+
+    $buildDir = Join-Path $updaterDir "build"
+    if (-not (Test-Path $buildDir)) { New-Item -ItemType Directory -Path $buildDir | Out-Null }
+
+    & dart compile exe bin/updater.dart -o $outputExe | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "dart compile exe failed for updater" }
+
+    Write-Host "Updater built: $outputExe" -ForegroundColor Green
+  } finally {
+    Pop-Location
+  }
+  return $outputExe
+}
+
 function Build-Windows([object]$config) {
-  $args = @(
+  $flutterArgs = @(
     "build", "windows", "--release",
     "--build-name", "$($config.windows.buildName)",
     "--build-number", "$($config.windows.buildNumber)"
@@ -77,9 +110,54 @@ function Build-Windows([object]$config) {
 
   Push-Location $repoRoot
   try {
-    & flutter @args
+    Write-Host "Running flutter clean..." -ForegroundColor Cyan
+    & flutter clean | Out-Host
+    & flutter pub get | Out-Host
+    & flutter @flutterArgs
     if ($LASTEXITCODE -ne 0) {
       throw "Windows build failed"
+    }
+
+    $buildOutput = Join-Path $repoRoot "build\windows\x64\runner\Release"
+
+    # Build and copy updater.exe into the release folder
+    $updaterExe = Build-Updater
+    Copy-Item $updaterExe -Destination $buildOutput -Force
+    Write-Host "Copied updater.exe to build output" -ForegroundColor Green
+
+    # Create release zip (includes updater.exe)
+    $zipName = "neuravpn-windows-v$($config.windows.buildName).zip"
+    $zipPath = Join-Path $repoRoot "build\$zipName"
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Compress-Archive -Path "$buildOutput\*" -DestinationPath $zipPath -Force
+    Write-Host "Created release zip: $zipPath" -ForegroundColor Green
+
+    # Build Inno Setup installer if iscc is available
+    $iscc = Get-Command "iscc" -ErrorAction SilentlyContinue
+    if (-not $iscc) {
+      # Try standard Inno Setup install locations
+      $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+      $isccPaths = @(
+        (Join-Path $pf86 'Inno Setup 6\ISCC.exe'),
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+      )
+      foreach ($p in $isccPaths) {
+        if (Test-Path $p) { $iscc = $p; break }
+      }
+    } else {
+      $iscc = $iscc.Source
+    }
+
+    if ($iscc) {
+      $issPath = Join-Path $repoRoot 'installer' 'neuravpn.iss'
+      & $iscc "/DAppVersion=$($config.windows.buildName)" $issPath
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "Inno Setup build failed" -ForegroundColor Red
+      } else {
+        Write-Host "Installer created in build/" -ForegroundColor Green
+      }
+    } else {
+      Write-Host "Inno Setup not found — skipping installer. Install from https://jrsoftware.org/isinfo.php" -ForegroundColor Yellow
     }
   } finally {
     Pop-Location
@@ -98,6 +176,7 @@ switch ($Action) {
     $config.$Platform.buildName = $BuildName
     $config.$Platform.buildNumber = $BuildNumber
     Save-Config $config
+    Update-Pubspec $BuildName $BuildNumber
     Show-Config $config
     break
   }

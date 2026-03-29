@@ -1,10 +1,10 @@
 {
-    "android":  {
-                    "buildName":  "1.0.5",
-                    "buildNumber":  5
-                },
-    "windows":  {
-                    "buildName":  "1.0.5",
-                    "buildNumber":  5
-                }
+  "android": {
+    "buildName": "1.0.5",
+    "buildNumber": 5
+  },
+  "windows": {
+    "buildName": "1.0.6",
+    "buildNumber": 6
+  }
 }

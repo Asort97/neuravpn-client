@@ -522,6 +522,11 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _developerMode = false;
   bool _smartRouting = false;
   bool _hasEverAddedKey = false;
+  bool _autoConnectOnStartup = false;
+  bool _autoStartOnBoot = false;
+  static const String _autoConnectKey = 'auto_connect_on_startup';
+  static const String _autoStartKey = 'auto_start_on_boot';
+  static const String _windowsAutoStartRegistryName = 'neuravpn';
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
   static const String _dpiTlsFragmentKey = 'dpi_tls_fragment_enabled';
@@ -546,6 +551,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   String _appVersion = '';
   UpdateCheckResult? _updateResult;
   bool _checkingUpdates = false;
+  bool _isDownloadingUpdate = false;
+  double _updateDownloadProgress = 0.0;
+  String? _updateDownloadError;
   bool _initialLaunchArgsHandled = false;
   bool _initialAndroidLaunchUriHandled = false;
 
@@ -739,6 +747,13 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _handleInitialLaunchArgs();
     await _handleInitialAndroidLaunchUri();
     unawaited(_refreshAllSubscriptions());
+    if (_autoConnectOnStartup &&
+        _isWindowsShellPlatform &&
+        !_isRunning &&
+        !_isConnecting &&
+        _controller.text.trim().isNotEmpty) {
+      unawaited(_start());
+    }
   }
 
   Future<void> _prepareWindowsRuntime() async {
@@ -821,16 +836,19 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _initVersionAndUpdates() async {
+    debugPrint('[UPDATE] _initVersionAndUpdates called');
     try {
       final info = await PackageInfo.fromPlatform();
+      debugPrint('[UPDATE] PackageInfo version=${info.version}');
       if (!mounted) return;
       setState(() {
         _appVersion = info.version;
       });
-    } catch (_) {
-      // ignore
+    } catch (e) {
+      debugPrint('[UPDATE] PackageInfo error: $e');
     }
     if (!Platform.isAndroid) {
+      debugPrint('[UPDATE] Calling _maybeCheckForUpdates...');
       await _maybeCheckForUpdates();
     }
   }
@@ -839,10 +857,15 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (Platform.isAndroid) return;
     if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
         _updateRepo == 'YOUR_GITHUB_REPO') {
+      debugPrint('[UPDATE] Skipped: owner/repo not configured');
       return;
     }
-    if (_checkingUpdates) return;
+    if (_checkingUpdates) {
+      debugPrint('[UPDATE] Skipped: already checking');
+      return;
+    }
     _checkingUpdates = true;
+    debugPrint('[UPDATE] Starting check (manual=$manual)...');
 
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -855,6 +878,7 @@ class _VlessHomePageState extends State<VlessHomePage>
         _updateRepo,
       );
       if (latest == null) {
+        debugPrint('[UPDATE] fetchLatestRelease returned null');
         if (manual && mounted) {
           _showFastSnack(
             '\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f',
@@ -862,13 +886,21 @@ class _VlessHomePageState extends State<VlessHomePage>
         }
         return;
       }
+      debugPrint('[UPDATE] Latest: tag=${latest.tag}, name=${latest.name}');
 
       final current = _appVersion.isNotEmpty ? _appVersion : '0.0.0';
+      debugPrint('[UPDATE] Current version: $current');
       final result = service.compareVersions(
         currentVersion: current,
         latest: latest,
       );
-      if (result == null) return;
+      if (result == null) {
+        debugPrint('[UPDATE] compareVersions returned null');
+        return;
+      }
+
+      debugPrint('[UPDATE] isUpdateAvailable=${result.isUpdateAvailable}, '
+          'current=${result.currentVersion}, latest=${result.latestVersion}');
 
       if (!mounted) return;
       setState(() => _updateResult = result);
@@ -882,11 +914,12 @@ class _VlessHomePageState extends State<VlessHomePage>
         return;
       }
 
-      final dismissed = prefs.getString(_updateDismissedTagKey);
-      if (!manual && dismissed == result.latestTag) {
-        return;
-      }
       _showUpdateDialog(result);
+    } catch (e) {
+      debugPrint('[UPDATE] Error: $e');
+      if (manual && mounted) {
+        _showFastSnack('Ошибка проверки обновлений: $e');
+      }
     } finally {
       _checkingUpdates = false;
     }
@@ -910,17 +943,24 @@ class _VlessHomePageState extends State<VlessHomePage>
                 await prefs.setString(_updateDismissedTagKey, result.latestTag);
                 if (ctx.mounted) Navigator.of(ctx).pop();
               },
-              child: const Text('\u041f\u043e\u0437\u0436\u0435'),
+              child: const Text('Позже'),
             ),
-            FilledButton(
-              onPressed: () {
-                _openUrl(result.releaseUrl.toString());
-                Navigator.of(ctx).pop();
-              },
-              child: const Text(
-                '\u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0440\u0435\u043b\u0438\u0437',
+            if (_isWindowsShellPlatform && _findWindowsZipAsset(result) != null)
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  _downloadAndApplyUpdate(result);
+                },
+                child: const Text('Обновить'),
+              )
+            else
+              FilledButton(
+                onPressed: () {
+                  _openUrl(result.releaseUrl.toString());
+                  Navigator.of(ctx).pop();
+                },
+                child: const Text('Открыть релиз'),
               ),
-            ),
           ],
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -959,6 +999,105 @@ class _VlessHomePageState extends State<VlessHomePage>
         ),
       ),
     );
+  }
+
+  Uri? _findWindowsZipAsset(UpdateCheckResult result) {
+    for (final asset in result.assets) {
+      final lower = asset.name.toLowerCase();
+      if (lower.endsWith('.zip') && lower.contains('windows')) {
+        return asset.downloadUrl;
+      }
+    }
+    for (final asset in result.assets) {
+      if (asset.name.toLowerCase().endsWith('.zip')) {
+        return asset.downloadUrl;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _downloadAndApplyUpdate(UpdateCheckResult result) async {
+    final zipUrl = _findWindowsZipAsset(result);
+    if (zipUrl == null) {
+      _openUrl(result.releaseUrl.toString());
+      return;
+    }
+
+    setState(() {
+      _isDownloadingUpdate = true;
+      _updateDownloadProgress = 0.0;
+      _updateDownloadError = null;
+    });
+
+    try {
+      final client = HttpClient();
+      final request = await client.getUrl(zipUrl);
+      final response = await request.close();
+      await _processUpdateDownload(response, result);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isDownloadingUpdate = false;
+          _updateDownloadError = e.toString();
+        });
+        _showFastSnack('Ошибка загрузки: $e');
+      }
+    }
+  }
+
+  Future<void> _processUpdateDownload(
+    HttpClientResponse response,
+    UpdateCheckResult result,
+  ) async {
+    final totalBytes = response.contentLength;
+    final tempDir = await getTemporaryDirectory();
+    final zipFile = File('${tempDir.path}/neuravpn_update.zip');
+    final sink = zipFile.openWrite();
+    var receivedBytes = 0;
+
+    await for (final chunk in response) {
+      sink.add(chunk);
+      receivedBytes += chunk.length;
+      if (totalBytes > 0 && mounted) {
+        setState(() {
+          _updateDownloadProgress = receivedBytes / totalBytes;
+        });
+      }
+    }
+    await sink.close();
+
+    if (mounted) {
+      setState(() => _updateDownloadProgress = 1.0);
+    }
+
+    await _applyUpdate(zipFile);
+  }
+
+  Future<void> _applyUpdate(File zipFile) async {
+    final appDir = File(Platform.resolvedExecutable).parent.path;
+    final updaterExe = path.join(appDir, 'updater.exe');
+
+    if (!File(updaterExe).existsSync()) {
+      if (mounted) {
+        setState(() {
+          _isDownloadingUpdate = false;
+          _updateDownloadError = 'updater.exe не найден в папке приложения';
+        });
+      }
+      return;
+    }
+
+    _stopTrafficMonitor();
+    await _dpiEvasionManager.stopNativeInjector();
+    await _vpnCoreController.forceTerminate();
+
+    await Process.start(
+      updaterExe,
+      ['--zip', zipFile.path, '--target', appDir, '--pid', '$pid'],
+      mode: ProcessStartMode.detached,
+    );
+
+    exit(0);
   }
 
   Future<void> _openUrl(String url) async {
@@ -1651,6 +1790,8 @@ $regItems = foreach ($rp in $regPaths) {
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? false;
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
     _developerMode = prefs.getBool('developer_mode') ?? false;
+    _autoConnectOnStartup = prefs.getBool(_autoConnectKey) ?? false;
+    _autoStartOnBoot = prefs.getBool(_autoStartKey) ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
     final dpiBase = dpiAggressive
         ? DpiEvasionConfig.aggressive
@@ -2327,6 +2468,7 @@ $regItems = foreach ($rp in $regPaths) {
     if (!_isDesktopPlatform) return;
     await windowManager.setPreventClose(true);
     await _setupTrayIcon();
+    unawaited(_syncAutoStartFromRegistry());
   }
 
   Future<void> _fitWindowToDisplay() async {
@@ -4168,10 +4310,64 @@ $regItems = foreach ($rp in $regPaths) {
     );
   }
 
+  Future<void> _setAutoConnectOnStartup(bool value) async {
+    setState(() => _autoConnectOnStartup = value);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoConnectKey, value);
+  }
+
+  Future<void> _setAutoStartOnBoot(bool value) async {
+    setState(() => _autoStartOnBoot = value);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoStartKey, value);
+    if (!Platform.isWindows) return;
+    try {
+      final exePath = Platform.resolvedExecutable;
+      if (value) {
+        await Process.run('reg', [
+          'add',
+          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+          '/v', _windowsAutoStartRegistryName,
+          '/t', 'REG_SZ',
+          '/d', '"$exePath"',
+          '/f',
+        ]);
+      } else {
+        await Process.run('reg', [
+          'delete',
+          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+          '/v', _windowsAutoStartRegistryName,
+          '/f',
+        ]);
+      }
+    } catch (e) {
+      _appendLogs(['[autostart] Failed to update registry: $e']);
+    }
+  }
+
+  Future<void> _syncAutoStartFromRegistry() async {
+    if (!Platform.isWindows) return;
+    try {
+      final result = await Process.run('reg', [
+        'query',
+        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+        '/v', _windowsAutoStartRegistryName,
+      ]);
+      final registered = result.exitCode == 0 &&
+          result.stdout.toString().contains(_windowsAutoStartRegistryName);
+      if (registered != _autoStartOnBoot) {
+        setState(() => _autoStartOnBoot = registered);
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_autoStartKey, registered);
+      }
+    } catch (_) {}
+  }
+
   Widget _buildWindowsSettingsView() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        // === UPDATES CARD ===
         _neuraCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -4225,22 +4421,79 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
                 const SizedBox(height: 10),
-                FilledButton(
-                  onPressed: () =>
-                      _openUrl(_updateResult!.releaseUrl.toString()),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _neuraRed,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 12,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
+                if (_isDownloadingUpdate) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: LinearProgressIndicator(
+                            value: _updateDownloadProgress,
+                            backgroundColor: Colors.white.withOpacity(0.1),
+                            valueColor: const AlwaysStoppedAnimation<Color>(_neuraRed),
+                            minHeight: 6,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Text(
+                        '${(_updateDownloadProgress * 100).toInt()}%',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.7),
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ),
+                ] else if (_updateDownloadError != null) ...[
+                  Text(
+                    'Ошибка: $_updateDownloadError',
+                    style: TextStyle(
+                      color: Colors.red.shade300,
+                      fontSize: 12,
                     ),
                   ),
-                  child: const Text('Открыть релиз на GitHub'),
-                ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      FilledButton(
+                        onPressed: () => _downloadAndApplyUpdate(_updateResult!),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _neuraRed,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: const Text('Повторить'),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: () => _openUrl(_updateResult!.releaseUrl.toString()),
+                        child: const Text('Открыть на GitHub'),
+                      ),
+                    ],
+                  ),
+                ] else ...[
+                  Row(
+                    children: [
+                      FilledButton(
+                        onPressed: () => _downloadAndApplyUpdate(_updateResult!),
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _neuraRed,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: const Text('Обновить'),
+                      ),
+                      const SizedBox(width: 8),
+                      TextButton(
+                        onPressed: () => _openUrl(_updateResult!.releaseUrl.toString()),
+                        child: const Text('GitHub'),
+                      ),
+                    ],
+                  ),
+                ],
               ] else ...[
                 const SizedBox(height: 8),
                 Text(
@@ -4255,6 +4508,97 @@ $regItems = foreach ($rp in $regPaths) {
                   color: Colors.white.withOpacity(0.35),
                   fontSize: 12,
                 ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 16),
+        // === GENERAL SETTINGS CARD ===
+        _neuraCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: _neuraSurface,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.white.withOpacity(0.08)),
+                    ),
+                    child: const Icon(Icons.settings, color: _neuraRed, size: 18),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Text(
+                      'Общие',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Автоподключение при запуске',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'Автоматически подключаться к VPN при запуске приложения',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.5),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch.adaptive(
+                    value: _autoConnectOnStartup,
+                    activeColor: _neuraRed,
+                    onChanged: (v) => _setAutoConnectOnStartup(v),
+                  ),
+                ],
+              ),
+              const Divider(height: 24, color: Color(0xFF2A2A2A)),
+              Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Автозапуск при старте системы',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          'Запускать приложение автоматически при входе в Windows',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.5),
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch.adaptive(
+                    value: _autoStartOnBoot,
+                    activeColor: _neuraRed,
+                    onChanged: (v) => _setAutoStartOnBoot(v),
+                  ),
+                ],
               ),
             ],
           ),

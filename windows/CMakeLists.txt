@@ -106,3 +106,10 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
   COMPONENT Runtime)
+
+# Copy updater.exe into the bundle if it has been compiled.
+set(UPDATER_EXE "${CMAKE_CURRENT_SOURCE_DIR}/../tool/updater/build/updater.exe")
+if(EXISTS "${UPDATER_EXE}")
+  install(FILES "${UPDATER_EXE}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
