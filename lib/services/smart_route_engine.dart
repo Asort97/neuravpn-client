@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/services.dart';
 
 import 'cache_repository.dart';
 
@@ -14,6 +17,9 @@ class SmartTlsFragmentOptions {
 ///
 /// Intentionally avoids IP/ASN heuristics to prevent false positives from anycast CDNs.
 class SmartRouteEngine {
+  static const String bundledRussianWhitelistAsset =
+      'assets/routing/ru_whitelist.txt';
+
   SmartRouteEngine({
     Set<String>? ruTlds,
     Set<String>? russianServices,
@@ -39,7 +45,12 @@ class SmartRouteEngine {
   final CacheRepository? _cacheRepository;
 
   bool _restoredFromDisk = false;
+  bool _bundledWhitelistLoaded = false;
+  int _bundledWhitelistAdded = 0;
+  Future<int>? _bundledWhitelistLoadFuture;
   Timer? _persistDebounce;
+
+  int get bundledWhitelistAdded => _bundledWhitelistAdded;
 
   /// Main decision function following strict priority:
   /// 1) RU TLD (.ru/.su/.xn--p1ai) => bypass
@@ -109,6 +120,55 @@ class SmartRouteEngine {
     _persistDebounce?.cancel();
   }
 
+  Future<int> ensureBundledWhitelistLoaded({
+    String assetPath = bundledRussianWhitelistAsset,
+    AssetBundle? bundle,
+  }) {
+    if (_bundledWhitelistLoaded) {
+      return Future<int>.value(0);
+    }
+    final existing = _bundledWhitelistLoadFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    late final Future<int> tracked;
+    tracked = _loadBundledWhitelist(assetPath: assetPath, bundle: bundle)
+        .whenComplete(() {
+          if (identical(_bundledWhitelistLoadFuture, tracked)) {
+            _bundledWhitelistLoadFuture = null;
+          }
+        });
+    _bundledWhitelistLoadFuture = tracked;
+    return tracked;
+  }
+
+  Future<int> _loadBundledWhitelist({
+    required String assetPath,
+    AssetBundle? bundle,
+  }) async {
+    final contents = await (bundle ?? rootBundle).loadString(assetPath);
+    final added = addRussianServicesFromText(contents);
+    _bundledWhitelistAdded += added;
+    _bundledWhitelistLoaded = true;
+    return added;
+  }
+
+  int addRussianServicesFromText(String contents) {
+    var added = 0;
+    for (final raw in const LineSplitter().convert(contents)) {
+      final entry = _normalizeWhitelistEntry(raw);
+      if (entry == null) continue;
+      if (russianServices.add(entry)) {
+        added++;
+      }
+    }
+    if (added > 0) {
+      _domainCache.clear();
+    }
+    return added;
+  }
+
   RouteDecision _decide(String normalizedDomain) {
     if (_hasRuTld(normalizedDomain)) {
       return RouteDecision.bypassVpn;
@@ -137,11 +197,9 @@ class SmartRouteEngine {
   }
 
   List<Map<String, dynamic>> buildRouteRules({required String outboundTag}) {
-    final suffixes = ruTlds.toList();
-    final domains = russianServices.toList();
+    final suffixes = <String>{...ruTlds, ...russianServices}.toList();
     return [
       {
-        if (domains.isNotEmpty) 'domain': domains,
         if (suffixes.isNotEmpty) 'domain_suffix': suffixes,
         'outbound': outboundTag,
       },
@@ -169,6 +227,42 @@ class SmartRouteEngine {
 
   static String _normalizeDomain(String domain) {
     return domain.trim().toLowerCase().replaceAll(RegExp(r'\.+$'), '');
+  }
+
+  static String? _normalizeWhitelistEntry(String raw) {
+    var value = raw.trim().toLowerCase().replaceFirst('\ufeff', '');
+    if (value.isEmpty || value.startsWith('#')) return null;
+
+    final commentIndex = value.indexOf('#');
+    if (commentIndex >= 0) {
+      value = value.substring(0, commentIndex).trim();
+    }
+
+    for (final prefix in const <String>[
+      'domain-suffix:',
+      'domain_suffix:',
+      'suffix:',
+      'domain-full:',
+      'domain_full:',
+      'full:',
+      'domain:',
+    ]) {
+      if (value.startsWith(prefix)) {
+        value = value.substring(prefix.length).trim();
+        break;
+      }
+    }
+
+    if (value.startsWith('*.')) {
+      value = value.substring(2);
+    }
+    if (value.startsWith('.')) {
+      value = value.substring(1);
+    }
+    value = value.replaceAll(RegExp(r'\.+$'), '');
+    if (value.isEmpty || !value.contains('.')) return null;
+    if (value.contains('/') || value.contains(' ')) return null;
+    return value;
   }
 
   static String _formatSingBoxDuration(Duration value) {

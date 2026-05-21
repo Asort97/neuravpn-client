@@ -1789,6 +1789,9 @@ $regItems = foreach ($rp in $regPaths) {
     final restoredPings = <String, int>{};
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? false;
     _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
+    unawaited(
+      _smartRouteEngine.ensureBundledWhitelistLoaded().catchError((_) => 0),
+    );
     _developerMode = prefs.getBool('developer_mode') ?? false;
     _autoConnectOnStartup = prefs.getBool(_autoConnectKey) ?? false;
     _autoStartOnBoot = prefs.getBool(_autoStartKey) ?? false;
@@ -8199,5 +8202,4 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
-
 

@@ -497,6 +497,7 @@ class VpnCoreController {
     final useSmartEngineRules =
         smartRouteEngine != null && splitConfig.smartRouting;
     if (useSmartEngineRules) {
+      await _ensureSmartRouteWhitelistLoaded(smartRouteEngine, onLog: onLog);
       extraRouteRules.addAll(
         smartRouteEngine.buildRouteRules(outboundTag: 'direct'),
       );
@@ -1132,6 +1133,24 @@ class VpnCoreController {
     return _windowsCoreAdapter.computeRuleHash(jsonConfig);
   }
 
+  Future<void> _ensureSmartRouteWhitelistLoaded(
+    SmartRouteEngine smartRouteEngine, {
+    void Function(String log)? onLog,
+  }) async {
+    try {
+      final added = await smartRouteEngine.ensureBundledWhitelistLoaded();
+      if (added <= 0) return;
+      final line =
+          '[smart-routing] loaded $added bundled Russian direct domains';
+      onLog?.call(line);
+      _appendConnectionLog(line);
+    } catch (e) {
+      final line = '[smart-routing] bundled whitelist load failed: $e';
+      onLog?.call(line);
+      _appendConnectionLog(line);
+    }
+  }
+
   Future<bool> hotReloadWindowsRules({
     required SplitTunnelConfig splitConfig,
     bool developerMode = false,
@@ -1147,6 +1166,7 @@ class VpnCoreController {
     final useSmartEngineRules =
         smartRouteEngine != null && splitConfig.smartRouting;
     if (useSmartEngineRules) {
+      await _ensureSmartRouteWhitelistLoaded(smartRouteEngine, onLog: onLog);
       extraRouteRules.addAll(
         smartRouteEngine.buildRouteRules(outboundTag: 'direct'),
       );

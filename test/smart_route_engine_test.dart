@@ -66,4 +66,35 @@ void main() {
     final refreshedDecision = await engine.decideForDomain('cached.test');
     expect(refreshedDecision, RouteDecision.bypassVpn);
   });
+
+  test('adds bundled whitelist entries as direct suffix rules', () async {
+    final engine = SmartRouteEngine(
+      ruTlds: const {},
+      russianServices: const {},
+    );
+
+    final added = engine.addRussianServicesFromText('''
+      alfabank.ru
+      sun1-13.userapi.com   
+      .mos.ru
+      domain:nalog.gov.ru
+      # comment
+      alfabank.ru
+    ''');
+
+    expect(added, 4);
+    expect(
+      await engine.decideForDomain('pay.alfabank.ru'),
+      RouteDecision.bypassVpn,
+    );
+    expect(
+      await engine.decideForDomain('cdn.sun1-13.userapi.com'),
+      RouteDecision.bypassVpn,
+    );
+
+    final rules = engine.buildRouteRules(outboundTag: 'direct');
+    final suffixes = (rules.single['domain_suffix'] as List<String>).toSet();
+    expect(suffixes, containsAll(['alfabank.ru', 'mos.ru', 'nalog.gov.ru']));
+    expect(rules.single['domain'], isNull);
+  });
 }
