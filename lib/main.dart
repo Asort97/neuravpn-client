@@ -295,7 +295,11 @@ class VlessHomePage extends StatefulWidget {
 }
 
 class _VlessHomePageState extends State<VlessHomePage>
-    with TrayListener, WindowListener, TickerProviderStateMixin, WidgetsBindingObserver {
+    with
+        TrayListener,
+        WindowListener,
+        TickerProviderStateMixin,
+        WidgetsBindingObserver {
   static const int _trafficGraphInterpolationSteps = 10;
   static const double _trafficGraphSmoothingFactor = 0.34;
   static const String _updateOwner = 'Asort97';
@@ -346,6 +350,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _isDisconnecting = false;
   bool _connectButtonHovered = false;
   bool _connectButtonPressed = false;
+  bool _connectButtonFocused = false;
   bool _hasSubscriptions = false;
   bool _trayPopupMode = false;
   OverlayEntry? _trayOverlayEntry;
@@ -649,7 +654,10 @@ class _VlessHomePageState extends State<VlessHomePage>
     // Раскрываем приложения: добавляем доп. процессы и домены для kernel-драйверов.
     final appExpansion = _expandAppsWithExtras(effective.applications);
     // Раскрываем домены с поддоменами + добавляем домены от приложений.
-    final allDomains = <String>[...normalizedDomains, ...appExpansion.extraDomains];
+    final allDomains = <String>[
+      ...normalizedDomains,
+      ...appExpansion.extraDomains,
+    ];
     final expandedDomains = _expandDomainsWithSubdomains(allDomains);
     return effective.copyWith(
       domains: expandedDomains,
@@ -899,8 +907,10 @@ class _VlessHomePageState extends State<VlessHomePage>
         return;
       }
 
-      debugPrint('[UPDATE] isUpdateAvailable=${result.isUpdateAvailable}, '
-          'current=${result.currentVersion}, latest=${result.latestVersion}');
+      debugPrint(
+        '[UPDATE] isUpdateAvailable=${result.isUpdateAvailable}, '
+        'current=${result.currentVersion}, latest=${result.latestVersion}',
+      );
 
       if (!mounted) return;
       setState(() => _updateResult = result);
@@ -1091,11 +1101,14 @@ class _VlessHomePageState extends State<VlessHomePage>
     await _dpiEvasionManager.stopNativeInjector();
     await _vpnCoreController.forceTerminate();
 
-    await Process.start(
-      updaterExe,
-      ['--zip', zipFile.path, '--target', appDir, '--pid', '$pid'],
-      mode: ProcessStartMode.detached,
-    );
+    await Process.start(updaterExe, [
+      '--zip',
+      zipFile.path,
+      '--target',
+      appDir,
+      '--pid',
+      '$pid',
+    ], mode: ProcessStartMode.detached);
 
     exit(0);
   }
@@ -1354,13 +1367,12 @@ $regItems = foreach ($rp in $regPaths) {
       scriptFile = File('${tempDir.path}/apps.ps1');
       await scriptFile.writeAsString(script);
 
-      final result = await Process.run('powershell', [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        scriptFile.path,
-      ], stdoutEncoding: utf8, stderrEncoding: utf8);
+      final result = await Process.run(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptFile.path],
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      );
       if (result.exitCode != 0) {
         throw Exception(
           result.stderr?.toString().trim().isNotEmpty == true
@@ -2274,7 +2286,11 @@ $regItems = foreach ($rp in $regPaths) {
     if (Platform.isAndroid) {
       if (previousConfig == null) return;
       final nextConfig = _configForConnection;
-      if (!_requiresWindowsSessionResetForRuleChange(previousConfig, nextConfig)) return;
+      if (!_requiresWindowsSessionResetForRuleChange(
+        previousConfig,
+        nextConfig,
+      ))
+        return;
       _appendLogs([
         '[android] Split tunnel rules changed, reconnecting to apply',
       ]);
@@ -3069,8 +3085,9 @@ $regItems = foreach ($rp in $regPaths) {
             previousUri.isNotEmpty &&
             _isSecureProfileUri(previousUri)) {
           final allSubs = await repository.getAllSubscriptions();
-          final stillValid =
-              allSubs.any((s) => s.profiles.contains(previousUri));
+          final stillValid = allSubs.any(
+            (s) => s.profiles.contains(previousUri),
+          );
           if (stillValid) {
             final restored = VpnProfile(
               name: previousName ?? _deriveProfileNameFromUri(previousUri),
@@ -3445,6 +3462,22 @@ $regItems = foreach ($rp in $regPaths) {
     }
 
     unawaited(_start());
+  }
+
+  String _connectButtonTooltip({
+    required bool isEnabled,
+    required bool isRunning,
+  }) {
+    if (_isConnecting) return 'Подключение...';
+    if (_isDisconnecting) return 'Отключение...';
+    if (isRunning) return 'Отключить VPN';
+    if (!isEnabled) return 'Выберите подписку для подключения';
+    return 'Подключить VPN';
+  }
+
+  void _setConnectButtonFocus(bool focused) {
+    if (_connectButtonFocused == focused) return;
+    setState(() => _connectButtonFocused = focused);
   }
 
   /// Дополнительная проверка полного отключения with retry logic
@@ -3939,16 +3972,18 @@ $regItems = foreach ($rp in $regPaths) {
             children: [
               const Center(child: AnimatedEmoji(emoji: '??', size: 84)),
               const SizedBox(height: 16),
-              FilledButton(
+              FilledButton.icon(
                 onPressed: _showProfileDialog,
-                child: const Text(
+                icon: const Icon(Icons.key_rounded),
+                label: const Text(
                   '\u0412\u0432\u0435\u0441\u0442\u0438 \u043a\u043b\u044e\u0447',
                 ),
               ),
               const SizedBox(height: 12),
-              OutlinedButton(
+              OutlinedButton.icon(
                 onPressed: _pasteProfileFromClipboard,
-                child: const Text(
+                icon: const Icon(Icons.content_paste_rounded),
+                label: const Text(
                   '\u0412\u0441\u0442\u0430\u0432\u0438\u0442\u044c \u0438\u0437 \u0431\u0443\u0444\u0435\u0440\u0430 \u043e\u0431\u043c\u0435\u043d\u0430',
                 ),
               ),
@@ -4394,16 +4429,20 @@ $regItems = foreach ($rp in $regPaths) {
         await Process.run('reg', [
           'add',
           r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v', _windowsAutoStartRegistryName,
-          '/t', 'REG_SZ',
-          '/d', '"$exePath"',
+          '/v',
+          _windowsAutoStartRegistryName,
+          '/t',
+          'REG_SZ',
+          '/d',
+          '"$exePath"',
           '/f',
         ]);
       } else {
         await Process.run('reg', [
           'delete',
           r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v', _windowsAutoStartRegistryName,
+          '/v',
+          _windowsAutoStartRegistryName,
           '/f',
         ]);
       }
@@ -4418,9 +4457,11 @@ $regItems = foreach ($rp in $regPaths) {
       final result = await Process.run('reg', [
         'query',
         r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v', _windowsAutoStartRegistryName,
+        '/v',
+        _windowsAutoStartRegistryName,
       ]);
-      final registered = result.exitCode == 0 &&
+      final registered =
+          result.exitCode == 0 &&
           result.stdout.toString().contains(_windowsAutoStartRegistryName);
       if (registered != _autoStartOnBoot) {
         setState(() => _autoStartOnBoot = registered);
@@ -4497,7 +4538,9 @@ $regItems = foreach ($rp in $regPaths) {
                           child: LinearProgressIndicator(
                             value: _updateDownloadProgress,
                             backgroundColor: Colors.white.withOpacity(0.1),
-                            valueColor: const AlwaysStoppedAnimation<Color>(_neuraRed),
+                            valueColor: const AlwaysStoppedAnimation<Color>(
+                              _neuraRed,
+                            ),
                             minHeight: 6,
                           ),
                         ),
@@ -4515,27 +4558,31 @@ $regItems = foreach ($rp in $regPaths) {
                 ] else if (_updateDownloadError != null) ...[
                   Text(
                     'Ошибка: $_updateDownloadError',
-                    style: TextStyle(
-                      color: Colors.red.shade300,
-                      fontSize: 12,
-                    ),
+                    style: TextStyle(color: Colors.red.shade300, fontSize: 12),
                   ),
                   const SizedBox(height: 8),
                   Row(
                     children: [
                       FilledButton(
-                        onPressed: () => _downloadAndApplyUpdate(_updateResult!),
+                        onPressed: () =>
+                            _downloadAndApplyUpdate(_updateResult!),
                         style: FilledButton.styleFrom(
                           backgroundColor: _neuraRed,
                           foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 12,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
                         ),
                         child: const Text('Повторить'),
                       ),
                       const SizedBox(width: 8),
                       TextButton(
-                        onPressed: () => _openUrl(_updateResult!.releaseUrl.toString()),
+                        onPressed: () =>
+                            _openUrl(_updateResult!.releaseUrl.toString()),
                         child: const Text('Открыть на GitHub'),
                       ),
                     ],
@@ -4544,18 +4591,25 @@ $regItems = foreach ($rp in $regPaths) {
                   Row(
                     children: [
                       FilledButton(
-                        onPressed: () => _downloadAndApplyUpdate(_updateResult!),
+                        onPressed: () =>
+                            _downloadAndApplyUpdate(_updateResult!),
                         style: FilledButton.styleFrom(
                           backgroundColor: _neuraRed,
                           foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 18,
+                            vertical: 12,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
                         ),
                         child: const Text('Обновить'),
                       ),
                       const SizedBox(width: 8),
                       TextButton(
-                        onPressed: () => _openUrl(_updateResult!.releaseUrl.toString()),
+                        onPressed: () =>
+                            _openUrl(_updateResult!.releaseUrl.toString()),
                         child: const Text('GitHub'),
                       ),
                     ],
@@ -4595,7 +4649,11 @@ $regItems = foreach ($rp in $regPaths) {
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: Colors.white.withOpacity(0.08)),
                     ),
-                    child: const Icon(Icons.settings, color: _neuraRed, size: 18),
+                    child: const Icon(
+                      Icons.settings,
+                      color: _neuraRed,
+                      size: 18,
+                    ),
                   ),
                   const SizedBox(width: 12),
                   const Expanded(
@@ -4793,14 +4851,16 @@ $regItems = foreach ($rp in $regPaths) {
             ),
           ),
           const SizedBox(height: 16),
-          FilledButton(
+          FilledButton.icon(
             onPressed: _showProfileDialog,
-            child: const Text('Ввести ключ'),
+            icon: const Icon(Icons.key_rounded),
+            label: const Text('Ввести ключ'),
           ),
           const SizedBox(height: 12),
-          OutlinedButton(
+          OutlinedButton.icon(
             onPressed: _pasteProfileFromClipboard,
-            child: const Text('Вставить из буфера обмена'),
+            icon: const Icon(Icons.content_paste_rounded),
+            label: const Text('Вставить из буфера обмена'),
           ),
         ],
       ),
@@ -4860,6 +4920,10 @@ $regItems = foreach ($rp in $regPaths) {
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
     final throughputLabel =
         'IN ${_formatThroughput(_latestDownlinkBps)}  •  OUT ${_formatThroughput(_latestUplinkBps)}';
+    final connectButtonTooltip = _connectButtonTooltip(
+      isEnabled: isEnabled,
+      isRunning: isRunning,
+    );
 
     return _neuraCard(
       child: Stack(
@@ -4980,200 +5044,248 @@ $regItems = foreach ($rp in $regPaths) {
                       });
                     }
                   },
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTapDown: canInteract
-                        ? (_) => setState(() => _connectButtonPressed = true)
-                        : null,
-                    onTapUp: (_) {
-                      if (_connectButtonPressed) {
-                        setState(() => _connectButtonPressed = false);
-                      }
-                    },
-                    onTapCancel: () {
-                      if (_connectButtonPressed) {
-                        setState(() => _connectButtonPressed = false);
-                      }
-                    },
-                    onTap: canInteract
-                        ? () => _onMainConnectButtonPressed(
-                            isEnabled: isEnabled,
-                            isRunning: isRunning,
-                          )
-                        : null,
-                    child: AnimatedBuilder(
-                      animation: _connectGlowAnimation,
-                      builder: (context, child) {
-                        final rotation =
-                            _connectGlowAnimation.value * 2 * math.pi;
-                        final interactionScale = _connectButtonPressed
-                            ? 0.95
-                            : _connectButtonHovered
-                            ? 1.04
-                            : 1.0;
-                        final pulse = _isConnecting
-                            ? 1 + 0.03 * math.sin(rotation)
-                            : (isRunning
-                                  ? 1 + 0.012 * math.sin(rotation)
-                                  : 1.0);
-                        final ring = Container(
-                          width: 140,
-                          height: 140,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: statusColor.withOpacity(0.9),
-                              width: 1.8,
-                            ),
+                  child: Tooltip(
+                    message: connectButtonTooltip,
+                    waitDuration: const Duration(milliseconds: 450),
+                    child: Semantics(
+                      button: true,
+                      enabled: canInteract,
+                      label: connectButtonTooltip,
+                      child: FocusableActionDetector(
+                        enabled: canInteract,
+                        shortcuts: const <ShortcutActivator, Intent>{
+                          SingleActivator(LogicalKeyboardKey.enter):
+                              ActivateIntent(),
+                          SingleActivator(LogicalKeyboardKey.space):
+                              ActivateIntent(),
+                        },
+                        actions: <Type, Action<Intent>>{
+                          ActivateIntent: CallbackAction<Intent>(
+                            onInvoke: (_) {
+                              if (canInteract) {
+                                _onMainConnectButtonPressed(
+                                  isEnabled: isEnabled,
+                                  isRunning: isRunning,
+                                );
+                              }
+                              return null;
+                            },
                           ),
-                        );
-                        return Opacity(
-                          opacity: canInteract && (isEnabled || isRunning)
-                              ? 1
-                              : 0.5,
-                          child: Transform.scale(
-                            scale: pulse * interactionScale,
-                            child: Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                AnimatedContainer(
-                                  duration: NeuraUi.fast,
-                                  width: 176,
-                                  height: 176,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    gradient: RadialGradient(
-                                      colors: [
-                                        _neuraRed.withOpacity(
-                                          _isConnecting
-                                              ? 0.16
-                                              : (isRunning ? 0.12 : 0.04),
-                                        ),
-                                        Colors.transparent,
-                                      ],
-                                      stops: const [0.0, 0.72],
-                                    ),
+                        },
+                        onShowFocusHighlight: _setConnectButtonFocus,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTapDown: canInteract
+                              ? (_) =>
+                                    setState(() => _connectButtonPressed = true)
+                              : null,
+                          onTapUp: (_) {
+                            if (_connectButtonPressed) {
+                              setState(() => _connectButtonPressed = false);
+                            }
+                          },
+                          onTapCancel: () {
+                            if (_connectButtonPressed) {
+                              setState(() => _connectButtonPressed = false);
+                            }
+                          },
+                          onTap: canInteract
+                              ? () => _onMainConnectButtonPressed(
+                                  isEnabled: isEnabled,
+                                  isRunning: isRunning,
+                                )
+                              : null,
+                          child: AnimatedBuilder(
+                            animation: _connectGlowAnimation,
+                            builder: (context, child) {
+                              final rotation =
+                                  _connectGlowAnimation.value * 2 * math.pi;
+                              final interactionScale = _connectButtonPressed
+                                  ? 0.95
+                                  : (_connectButtonHovered ||
+                                        _connectButtonFocused)
+                                  ? 1.04
+                                  : 1.0;
+                              final pulse = _isConnecting
+                                  ? 1 + 0.03 * math.sin(rotation)
+                                  : (isRunning
+                                        ? 1 + 0.012 * math.sin(rotation)
+                                        : 1.0);
+                              final ring = Container(
+                                width: 140,
+                                height: 140,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: statusColor.withOpacity(0.9),
+                                    width: 1.8,
                                   ),
                                 ),
-                                if (_isConnecting)
-                                  Transform.rotate(angle: rotation, child: ring)
-                                else
-                                  ring,
-                                AnimatedContainer(
-                                  duration: NeuraUi.fast,
-                                  width: 154,
-                                  height: 154,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    border: Border.all(
-                                      color: _neuraRed.withOpacity(
-                                        _connectButtonHovered || _isConnecting
-                                            ? 0.35
-                                            : 0.12,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                                if (isRunning)
-                                  Container(
-                                    width: 140,
-                                    height: 140,
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      gradient: RadialGradient(
-                                        colors: [
-                                          _neuraRed.withOpacity(0.25),
-                                          Colors.transparent,
-                                        ],
-                                        stops: const [0.0, 0.7],
-                                      ),
-                                    ),
-                                  ),
-                                Container(
-                                  width: 104,
-                                  height: 104,
-                                  decoration: BoxDecoration(
-                                    shape: BoxShape.circle,
-                                    gradient: RadialGradient(
-                                      colors: [
-                                        (isRunning ? _neuraRed : _neuraSurface)
-                                            .withOpacity(0.98),
-                                        (isRunning
-                                                ? const Color(0xFFD92F2F)
-                                                : const Color(0xFF1C1E22))
-                                            .withOpacity(0.98),
-                                      ],
-                                      stops: const [0.0, 1.0],
-                                    ),
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: _neuraRed.withOpacity(
-                                          isRunning
-                                              ? 0.34
-                                              : (_connectButtonHovered
+                              );
+                              return Opacity(
+                                opacity: canInteract && (isEnabled || isRunning)
+                                    ? 1
+                                    : 0.5,
+                                child: Transform.scale(
+                                  scale: pulse * interactionScale,
+                                  child: Stack(
+                                    alignment: Alignment.center,
+                                    children: [
+                                      AnimatedContainer(
+                                        duration: NeuraUi.fast,
+                                        width: 176,
+                                        height: 176,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          gradient: RadialGradient(
+                                            colors: [
+                                              _neuraRed.withOpacity(
+                                                _isConnecting
                                                     ? 0.16
-                                                    : 0.08),
+                                                    : (isRunning ? 0.12 : 0.04),
+                                              ),
+                                              Colors.transparent,
+                                            ],
+                                            stops: const [0.0, 0.72],
+                                          ),
                                         ),
-                                        blurRadius: _connectButtonPressed
-                                            ? 16
-                                            : 24,
-                                        spreadRadius: _connectButtonHovered
-                                            ? 1
-                                            : 0,
+                                      ),
+                                      if (_isConnecting)
+                                        Transform.rotate(
+                                          angle: rotation,
+                                          child: ring,
+                                        )
+                                      else
+                                        ring,
+                                      AnimatedContainer(
+                                        duration: NeuraUi.fast,
+                                        width: 154,
+                                        height: 154,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                            color: _neuraRed.withOpacity(
+                                              _connectButtonHovered ||
+                                                      _connectButtonFocused ||
+                                                      _isConnecting
+                                                  ? 0.35
+                                                  : 0.12,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      if (isRunning)
+                                        Container(
+                                          width: 140,
+                                          height: 140,
+                                          decoration: BoxDecoration(
+                                            shape: BoxShape.circle,
+                                            gradient: RadialGradient(
+                                              colors: [
+                                                _neuraRed.withOpacity(0.25),
+                                                Colors.transparent,
+                                              ],
+                                              stops: const [0.0, 0.7],
+                                            ),
+                                          ),
+                                        ),
+                                      Container(
+                                        width: 104,
+                                        height: 104,
+                                        decoration: BoxDecoration(
+                                          shape: BoxShape.circle,
+                                          gradient: RadialGradient(
+                                            colors: [
+                                              (isRunning
+                                                      ? _neuraRed
+                                                      : _neuraSurface)
+                                                  .withOpacity(0.98),
+                                              (isRunning
+                                                      ? const Color(0xFFD92F2F)
+                                                      : const Color(0xFF1C1E22))
+                                                  .withOpacity(0.98),
+                                            ],
+                                            stops: const [0.0, 1.0],
+                                          ),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: _neuraRed.withOpacity(
+                                                isRunning
+                                                    ? 0.34
+                                                    : (_connectButtonHovered ||
+                                                              _connectButtonFocused
+                                                          ? 0.16
+                                                          : 0.08),
+                                              ),
+                                              blurRadius: _connectButtonPressed
+                                                  ? 16
+                                                  : 24,
+                                              spreadRadius:
+                                                  _connectButtonHovered ||
+                                                      _connectButtonFocused
+                                                  ? 1
+                                                  : 0,
+                                            ),
+                                          ],
+                                        ),
+                                        child: Center(
+                                          child: AnimatedScale(
+                                            duration: NeuraUi.fast,
+                                            scale: _connectButtonPressed
+                                                ? 0.92
+                                                : 1.0,
+                                            child: AnimatedRotation(
+                                              duration: NeuraUi.normal,
+                                              turns: _isConnecting ? 0.0125 : 0,
+                                              child: AnimatedBuilder(
+                                                animation: _frameAnimController,
+                                                builder: (context, _) {
+                                                  final String framePath;
+                                                  if (_isConnecting ||
+                                                      _isDisconnecting) {
+                                                    final frames = _isConnecting
+                                                        ? _connectFrames
+                                                        : _disconnectFrames;
+                                                    final idx =
+                                                        (_frameAnimController
+                                                                    .value *
+                                                                (frames.length -
+                                                                    1))
+                                                            .round()
+                                                            .clamp(
+                                                              0,
+                                                              frames.length - 1,
+                                                            );
+                                                    framePath = frames[idx];
+                                                  } else if (isRunning) {
+                                                    framePath =
+                                                        _connectFrames.last;
+                                                  } else {
+                                                    framePath =
+                                                        _connectFrames.first;
+                                                  }
+                                                  return Image.asset(
+                                                    framePath,
+                                                    width: 48,
+                                                    height: 48,
+                                                    filterQuality:
+                                                        FilterQuality.high,
+                                                    gaplessPlayback: true,
+                                                  );
+                                                },
+                                              ),
+                                            ),
+                                          ),
+                                        ),
                                       ),
                                     ],
                                   ),
-                                  child: Center(
-                                    child: AnimatedScale(
-                                      duration: NeuraUi.fast,
-                                      scale: _connectButtonPressed ? 0.92 : 1.0,
-                                      child: AnimatedRotation(
-                                        duration: NeuraUi.normal,
-                                        turns: _isConnecting ? 0.0125 : 0,
-                                        child: AnimatedBuilder(
-                                          animation: _frameAnimController,
-                                          builder: (context, _) {
-                                            final String framePath;
-                                            if (_isConnecting ||
-                                                _isDisconnecting) {
-                                              final frames = _isConnecting
-                                                  ? _connectFrames
-                                                  : _disconnectFrames;
-                                              final idx =
-                                                  (_frameAnimController.value *
-                                                          (frames.length - 1))
-                                                      .round()
-                                                      .clamp(
-                                                        0,
-                                                        frames.length - 1,
-                                                      );
-                                              framePath = frames[idx];
-                                            } else if (isRunning) {
-                                              framePath =
-                                                  _connectFrames.last;
-                                            } else {
-                                              framePath =
-                                                  _connectFrames.first;
-                                            }
-                                            return Image.asset(
-                                              framePath,
-                                              width: 48,
-                                              height: 48,
-                                              filterQuality:
-                                                  FilterQuality.high,
-                                              gaplessPlayback: true,
-                                            );
-                                          },
-                                        ),
-                                      ),
-                                    ),
-                                  ),
                                 ),
-                              ],
-                            ),
+                              );
+                            },
                           ),
-                        );
-                      },
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -5233,7 +5345,11 @@ $regItems = foreach ($rp in $regPaths) {
                           children: [
                             Row(
                               children: [
-                                const Icon(Icons.bolt, size: 16, color: _neuraRed),
+                                const Icon(
+                                  Icons.bolt,
+                                  size: 16,
+                                  color: _neuraRed,
+                                ),
                                 const SizedBox(width: 6),
                                 Flexible(
                                   child: Text(
@@ -5247,12 +5363,15 @@ $regItems = foreach ($rp in $regPaths) {
                                   width: 24,
                                   height: 24,
                                   child: IconButton(
+                                    tooltip: 'Обновить задержку',
                                     padding: EdgeInsets.zero,
                                     constraints: const BoxConstraints(),
                                     iconSize: 16,
                                     icon: const Icon(Icons.refresh),
                                     color: Colors.white54,
-                                    onPressed: canRefreshMetrics ? _refreshMetrics : null,
+                                    onPressed: canRefreshMetrics
+                                        ? _refreshMetrics
+                                        : null,
                                   ),
                                 ),
                               ],
@@ -6478,6 +6597,7 @@ $regItems = foreach ($rp in $regPaths) {
             Align(
               alignment: Alignment.centerRight,
               child: IconButton(
+                tooltip: 'Показать конфиг',
                 onPressed: () => _showConfigDialog(context),
                 icon: const Icon(Icons.receipt_long, color: Colors.white),
               ),
@@ -6501,7 +6621,11 @@ $regItems = foreach ($rp in $regPaths) {
 
     final buttonSize = compact ? 140.0 : 170.0;
     final canInteract = !_isConnecting && !_isDisconnecting;
-    final connectButton = Material(
+    final connectButtonTooltip = _connectButtonTooltip(
+      isEnabled: isEnabled,
+      isRunning: isRunning,
+    );
+    final connectButtonCore = Material(
       color: Colors.transparent,
       shape: const CircleBorder(),
       child: InkWell(
@@ -6542,7 +6666,9 @@ $regItems = foreach ($rp in $regPaths) {
         child: AnimatedScale(
           scale: _connectButtonPressed
               ? 0.95
-              : (_connectButtonHovered && canInteract ? 1.08 : 1.0),
+              : ((_connectButtonHovered || _connectButtonFocused) && canInteract
+                    ? 1.08
+                    : 1.0),
           duration: NeuraUi.micro,
           child: AnimatedBuilder(
             animation: _connectGlowController,
@@ -6581,12 +6707,17 @@ $regItems = foreach ($rp in $regPaths) {
                         color: scheme.primary.withOpacity(
                           isRunning
                               ? 0.35
-                              : (_connectButtonHovered ? 0.18 : 0.12),
+                              : (_connectButtonHovered || _connectButtonFocused
+                                    ? 0.18
+                                    : 0.12),
                         ),
                         blurRadius: _connectButtonPressed
                             ? 16
                             : (isRunning ? 28 : 18),
-                        spreadRadius: isRunning || _connectButtonHovered
+                        spreadRadius:
+                            isRunning ||
+                                _connectButtonHovered ||
+                                _connectButtonFocused
                             ? 2
                             : 0,
                       ),
@@ -6619,6 +6750,37 @@ $regItems = foreach ($rp in $regPaths) {
         ),
       ),
     );
+    final connectButton = Tooltip(
+      message: connectButtonTooltip,
+      waitDuration: const Duration(milliseconds: 450),
+      child: Semantics(
+        button: true,
+        enabled: canInteract,
+        label: connectButtonTooltip,
+        child: FocusableActionDetector(
+          enabled: canInteract,
+          shortcuts: const <ShortcutActivator, Intent>{
+            SingleActivator(LogicalKeyboardKey.enter): ActivateIntent(),
+            SingleActivator(LogicalKeyboardKey.space): ActivateIntent(),
+          },
+          actions: <Type, Action<Intent>>{
+            ActivateIntent: CallbackAction<Intent>(
+              onInvoke: (_) {
+                if (canInteract) {
+                  _onMainConnectButtonPressed(
+                    isEnabled: isEnabled,
+                    isRunning: isRunning,
+                  );
+                }
+                return null;
+              },
+            ),
+          },
+          onShowFocusHighlight: _setConnectButtonFocus,
+          child: connectButtonCore,
+        ),
+      ),
+    );
 
     final pingRow = Row(
       mainAxisAlignment: MainAxisAlignment.end,
@@ -6629,6 +6791,7 @@ $regItems = foreach ($rp in $regPaths) {
         ),
         const SizedBox(width: 6),
         IconButton(
+          tooltip: _pingInProgress ? 'Проверяем задержку' : 'Обновить задержку',
           onPressed: canRefreshMetrics ? () => _refreshMetrics() : null,
           icon: Icon(
             _pingInProgress ? Icons.timelapse : Icons.refresh_outlined,
@@ -7712,7 +7875,10 @@ class _WindowsAppPickerSheetState extends State<_WindowsAppPickerSheet> {
                               Navigator.of(context).pop(picked);
                             }
                           },
-                          icon: const Icon(Icons.folder_open_outlined, size: 18),
+                          icon: const Icon(
+                            Icons.folder_open_outlined,
+                            size: 18,
+                          ),
                           label: const Text('Выбрать вручную (.exe)'),
                         ),
                       ),
@@ -8202,4 +8368,3 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
-
