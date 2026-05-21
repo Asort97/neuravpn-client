@@ -1855,6 +1855,26 @@ $regItems = foreach ($rp in $regPaths) {
         }
       }
     }
+    // Restore subscription profile by URI if standalone lookup failed
+    if (selected == null) {
+      final selectedUri = prefs.getString('vpn_profile_selected_uri');
+      if (selectedUri != null &&
+          selectedUri.isNotEmpty &&
+          _isSecureProfileUri(selectedUri)) {
+        for (final sub in subscriptions) {
+          if (sub.profiles.contains(selectedUri)) {
+            final autoName = _deriveProfileNameFromUri(selectedUri);
+            selected = VpnProfile(
+              name: autoName.isEmpty
+                  ? _deriveSubscriptionNameFromUrl(sub.url)
+                  : autoName,
+              uri: selectedUri,
+            );
+            break;
+          }
+        }
+      }
+    }
     selected ??= profiles.isNotEmpty ? profiles.first : null;
     if (selected == null && subscriptions.isNotEmpty) {
       final firstSub = subscriptions.first;
@@ -2195,8 +2215,10 @@ $regItems = foreach ($rp in $regPaths) {
     final prefs = await SharedPreferences.getInstance();
     if (_selectedProfile != null) {
       await prefs.setString('vpn_profile_selected', _selectedProfile!.name);
+      await prefs.setString('vpn_profile_selected_uri', _selectedProfile!.uri);
     } else {
       await prefs.remove('vpn_profile_selected');
+      await prefs.remove('vpn_profile_selected_uri');
     }
   }
 
@@ -2921,14 +2943,17 @@ $regItems = foreach ($rp in $regPaths) {
       autoName.isEmpty ? _previewProfileName() : autoName,
     );
     final profile = VpnProfile(name: uniqueName, uri: trimmedUri);
+    final shouldAutoSelect = _selectedProfile == null;
 
     setState(() {
       _profiles = [..._profiles, profile];
-      _selectedProfile = profile;
+      if (shouldAutoSelect) {
+        _selectedProfile = profile;
+        _syncMetricsFromProfile(profile);
+      }
       _hasEverAddedKey = true;
-      _syncMetricsFromProfile(profile);
     });
-    _controller.text = trimmedUri;
+    if (shouldAutoSelect) _controller.text = trimmedUri;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_hasEverAddedKeyKey, true);
     await _persistProfiles();
@@ -3029,10 +3054,30 @@ $regItems = foreach ($rp in $regPaths) {
           'Подписка добавлена',
           tone: NeuraToastTone.success,
         );
+        // Remember current selection before clearing standalone profiles
+        final previousUri = _selectedProfile?.uri;
+        final previousName = _selectedProfile?.name;
         await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
 
         if (!mounted) return;
+        // Restore previous selection if it's still valid in any subscription
+        if (previousUri != null &&
+            previousUri.isNotEmpty &&
+            _isSecureProfileUri(previousUri)) {
+          final allSubs = await repository.getAllSubscriptions();
+          final stillValid =
+              allSubs.any((s) => s.profiles.contains(previousUri));
+          if (stillValid) {
+            final restored = VpnProfile(
+              name: previousName ?? _deriveProfileNameFromUri(previousUri),
+              uri: previousUri,
+            );
+            await _selectCurrentProfile(restored);
+            return;
+          }
+        }
+        // Default: select first profile from newly added subscription
         final uri = profiles.first;
         final autoName = _deriveProfileNameFromUri(uri);
         final profile = VpnProfile(
@@ -3111,11 +3156,14 @@ $regItems = foreach ($rp in $regPaths) {
       return;
     }
 
-    // Pick first available subscription profile.
+    // URI not found — try to restore by savedIndex within each subscription.
+    // selectedIndex is updated in _persistSubscriptionSelectedIndex when user taps.
     for (final sub in subs) {
-      final uri = sub.selectedProfile ??
-          (sub.profiles.isNotEmpty ? sub.profiles.first : null);
-      if (uri != null && uri.isNotEmpty && _isSecureProfileUri(uri)) {
+      if (sub.profiles.isEmpty) continue;
+      // Clamp index to valid range in case profile count changed after refresh.
+      final idx = sub.selectedIndex.clamp(0, sub.profiles.length - 1);
+      final uri = sub.profiles[idx];
+      if (uri.isNotEmpty && _isSecureProfileUri(uri)) {
         final autoName = _deriveProfileNameFromUri(uri);
         final profile = VpnProfile(
           name: autoName.isEmpty
@@ -3124,11 +3172,8 @@ $regItems = foreach ($rp in $regPaths) {
           uri: uri,
         );
         if (!mounted) return;
-        setState(() {
-          _selectedProfile = profile;
-          _controller.text = profile.uri;
-          _syncMetricsFromProfile(profile);
-        });
+        // Use _selectCurrentProfile to also persist the new selection.
+        await _selectCurrentProfile(profile);
         return;
       }
     }
@@ -3140,6 +3185,7 @@ $regItems = foreach ($rp in $regPaths) {
       _controller.text = '';
       _syncMetricsFromProfile(null);
     });
+    await _persistSelectedProfile();
   }
 
   Future<void> _clearAllProfilesForSubscriptionMode() async {
@@ -3257,10 +3303,28 @@ $regItems = foreach ($rp in $regPaths) {
       _controller.text = profile.uri;
       _syncMetricsFromProfile(profile);
     });
-    // Для профилей из подписки не сохраняем выбор
-    // Только для постоянных профилей
-    if (_profiles.any((p) => p.name == profile.name)) {
-      await _persistSelectedProfile();
+    await _persistSelectedProfile();
+    // Сохраняем selectedIndex в подписке, чтобы при обновлении сервера
+    // восстановить позицию даже если URI немного изменился
+    await _persistSubscriptionSelectedIndex(profile.uri);
+  }
+
+  /// Находит подписку, содержащую [uri], и обновляет её selectedIndex.
+  Future<void> _persistSubscriptionSelectedIndex(String uri) async {
+    try {
+      final repository = SubscriptionRepository();
+      final subs = await repository.getAllSubscriptions();
+      for (final sub in subs) {
+        final index = sub.profiles.indexOf(uri);
+        if (index != -1) {
+          await repository.updateSubscription(
+            sub.copyWith(selectedIndex: index),
+          );
+          break;
+        }
+      }
+    } catch (_) {
+      // ignore
     }
   }
 
@@ -8135,3 +8199,5 @@ class _MenuItemState extends State<_MenuItem> {
     );
   }
 }
+
+
