@@ -16,7 +16,7 @@ class _FakeBinaryManager extends VpnCoreBinaryManager {
   final String? _path;
 
   @override
-  Future<String?> resolveExecutable() async => _path;
+  Future<String?> resolveExecutable({String? androidRuntime}) async => _path;
 }
 
 class _FakeTunGuard extends WindowsTunGuard {
@@ -35,7 +35,7 @@ class _FakeTunGuard extends WindowsTunGuard {
   final List<List<String>> bulkCleanupCalls = <List<String>>[];
 
   @override
-  Future<TunSessionPlan> prepare() async {
+  Future<TunSessionPlan> prepare({bool detectExistingAdapters = false}) async {
     prepareCalls += 1;
     final interface = 'tun-in-session-$prepareCalls';
     return TunSessionPlan(
@@ -503,10 +503,11 @@ void main() {
     final result = await controller.connect(
       rawUri: _validUri,
       splitConfig: SplitTunnelConfig(mode: 'all'),
-      developerMode: false,
+      developerMode: true,
     );
 
     expect(result.success, isTrue);
+    await Future<void>.delayed(const Duration(milliseconds: 120));
     await controller.disconnect();
 
     final afterPaths = _existingConnectionLogPaths();
@@ -517,12 +518,16 @@ void main() {
                   .listSync()
                   .whereType<File>()
                   .where(
-                    (file) => path.basename(file.path).startsWith('connection_'),
+                    (file) =>
+                        path.basename(file.path).startsWith('connection_'),
                   )
                   .toList()
-                ..sort((a, b) => a.statSync().modified.compareTo(b.statSync().modified)))
-            .last
-            .path;
+                ..sort(
+                  (a, b) =>
+                      a.statSync().modified.compareTo(b.statSync().modified),
+                ))
+              .last
+              .path;
     final text = await File(targetPath).readAsString();
     expect(text.contains('connection log throttled:'), isTrue);
   });
@@ -692,105 +697,111 @@ void main() {
     await controller.disconnect();
   });
 
-  test('fetchTrafficBps falls back to inbound counters when outbound is zero', () async {
-    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
-    final routeManager = _FakeWindowsRouteManager();
-    final controller = VpnCoreController(
-      tunGuard: guard,
-      binaryManager: _FakeBinaryManager('fake-xray.exe'),
-      windowsRouteManager: routeManager,
-      isWindowsOverride: true,
-      isAndroidOverride: false,
-      processRunner: (executable, arguments) async {
-        if (arguments.contains('version')) {
-          return ProcessResult(1, 0, 'Xray 1.8.24', '');
-        }
-        if (arguments.length >= 2 &&
-            arguments[0] == 'api' &&
-            arguments[1] == 'statsquery') {
-          return ProcessResult(
-            1,
-            0,
-            'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 0\n'
-                'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 0\n'
-                'name: "inbound>>>tun-in-session-1>>>traffic>>>downlink"\nvalue: 8192\n'
-                'name: "inbound>>>tun-in-session-1>>>traffic>>>uplink"\nvalue: 2048\n',
-            '',
-          );
-        }
-        return ProcessResult(1, 0, '', '');
-      },
-      processStarter: (executable, arguments, {environment}) async =>
-          _FakeProcess(pid: 6105),
-    );
-
-    final result = await controller.connect(
-      rawUri: _validUri,
-      splitConfig: SplitTunnelConfig(mode: 'all'),
-    );
-    expect(result.success, isTrue);
-
-    final sample = await controller.fetchTrafficBps();
-    expect(sample, 10240);
-    await controller.disconnect();
-  });
-
-  test('fetchTrafficSample useDelta handles counter resets without dropping to zero', () async {
-    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
-    final routeManager = _FakeWindowsRouteManager();
-    int statsQueryCalls = 0;
-    final controller = VpnCoreController(
-      tunGuard: guard,
-      binaryManager: _FakeBinaryManager('fake-xray.exe'),
-      windowsRouteManager: routeManager,
-      isWindowsOverride: true,
-      isAndroidOverride: false,
-      processRunner: (executable, arguments) async {
-        if (arguments.contains('version')) {
-          return ProcessResult(1, 0, 'Xray 1.8.24', '');
-        }
-        if (arguments.length >= 2 &&
-            arguments[0] == 'api' &&
-            arguments[1] == 'statsquery') {
-          statsQueryCalls += 1;
-          if (statsQueryCalls == 1) {
+  test(
+    'fetchTrafficBps falls back to inbound counters when outbound is zero',
+    () async {
+      final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+      final routeManager = _FakeWindowsRouteManager();
+      final controller = VpnCoreController(
+        tunGuard: guard,
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: routeManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: (executable, arguments) async {
+          if (arguments.contains('version')) {
+            return ProcessResult(1, 0, 'Xray 1.8.24', '');
+          }
+          if (arguments.length >= 2 &&
+              arguments[0] == 'api' &&
+              arguments[1] == 'statsquery') {
             return ProcessResult(
               1,
               0,
-              'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 1000\n'
-                  'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 500\n',
+              'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 0\n'
+                  'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 0\n'
+                  'name: "inbound>>>tun-in-session-1>>>traffic>>>downlink"\nvalue: 8192\n'
+                  'name: "inbound>>>tun-in-session-1>>>traffic>>>uplink"\nvalue: 2048\n',
               '',
             );
           }
-          return ProcessResult(
-            1,
-            0,
-            'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 100\n'
-                'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 50\n',
-            '',
-          );
-        }
-        return ProcessResult(1, 0, '', '');
-      },
-      processStarter: (executable, arguments, {environment}) async =>
-          _FakeProcess(pid: 6106),
-    );
+          return ProcessResult(1, 0, '', '');
+        },
+        processStarter: (executable, arguments, {environment}) async =>
+            _FakeProcess(pid: 6105),
+      );
 
-    final result = await controller.connect(
-      rawUri: _validUri,
-      splitConfig: SplitTunnelConfig(mode: 'all'),
-    );
-    expect(result.success, isTrue);
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+      );
+      expect(result.success, isTrue);
 
-    final sample1 = await controller.fetchTrafficSample(useDelta: true);
-    final sample2 = await controller.fetchTrafficSample(useDelta: true);
-    expect(sample1, isNotNull);
-    expect(sample2, isNotNull);
-    expect(sample1!.totalBps, 1500);
-    expect(sample2!.totalBps, 150);
+      final sample = await controller.fetchTrafficBps();
+      expect(sample, 10240);
+      await controller.disconnect();
+    },
+  );
 
-    await controller.disconnect();
-  });
+  test(
+    'fetchTrafficSample useDelta handles counter resets without dropping to zero',
+    () async {
+      final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+      final routeManager = _FakeWindowsRouteManager();
+      int statsQueryCalls = 0;
+      final controller = VpnCoreController(
+        tunGuard: guard,
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: routeManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: (executable, arguments) async {
+          if (arguments.contains('version')) {
+            return ProcessResult(1, 0, 'Xray 1.8.24', '');
+          }
+          if (arguments.length >= 2 &&
+              arguments[0] == 'api' &&
+              arguments[1] == 'statsquery') {
+            statsQueryCalls += 1;
+            if (statsQueryCalls == 1) {
+              return ProcessResult(
+                1,
+                0,
+                'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 1000\n'
+                    'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 500\n',
+                '',
+              );
+            }
+            return ProcessResult(
+              1,
+              0,
+              'name: "outbound>>>tag>>>traffic>>>downlink"\nvalue: 100\n'
+                  'name: "outbound>>>tag>>>traffic>>>uplink"\nvalue: 50\n',
+              '',
+            );
+          }
+          return ProcessResult(1, 0, '', '');
+        },
+        processStarter: (executable, arguments, {environment}) async =>
+            _FakeProcess(pid: 6106),
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+      );
+      expect(result.success, isTrue);
+
+      final sample1 = await controller.fetchTrafficSample(useDelta: true);
+      final sample2 = await controller.fetchTrafficSample(useDelta: true);
+      expect(sample1, isNotNull);
+      expect(sample2, isNotNull);
+      expect(sample1!.totalBps, 1500);
+      expect(sample2!.totalBps, 150);
+
+      await controller.disconnect();
+    },
+  );
 
   test('fetchTrafficBps uses direct api stats counters when available', () async {
     final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
@@ -812,7 +823,9 @@ void main() {
             (arg) => arg.startsWith('--name='),
             orElse: () => '',
           );
-          if (statArg.contains('inbound>>>tun-in-session-1>>>traffic>>>downlink')) {
+          if (statArg.contains(
+            'inbound>>>tun-in-session-1>>>traffic>>>downlink',
+          )) {
             return ProcessResult(
               1,
               0,
@@ -820,7 +833,9 @@ void main() {
               '',
             );
           }
-          if (statArg.contains('inbound>>>tun-in-session-1>>>traffic>>>uplink')) {
+          if (statArg.contains(
+            'inbound>>>tun-in-session-1>>>traffic>>>uplink',
+          )) {
             return ProcessResult(
               1,
               0,
@@ -852,4 +867,3 @@ void main() {
     await controller.disconnect();
   });
 }
-

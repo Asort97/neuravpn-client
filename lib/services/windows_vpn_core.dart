@@ -20,6 +20,7 @@ abstract class WindowsVpnCoreAdapter {
     required List<Map<String, dynamic>> extraRouteRules,
     required DpiEvasionConfig dpiEvasionConfig,
     required bool developerMode,
+    String? serverAddressOverride,
   });
 
   String? computeRuleHash(String jsonConfig);

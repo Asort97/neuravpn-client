@@ -117,6 +117,39 @@ void main() {
     );
   });
 
+  test('can pin xray server address while preserving tls host metadata', () {
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=tls&type=tcp&sni=example.com#proxy',
+    );
+    final config =
+        jsonDecode(
+              generateXrayConfig(
+                link,
+                SplitTunnelConfig(mode: 'all'),
+                serverAddressOverride: '203.0.113.10',
+                externalRouteManager: true,
+              ),
+            )
+            as Map<String, dynamic>;
+    final proxy = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((item) => item['tag'] == 'proxy');
+    final vnext =
+        ((proxy['settings'] as Map<String, dynamic>)['vnext'] as List<dynamic>)
+            .cast<Map<String, dynamic>>()
+            .single;
+    final stream = proxy['streamSettings'] as Map<String, dynamic>;
+    final inbound = (config['inbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((item) => item['tag'] == 'tun-in');
+    final tunSettings = inbound['settings'] as Map<String, dynamic>;
+
+    expect(vnext['address'], '203.0.113.10');
+    expect(stream['tlsSettings']['serverName'], 'example.com');
+    expect(tunSettings['autoRoute'], isFalse);
+    expect(tunSettings['strictRoute'], isFalse);
+  });
+
   test('builds whitelist routing rule for domains and CIDR', () {
     final link = _parse(
       'vless://$_uuid@example.com:443?security=tls&type=tcp&sni=example.com#proxy',
@@ -163,10 +196,7 @@ void main() {
         jsonDecode(
               generateXrayConfig(
                 link,
-                SplitTunnelConfig(
-                  mode: 'blacklist',
-                  domains: ['example.com'],
-                ),
+                SplitTunnelConfig(mode: 'blacklist', domains: ['example.com']),
               ),
             )
             as Map<String, dynamic>;

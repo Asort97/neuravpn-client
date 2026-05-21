@@ -6,6 +6,7 @@
 #include "dpi_evasion_channel.h"
 #include "launch_uri_channel.h"
 #include "utils.h"
+#include "windows_route_channel.h"
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -30,6 +31,7 @@ bool FlutterWindow::OnCreate() {
   RegisterPlugins(flutter_controller_->engine());
   SetupDpiEvasionChannel(flutter_controller_->engine()->messenger());
   SetupLaunchUriChannel(flutter_controller_->engine()->messenger());
+  SetupWindowsRouteChannel(flutter_controller_->engine()->messenger());
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -46,6 +48,7 @@ bool FlutterWindow::OnCreate() {
 
 void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
+    TeardownWindowsRouteChannel();
     TeardownDpiEvasionChannel();
     TeardownLaunchUriChannel();
     flutter_controller_ = nullptr;

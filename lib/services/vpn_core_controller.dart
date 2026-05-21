@@ -155,6 +155,8 @@ class VpnCoreController {
   final Map<int, WindowsRouteSession> _sessionRoutePlans =
       <int, WindowsRouteSession>{};
   WindowsRouteUplink? _cachedWindowsUplink;
+  String? _cachedWindowsExecutablePath;
+  Future<void>? _windowsPrewarmFuture;
   bool _windowsRuntimePrepared = false;
   bool _pendingAggressiveRecovery = false;
   final _WindowsRuntimeSessionStore _sessionStore =
@@ -165,6 +167,9 @@ class VpnCoreController {
   static const int _connectionLogFlushMs = 200;
   static const int _maxPendingConnectionLogLines = 1000;
   static const int _maxMemoryConnectionLogLines = 400;
+  static const Duration _windowsPrewarmConnectWaitBudget = Duration(
+    milliseconds: 200,
+  );
   static const Duration _trafficForegroundPollInterval = Duration(
     milliseconds: 750,
   );
@@ -289,10 +294,14 @@ class VpnCoreController {
     bool force = false,
   }) async {
     if (!_isWindows) return;
-    if (_windowsRuntimePrepared && !force) return;
+    if (_windowsRuntimePrepared && !force) {
+      unawaited(_startWindowsRuntimePrewarm(onLog: onLog));
+      return;
+    }
     _windowsRuntimePrepared = true;
     final state = await _sessionStore.read();
     if (!state.dirty) {
+      unawaited(_startWindowsRuntimePrewarm(onLog: onLog));
       return;
     }
 
@@ -323,6 +332,97 @@ class VpnCoreController {
       onLog?.call(line);
       _logSink?.call(line);
       _appendConnectionLog(line);
+    }
+    unawaited(_startWindowsRuntimePrewarm(onLog: onLog));
+  }
+
+  Future<void> _startWindowsRuntimePrewarm({void Function(String log)? onLog}) {
+    if (!_isWindows) return Future<void>.value();
+    final existing = _windowsPrewarmFuture;
+    if (existing != null) {
+      return existing;
+    }
+
+    late final Future<void> tracked;
+    tracked = _prewarmWindowsRuntime(onLog: onLog).whenComplete(() {
+      if (identical(_windowsPrewarmFuture, tracked)) {
+        _windowsPrewarmFuture = null;
+      }
+    });
+    _windowsPrewarmFuture = tracked;
+    return tracked;
+  }
+
+  Future<void> _prewarmWindowsRuntime({
+    void Function(String log)? onLog,
+  }) async {
+    await Future.wait(<Future<void>>[
+      _prewarmWindowsCoreBinary(onLog: onLog),
+      _prewarmWindowsUplink(onLog: onLog),
+      _prewarmWindowsElevation(onLog: onLog),
+    ]);
+  }
+
+  Future<void> _prewarmWindowsCoreBinary({
+    void Function(String log)? onLog,
+  }) async {
+    try {
+      final exePath = await _binaryManager.resolveExecutable(
+        androidRuntime: _useAndroidXrayRuntime ? _androidRuntimeId : null,
+      );
+      if (exePath == null) {
+        return;
+      }
+      final sanityError = await _verifyWindowsCoreBinary(
+        exePath,
+        recordDiagnostics: false,
+      );
+      if (sanityError == null) {
+        _cachedWindowsExecutablePath = exePath;
+      }
+    } catch (e) {
+      onLog?.call('[prewarm] Windows core warmup failed: $e');
+    }
+  }
+
+  Future<void> _prewarmWindowsUplink({void Function(String log)? onLog}) async {
+    if (_cachedWindowsUplink != null) {
+      return;
+    }
+    try {
+      final logs = <String>[];
+      final uplink = await _windowsRouteManager.discoverPrimaryUplink(
+        logs: logs,
+      );
+      if (uplink != null) {
+        _cachedWindowsUplink = uplink;
+      }
+    } catch (e) {
+      onLog?.call('[prewarm] Windows uplink warmup failed: $e');
+    }
+  }
+
+  Future<void> _prewarmWindowsElevation({
+    void Function(String log)? onLog,
+  }) async {
+    try {
+      await _tunGuard.warmupElevationCheck();
+    } catch (e) {
+      onLog?.call('[prewarm] Windows elevation warmup failed: $e');
+    }
+  }
+
+  Future<void> _awaitWindowsPrewarmBudget() async {
+    final prewarm = _windowsPrewarmFuture;
+    if (prewarm == null) {
+      return;
+    }
+    try {
+      await prewarm.timeout(_windowsPrewarmConnectWaitBudget);
+    } on TimeoutException {
+      _appendConnectionLog('[prewarm] still running; continuing connect path');
+    } catch (_) {
+      // Warmup is best-effort; the foreground connection path will retry.
     }
   }
 
@@ -508,9 +608,7 @@ class VpnCoreController {
           'Android VPN сервис не запустился (проверьте совместимость конфигурации)',
         );
       }
-      _notifyStatus(
-        'Android Xray сервис запущен',
-      );
+      _notifyStatus('Android Xray сервис запущен');
       unawaited(_warmupConnection());
       return VpnCoreStartResult.success();
     }
@@ -549,19 +647,34 @@ class VpnCoreController {
     required DpiEvasionConfig dpiEvasionConfig,
     required bool developerMode,
   }) async {
+    await _awaitWindowsPrewarmBudget();
     _notifyStatus('Поиск xray-core');
-    final exePath = await _measureConnectPhase(
-      'binary_resolve',
-      () => _binaryManager.resolveExecutable(
-        androidRuntime: _useAndroidXrayRuntime ? 'xray' : null,
-      ),
-    );
+    var exePath = _cachedWindowsExecutablePath;
+    if (exePath != null && !File(exePath).existsSync()) {
+      exePath = null;
+      _cachedWindowsExecutablePath = null;
+    }
+    if (exePath == null) {
+      exePath = await _measureConnectPhase(
+        'binary_resolve',
+        () => _binaryManager.resolveExecutable(
+          androidRuntime: _useAndroidXrayRuntime ? 'xray' : null,
+        ),
+      );
+      if (exePath != null) {
+        _cachedWindowsExecutablePath = exePath;
+      }
+    } else {
+      _lastConnectPhaseDurationsMs['binary_resolve'] = 0;
+      _appendConnectionLog('[prewarm] reusing verified xray binary');
+    }
     if (exePath == null) {
       return VpnCoreStartResult.failure('Не найден исполняемый файл xray-core');
     }
+    final resolvedExePath = exePath;
     final sanityError = await _measureConnectPhase(
       'binary_verify',
-      () => _verifyWindowsCoreBinary(exePath),
+      () => _verifyWindowsCoreBinary(resolvedExePath),
     );
     if (sanityError != null) {
       return VpnCoreStartResult.failure(sanityError);
@@ -654,6 +767,7 @@ class VpnCoreController {
       );
       WindowsRouteUplink? uplink = _cachedWindowsUplink;
       if (uplink != null) {
+        _lastConnectPhaseDurationsMs['uplink_discovery'] = 0;
         _appendConnectionLog(
           '[token=$token] reusing cached uplink ${uplink.interfaceName} via ${uplink.gateway}',
         );
@@ -678,6 +792,16 @@ class VpnCoreController {
         );
         continue;
       }
+      final endpoint = await _measureConnectPhase(
+        'endpoint_resolve',
+        () => _resolveWindowsEndpoint(parsed.host),
+      );
+      if (endpoint.serverAddressOverride != null) {
+        _appendConnectionLog(
+          '[token=$token] using resolved server IP '
+          '${endpoint.serverAddressOverride} for ${parsed.host}',
+        );
+      }
       _notifyStatus('Генерация конфига');
       final jsonConfig = _buildConfigJson(
         parsed: parsed,
@@ -695,6 +819,7 @@ class VpnCoreController {
         dnsFinalTag: dnsFinalTag,
         dpiEvasionConfig: dpiEvasionConfig,
         developerMode: developerMode,
+        serverAddressOverride: endpoint.serverAddressOverride,
       );
       _generatedConfig = jsonConfig;
 
@@ -717,7 +842,7 @@ class VpnCoreController {
       try {
         final process = await _measureConnectPhase(
           'process_start',
-          () => _startMeasuredProcess(exePath, [
+          () => _startMeasuredProcess(resolvedExePath, [
             'run',
             '-c',
             cfgFile.path,
@@ -739,7 +864,7 @@ class VpnCoreController {
             'route_apply',
             () => _windowsRouteManager.applyRoutes(
               preferredTunInterface: _activeInterfaceName ?? plan.interfaceName,
-              remoteHost: parsed.host,
+              remoteHost: endpoint.routeHost,
               dnsServers: const <String>['8.8.8.8', '1.1.1.1'],
               tunAddressHint: plan.addresses.isEmpty
                   ? null
@@ -842,6 +967,7 @@ class VpnCoreController {
     required String? dnsFinalTag,
     required DpiEvasionConfig dpiEvasionConfig,
     required bool developerMode,
+    String? serverAddressOverride,
   }) {
     if (_isWindows) {
       return _windowsCoreAdapter.generateConfig(
@@ -855,6 +981,7 @@ class VpnCoreController {
         extraRouteRules: extraRouteRules,
         dpiEvasionConfig: dpiEvasionConfig,
         developerMode: developerMode,
+        serverAddressOverride: serverAddressOverride,
       );
     }
     if (_useAndroidXrayRuntime) {
@@ -913,9 +1040,7 @@ class VpnCoreController {
       // calling stopSelf(), so it may appear before isRunning flips.
       // Ignore a stale error left over from a previous stop cycle.
       final error = await _androidController.getLastStartupError();
-      if (error != null &&
-          error.isNotEmpty &&
-          error != ignoreError) {
+      if (error != null && error.isNotEmpty && error != ignoreError) {
         return (running: false, error: error);
       }
       final running = await _androidController.isRunning();
@@ -935,16 +1060,56 @@ class VpnCoreController {
     return false;
   }
 
-  Future<String?> _verifyWindowsCoreBinary(String executablePath) async {
+  Future<_WindowsEndpointResolution> _resolveWindowsEndpoint(
+    String host,
+  ) async {
+    final trimmed = host.trim();
+    if (trimmed.isEmpty || _looksLikeIpv4(trimmed)) {
+      return _WindowsEndpointResolution(routeHost: trimmed);
+    }
+
+    try {
+      final resolved = await InternetAddress.lookup(
+        trimmed,
+      ).timeout(const Duration(milliseconds: 1000));
+      final ipv4 = resolved
+          .where((address) => address.type == InternetAddressType.IPv4)
+          .map((address) => address.address)
+          .where(_looksLikeIpv4)
+          .toList();
+      if (ipv4.isEmpty) {
+        _appendConnectionLog('[endpoint] no IPv4 result for $trimmed');
+        return _WindowsEndpointResolution(routeHost: trimmed);
+      }
+      return _WindowsEndpointResolution(
+        routeHost: ipv4.first,
+        serverAddressOverride: ipv4.first,
+      );
+    } on TimeoutException {
+      _appendConnectionLog('[endpoint] resolve timed out for $trimmed');
+    } catch (e) {
+      _appendConnectionLog('[endpoint] resolve failed for $trimmed: $e');
+    }
+    return _WindowsEndpointResolution(routeHost: trimmed);
+  }
+
+  bool _looksLikeIpv4(String value) {
+    return RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(value);
+  }
+
+  Future<String?> _verifyWindowsCoreBinary(
+    String executablePath, {
+    bool recordDiagnostics = true,
+  }) async {
     if (!_isWindows) return null;
     if (_verifiedWindowsBinaryPath == executablePath &&
         _verifiedWindowsBinarySignature == _windowsCoreAdapter.processName) {
       return null;
     }
     try {
-      final result = await _runMeasuredProcess(executablePath, const [
-        'version',
-      ]);
+      final result = recordDiagnostics
+          ? await _runMeasuredProcess(executablePath, const ['version'])
+          : await _processRunner(executablePath, const ['version']);
       if (result.exitCode != 0) {
         return 'xray-core не отвечает: code ${result.exitCode}';
       }
@@ -2069,25 +2234,28 @@ if (-not \$s) { exit 0 }
     if (_startupCheckInProgress) return null;
     _startupCheckInProgress = true;
     try {
-      try {
-        final exitCode = await process.exitCode.timeout(
-          const Duration(milliseconds: 250),
-        );
-        final hint =
-            _lastStartError ??
-            (_recentLogs.isNotEmpty ? _recentLogs.last : null);
-        final suffix = hint == null ? '' : ' ($hint)';
-        _appendConnectionLog(
-          'ERROR: xray-core exited early (code $exitCode)$suffix',
-        );
-        return 'xray-core exited early (code $exitCode)$suffix';
-      } on TimeoutException {
-        // Process is still alive. Continue with adapter check.
-      }
       if (_isWindows) {
-        _appendConnectionLog('Waiting for TUN adapter to come up...');
+        _appendConnectionLog('Waiting for Windows core readiness...');
         final deadline = DateTime.now().add(const Duration(seconds: 3));
+        var lastAdapterProbe = DateTime.fromMillisecondsSinceEpoch(0);
         while (DateTime.now().isBefore(deadline)) {
+          final exitCode = await _tryReadEarlyExitCode(process);
+          if (exitCode != null) {
+            final hint =
+                _lastStartError ??
+                (_recentLogs.isNotEmpty ? _recentLogs.last : null);
+            final suffix = hint == null ? '' : ' ($hint)';
+            _appendConnectionLog(
+              'ERROR: xray-core exited early (code $exitCode)$suffix',
+            );
+            return 'xray-core exited early (code $exitCode)$suffix';
+          }
+
+          if (_hasTunReadySignal()) {
+            _appendConnectionLog('Windows core reported TUN ready signal');
+            return null;
+          }
+
           final apiReady = await _isWindowsCoreApiResponsive();
           if (apiReady) {
             _appendConnectionLog(
@@ -2096,18 +2264,18 @@ if (-not \$s) { exit 0 }
             return null;
           }
 
-          final adapterUp = await _tunGuard.isAdapterUp(interfaceName);
-          if (adapterUp) {
-            _appendConnectionLog('TUN adapter is up and ready');
-            return null;
+          final now = DateTime.now();
+          if (now.difference(lastAdapterProbe) >=
+              const Duration(milliseconds: 900)) {
+            lastAdapterProbe = now;
+            final adapterUp = await _tunGuard.isAdapterUp(interfaceName);
+            if (adapterUp) {
+              _appendConnectionLog('TUN adapter is up and ready');
+              return null;
+            }
           }
 
-          if (_hasTunReadySignal()) {
-            _appendConnectionLog('Windows core reported TUN ready signal');
-            return null;
-          }
-
-          await Future.delayed(const Duration(milliseconds: 120));
+          await Future.delayed(const Duration(milliseconds: 80));
         }
 
         final hint =
@@ -2120,6 +2288,16 @@ if (-not \$s) { exit 0 }
       return null;
     } finally {
       _startupCheckInProgress = false;
+    }
+  }
+
+  Future<int?> _tryReadEarlyExitCode(Process process) async {
+    try {
+      return await process.exitCode.timeout(const Duration(milliseconds: 1));
+    } on TimeoutException {
+      return null;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -2302,6 +2480,16 @@ class _WindowsRuntimeSessionState {
       'updatedAt': updatedAt?.toIso8601String(),
     };
   }
+}
+
+class _WindowsEndpointResolution {
+  const _WindowsEndpointResolution({
+    required this.routeHost,
+    this.serverAddressOverride,
+  });
+
+  final String routeHost;
+  final String? serverAddressOverride;
 }
 
 class _WindowsRuntimeSessionStore {

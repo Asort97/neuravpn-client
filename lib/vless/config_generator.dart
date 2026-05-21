@@ -224,6 +224,8 @@ String generateXrayConfig(
   List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
   int apiPort = 10085,
   String logLevel = 'info',
+  String? serverAddressOverride,
+  bool externalRouteManager = false,
 }) {
   final p = link.params;
   final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
@@ -239,6 +241,9 @@ String generateXrayConfig(
   final vpnTag = link.tag ?? 'proxy';
   final trimmedInterfaceName = outboundInterfaceName?.trim();
   final trimmedBindAddress = outboundBindAddress?.trim();
+  final outboundServerAddress = serverAddressOverride?.trim().isNotEmpty == true
+      ? serverAddressOverride!.trim()
+      : link.host;
 
   final user = <String, dynamic>{
     'id': link.uuid,
@@ -252,7 +257,7 @@ String generateXrayConfig(
     'settings': {
       'vnext': [
         {
-          'address': link.host,
+          'address': outboundServerAddress,
           'port': link.port,
           'users': [user],
         },
@@ -357,8 +362,8 @@ String generateXrayConfig(
           'interfaceName': interfaceName,
           'mtu': 1280,
           'address': addresses ?? const ['172.19.0.1/30'],
-          'autoRoute': true,
-          'strictRoute': true,
+          'autoRoute': !externalRouteManager,
+          'strictRoute': !externalRouteManager,
           'stack': tunStack,
         },
         'sniffing': {
@@ -440,10 +445,7 @@ String generateAndroidXrayConfig(
         'listen': '127.0.0.1',
         'port': 10808,
         'protocol': 'socks',
-        'settings': {
-          'auth': 'noauth',
-          'udp': true,
-        },
+        'settings': {'auth': 'noauth', 'udp': true},
         'sniffing': {
           'enabled': true,
           'destOverride': ['http', 'tls', 'quic'],

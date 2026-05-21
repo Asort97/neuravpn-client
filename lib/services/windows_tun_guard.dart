@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:flutter/services.dart';
+
 typedef TunProcessRunner =
     Future<ProcessResult> Function(String executable, List<String> arguments);
 
@@ -95,6 +97,9 @@ class WindowsTunGuard {
   static const String defaultInboundTag = 'tun-in';
   static const String defaultInterfaceName = 'wintun0';
   static const List<String> _defaultAddresses = ['172.19.0.1/30'];
+  static const MethodChannel _windowsRouteChannel = MethodChannel(
+    'happycat.vpn/windows_route',
+  );
 
   final Duration removalTimeout;
   final Duration pollInterval;
@@ -107,6 +112,7 @@ class WindowsTunGuard {
   final int Function(int max) _randomInt;
   final void Function(String category)? _processLaunchRecorder;
   int _sessionCounter = 0;
+  bool _knownElevated = false;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
 
@@ -125,7 +131,7 @@ class WindowsTunGuard {
     }
 
     final logs = <String>[];
-    if (!await _isElevated()) {
+    if (!await _isElevatedCached()) {
       logs.add('Administrator privileges are required to manage TUN adapters.');
       return TunSessionPlan(
         success: false,
@@ -178,6 +184,8 @@ class WindowsTunGuard {
       discoveredAdapters: discovered,
     );
   }
+
+  Future<bool> warmupElevationCheck() => _isElevatedCached();
 
   Future<TunCleanupResult> cleanupAdapter(String? interfaceName) async {
     if (!_isWindows || interfaceName == null || interfaceName.isEmpty) {
@@ -390,11 +398,30 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
   }
 
   Future<String> _readAdapterStatus(String name) async {
+    final native = await _readAdapterStatusNative(name);
+    if (native != null) {
+      return native;
+    }
     final command =
         "Get-NetAdapter -Name '${_escapePs(name)}' -IncludeHidden -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status";
     final result = await _runPowerShell(command, null);
     if (result.stdout == null) return '';
     return result.stdout.toString().trim().toLowerCase();
+  }
+
+  Future<String?> _readAdapterStatusNative(String name) async {
+    try {
+      final result = await _windowsRouteChannel.invokeMethod<String>(
+        'adapterStatus',
+        {'name': name},
+      );
+      final normalized = result?.trim().toLowerCase();
+      return normalized == null || normalized.isEmpty ? null : normalized;
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
   }
 
   Future<bool> _removeAdapterPipeline(
@@ -473,6 +500,10 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     if (_elevationChecker != null) {
       return _elevationChecker.call();
     }
+    final native = await _isElevatedNative();
+    if (native != null) {
+      return native;
+    }
     try {
       _processLaunchRecorder?.call('powershell');
       final result = await _processRunner('powershell', [
@@ -485,6 +516,30 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     } catch (_) {
       return false;
     }
+  }
+
+  Future<bool?> _isElevatedNative() async {
+    try {
+      final result = await _windowsRouteChannel.invokeMethod<bool>(
+        'isElevated',
+      );
+      return result;
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  Future<bool> _isElevatedCached() async {
+    if (_knownElevated) {
+      return true;
+    }
+    final elevated = await _isElevated();
+    if (elevated) {
+      _knownElevated = true;
+    }
+    return elevated;
   }
 
   Future<ProcessResult> _runNetsh(List<String> args, List<String>? logs) async {

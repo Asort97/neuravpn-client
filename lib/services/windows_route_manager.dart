@@ -1,5 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:flutter/services.dart';
 
 typedef WindowsRouteProcessRunner =
     Future<ProcessResult> Function(String executable, List<String> arguments);
@@ -54,18 +57,187 @@ class WindowsRouteApplyResult {
   final List<String> logs;
 }
 
+class WindowsRouteNativeApplyResult {
+  const WindowsRouteNativeApplyResult({
+    required this.supported,
+    this.session,
+    this.error,
+  });
+
+  const WindowsRouteNativeApplyResult.unsupported()
+    : supported = false,
+      session = null,
+      error = null;
+
+  final bool supported;
+  final WindowsRouteSession? session;
+  final String? error;
+}
+
+abstract class WindowsRouteNativeApi {
+  Future<WindowsRouteUplink?> discoverPrimaryUplink();
+
+  Future<WindowsRouteNativeApplyResult> applyRoutes({
+    required String preferredTunInterface,
+    required String tunAddress,
+    required int tunPrefixLength,
+    required WindowsRouteUplink uplink,
+    required List<String> protectedPrefixes,
+  });
+}
+
+class MethodChannelWindowsRouteNativeApi implements WindowsRouteNativeApi {
+  static const MethodChannel _channel = MethodChannel(
+    'happycat.vpn/windows_route',
+  );
+
+  const MethodChannelWindowsRouteNativeApi();
+
+  @override
+  Future<WindowsRouteUplink?> discoverPrimaryUplink() async {
+    try {
+      final raw = await _channel.invokeMethod<Object?>('discoverPrimaryUplink');
+      final map = _asMap(raw);
+      if (map == null || !_isSuccess(map)) {
+        return null;
+      }
+      return _uplinkFromMap(map);
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  @override
+  Future<WindowsRouteNativeApplyResult> applyRoutes({
+    required String preferredTunInterface,
+    required String tunAddress,
+    required int tunPrefixLength,
+    required WindowsRouteUplink uplink,
+    required List<String> protectedPrefixes,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Object?>('applyRoutes', {
+        'preferredTunInterface': preferredTunInterface,
+        'tunAddress': tunAddress,
+        'tunPrefixLength': tunPrefixLength,
+        'uplinkInterfaceIndex': uplink.interfaceIndex,
+        'uplinkGateway': uplink.gateway,
+        'protectedPrefixes': protectedPrefixes,
+      });
+      final map = _asMap(raw);
+      if (map == null) {
+        return const WindowsRouteNativeApplyResult.unsupported();
+      }
+      if (!_isSuccess(map)) {
+        return WindowsRouteNativeApplyResult(
+          supported: true,
+          error: _stringValue(map, 'error'),
+        );
+      }
+      final tunName = _stringValue(map, 'tunInterfaceName');
+      final tunAddressResult = _stringValue(map, 'tunAddress');
+      final tunIndex = _intValue(map, 'tunInterfaceIndex');
+      if (tunName == null ||
+          tunName.isEmpty ||
+          tunAddressResult == null ||
+          tunAddressResult.isEmpty ||
+          tunIndex == null) {
+        return const WindowsRouteNativeApplyResult(
+          supported: true,
+          error: 'native_route_parse_failed',
+        );
+      }
+      return WindowsRouteNativeApplyResult(
+        supported: true,
+        session: WindowsRouteSession(
+          tunInterfaceName: tunName,
+          tunInterfaceIndex: tunIndex,
+          tunAddress: tunAddressResult,
+          uplinkInterfaceName: uplink.interfaceName,
+          uplinkInterfaceIndex: uplink.interfaceIndex,
+          uplinkGateway: uplink.gateway,
+          uplinkAddress: uplink.localAddress,
+          protectedPrefixes: protectedPrefixes,
+        ),
+      );
+    } on MissingPluginException {
+      return const WindowsRouteNativeApplyResult.unsupported();
+    } on PlatformException catch (e) {
+      return WindowsRouteNativeApplyResult(
+        supported: true,
+        error: e.message ?? e.code,
+      );
+    }
+  }
+
+  static Map<Object?, Object?>? _asMap(Object? raw) {
+    if (raw is Map<Object?, Object?>) {
+      return raw;
+    }
+    if (raw is Map) {
+      return raw.cast<Object?, Object?>();
+    }
+    return null;
+  }
+
+  static bool _isSuccess(Map<Object?, Object?> map) {
+    final raw = map['success'];
+    return raw == true || raw?.toString().toLowerCase() == 'true';
+  }
+
+  static WindowsRouteUplink? _uplinkFromMap(Map<Object?, Object?> map) {
+    final interfaceName = _stringValue(map, 'interfaceName');
+    final interfaceIndex = _intValue(map, 'interfaceIndex');
+    final gateway = _stringValue(map, 'gateway');
+    final localAddress = _stringValue(map, 'localAddress');
+    if (interfaceName == null ||
+        interfaceName.isEmpty ||
+        interfaceIndex == null ||
+        gateway == null ||
+        gateway.isEmpty ||
+        localAddress == null ||
+        localAddress.isEmpty) {
+      return null;
+    }
+    return WindowsRouteUplink(
+      interfaceName: interfaceName,
+      interfaceIndex: interfaceIndex,
+      gateway: gateway,
+      localAddress: localAddress,
+    );
+  }
+
+  static String? _stringValue(Map<Object?, Object?> map, String key) {
+    final raw = map[key];
+    return raw?.toString();
+  }
+
+  static int? _intValue(Map<Object?, Object?> map, String key) {
+    final raw = map[key];
+    if (raw is int) {
+      return raw;
+    }
+    return int.tryParse('${raw ?? ''}');
+  }
+}
+
 class WindowsRouteManager {
   WindowsRouteManager({
     WindowsRouteProcessRunner? processRunner,
     bool? isWindowsOverride,
     void Function(String category)? processLaunchRecorder,
+    WindowsRouteNativeApi? nativeApi,
   }) : _processRunner = processRunner ?? _defaultProcessRunner,
        _isWindowsOverride = isWindowsOverride,
-       _processLaunchRecorder = processLaunchRecorder;
+       _processLaunchRecorder = processLaunchRecorder,
+       _nativeApi = nativeApi ?? const MethodChannelWindowsRouteNativeApi();
 
   final WindowsRouteProcessRunner _processRunner;
   final bool? _isWindowsOverride;
   final void Function(String category)? _processLaunchRecorder;
+  final WindowsRouteNativeApi _nativeApi;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
 
@@ -74,6 +246,15 @@ class WindowsRouteManager {
   }) async {
     if (!_isWindows) return null;
     final sink = logs ?? <String>[];
+    final native = await _nativeApi.discoverPrimaryUplink();
+    if (native != null) {
+      sink.add(
+        'Selected uplink route (native): ${native.interfaceName} via '
+        '${native.gateway} (ifIndex=${native.interfaceIndex}, '
+        'ip=${native.localAddress})',
+      );
+      return native;
+    }
     return _findPrimaryDefaultRoute(sink);
   }
 
@@ -90,26 +271,12 @@ class WindowsRouteManager {
 
     final logs = <String>[];
 
-    final tun = await _findTunInterface(preferredTunInterface, logs);
-    if (tun == null) {
-      return WindowsRouteApplyResult(
-        success: false,
-        error: 'Не удалось найти активный TUN интерфейс xray',
-        logs: logs,
-      );
-    }
-
     final hintedTunAddress = _normalizeTunAddressHint(tunAddressHint);
+    final hintedTunPrefixLength = _parseTunPrefixLength(tunAddressHint) ?? 30;
     if (hintedTunAddress != null) {
-      logs.add('Using provided TUN IPv4 address: $hintedTunAddress');
-    }
-    final tunAddress =
-        hintedTunAddress ?? await _findTunAddress(tun.interfaceIndex, logs);
-    if (tunAddress == null) {
-      return WindowsRouteApplyResult(
-        success: false,
-        error: 'Не удалось определить IPv4 адрес TUN интерфейса ${tun.name}',
-        logs: logs,
+      logs.add(
+        'Using provided TUN IPv4 address: '
+        '$hintedTunAddress/$hintedTunPrefixLength',
       );
     }
 
@@ -128,12 +295,91 @@ class WindowsRouteManager {
       logs: logs,
     );
 
+    final nativeBatch = await _applyRouteBatchNative(
+      preferredTunInterface: preferredTunInterface,
+      tunAddress: hintedTunAddress,
+      tunPrefixLength: hintedTunPrefixLength,
+      uplink: selectedUplink,
+      protectedPrefixes: protectedPrefixes,
+      logs: logs,
+    );
+    if (nativeBatch.session != null) {
+      return WindowsRouteApplyResult(
+        success: true,
+        session: nativeBatch.session,
+        logs: logs,
+      );
+    }
+
+    final fastBatch = await _applyRouteBatchFast(
+      preferredTunInterface: preferredTunInterface,
+      tunAddressHint: hintedTunAddress,
+      tunPrefixLength: hintedTunPrefixLength,
+      uplink: selectedUplink,
+      protectedPrefixes: protectedPrefixes,
+      logs: logs,
+    );
+    if (fastBatch.session != null) {
+      return WindowsRouteApplyResult(
+        success: true,
+        session: fastBatch.session,
+        logs: logs,
+      );
+    }
+    if (!fastBatch.canFallback) {
+      return WindowsRouteApplyResult(
+        success: false,
+        error:
+            fastBatch.error ?? 'Не удалось направить default route через TUN',
+        logs: logs,
+      );
+    }
+
+    logs.add('Fast route setup failed; falling back to legacy route pipeline.');
+    return _applyRoutesLegacy(
+      preferredTunInterface: preferredTunInterface,
+      hintedTunAddress: hintedTunAddress,
+      hintedTunPrefixLength: hintedTunPrefixLength,
+      selectedUplink: selectedUplink,
+      protectedPrefixes: protectedPrefixes,
+      logs: logs,
+    );
+  }
+
+  Future<WindowsRouteApplyResult> _applyRoutesLegacy({
+    required String preferredTunInterface,
+    required String? hintedTunAddress,
+    required int hintedTunPrefixLength,
+    required WindowsRouteUplink selectedUplink,
+    required List<String> protectedPrefixes,
+    required List<String> logs,
+  }) async {
+    final tun = await _findTunInterface(preferredTunInterface, logs);
+    if (tun == null) {
+      return WindowsRouteApplyResult(
+        success: false,
+        error: 'Не удалось найти активный TUN интерфейс xray',
+        logs: logs,
+      );
+    }
+
+    final tunAddress =
+        hintedTunAddress ?? await _findTunAddress(tun.interfaceIndex, logs);
+    if (tunAddress == null) {
+      return WindowsRouteApplyResult(
+        success: false,
+        error: 'Не удалось определить IPv4 адрес TUN интерфейса ${tun.name}',
+        logs: logs,
+      );
+    }
+
     final applyOk = await _applyRouteBatch(
       protectedPrefixes: protectedPrefixes,
       uplinkInterfaceIndex: selectedUplink.interfaceIndex,
       uplinkGateway: selectedUplink.gateway,
       tunInterfaceIndex: tun.interfaceIndex,
       tunAddress: tunAddress,
+      tunPrefixLength: hintedTunPrefixLength,
       logs: logs,
     );
     if (!applyOk) {
@@ -158,6 +404,37 @@ class WindowsRouteManager {
       ),
       logs: logs,
     );
+  }
+
+  Future<WindowsRouteNativeApplyResult> _applyRouteBatchNative({
+    required String preferredTunInterface,
+    required String? tunAddress,
+    required int tunPrefixLength,
+    required WindowsRouteUplink uplink,
+    required List<String> protectedPrefixes,
+    required List<String> logs,
+  }) async {
+    if (tunAddress == null) {
+      return const WindowsRouteNativeApplyResult.unsupported();
+    }
+    final result = await _nativeApi.applyRoutes(
+      preferredTunInterface: preferredTunInterface,
+      tunAddress: tunAddress,
+      tunPrefixLength: tunPrefixLength,
+      uplink: uplink,
+      protectedPrefixes: protectedPrefixes,
+    );
+    if (result.session != null) {
+      logs.add(
+        'Route batch applied natively through '
+        '${result.session!.tunInterfaceName}',
+      );
+      return result;
+    }
+    if (result.supported && result.error != null) {
+      logs.add('Native route setup failed: ${result.error}');
+    }
+    return result;
   }
 
   Future<void> cleanupSession(
@@ -225,6 +502,15 @@ if (-not \$items) { exit 0 }
     return _looksLikeIpv4(address) ? address : null;
   }
 
+  int? _parseTunPrefixLength(String? value) {
+    if (value == null) return null;
+    final parts = value.trim().split('/');
+    if (parts.length < 2) return null;
+    final prefix = int.tryParse(parts[1].trim());
+    if (prefix == null || prefix < 1 || prefix > 32) return null;
+    return prefix;
+  }
+
   Future<WindowsRouteUplink?> _findPrimaryDefaultRoute(
     List<String> logs,
   ) async {
@@ -287,12 +573,16 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
       prefixes.add(remoteHost);
     } else {
       try {
-        final resolved = await InternetAddress.lookup(remoteHost);
+        final resolved = await InternetAddress.lookup(
+          remoteHost,
+        ).timeout(const Duration(milliseconds: 900));
         for (final address in resolved) {
           if (address.type == InternetAddressType.IPv4) {
             prefixes.add(address.address);
           }
         }
+      } on TimeoutException {
+        logs.add('Remote host resolve timed out for $remoteHost');
       } catch (e) {
         logs.add('Remote host resolve failed for $remoteHost: $e');
       }
@@ -308,12 +598,157 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
     return result;
   }
 
+  Future<_RouteBatchResult> _applyRouteBatchFast({
+    required String preferredTunInterface,
+    required String? tunAddressHint,
+    required int tunPrefixLength,
+    required WindowsRouteUplink uplink,
+    required List<String> protectedPrefixes,
+    required List<String> logs,
+  }) async {
+    final protectedJson = jsonEncode(protectedPrefixes);
+    final escapedPreferred = _escapePs(preferredTunInterface);
+    final escapedTunAddress = _escapePs(tunAddressHint ?? '');
+    final escapedUplinkGateway = _escapePs(uplink.gateway);
+    final result = await _runPowerShell('''
+\$preferred = '$escapedPreferred'
+\$tunAddressHint = '$escapedTunAddress'
+\$tunPrefixLength = $tunPrefixLength
+\$uplinkGateway = '$escapedUplinkGateway'
+\$protected = ConvertFrom-Json @'
+$protectedJson
+'@
+try {
+  \$items = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
+    Where-Object { \$_.Name -eq \$preferred -or \$_.Name -eq 'xray0' -or \$_.Name -like 'xray*' -or \$_.Name -like 'tun-in*' -or \$_.Name -like 'wintun*' } |
+    Select-Object Name, InterfaceIndex
+  if (-not \$items) {
+    [pscustomobject]@{ Success = \$false; Error = 'tun_not_found' } | ConvertTo-Json -Compress
+    exit 0
+  }
+  \$selected = \$items |
+    Sort-Object @{ Expression = { if (\$_.Name -eq \$preferred) { 0 } elseif (\$_.Name -eq 'xray0') { 1 } elseif (\$_.Name -like 'xray*') { 2 } else { 3 } } } |
+    Select-Object -First 1
+  \$tunAddress = \$tunAddressHint
+  if (-not \$tunAddress) {
+    \$tunAddress = Get-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { \$_.IPAddress -and \$_.IPAddress -ne '0.0.0.0' } |
+      Sort-Object @{ Expression = { if (\$_.IPAddress -like '169.254.*') { 1 } else { 0 } } } |
+      Select-Object -First 1 -ExpandProperty IPAddress
+  }
+  if (-not \$tunAddress) {
+    [pscustomobject]@{ Success = \$false; Error = 'tun_address_not_found'; TunName = \$selected.Name; TunInterfaceIndex = [int]\$selected.InterfaceIndex } | ConvertTo-Json -Compress
+    exit 0
+  }
+  Set-NetIPInterface -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
+  \$existingTunIp = Get-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -IPAddress \$tunAddress -ErrorAction SilentlyContinue
+  if (-not \$existingTunIp) {
+    Get-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { \$_.IPAddress -like '169.254.*' } |
+      Remove-NetIPAddress -Confirm:\$false -ErrorAction SilentlyContinue
+    New-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -IPAddress \$tunAddress -PrefixLength \$tunPrefixLength -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  }
+  foreach (\$prefix in @(\$protected)) {
+    if (-not \$prefix) { continue }
+    Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { \$_.NextHop -eq \$uplinkGateway } |
+      Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
+    New-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -NextHop \$uplinkGateway -RouteMetric 1 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  }
+  Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
+  Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
+  Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
+  New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -NextHop '0.0.0.0' -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  [pscustomobject]@{
+    Success = \$true
+    TunName = \$selected.Name
+    TunInterfaceIndex = [int]\$selected.InterfaceIndex
+    TunAddress = \$tunAddress
+  } | ConvertTo-Json -Compress
+} catch {
+  [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } | ConvertTo-Json -Compress
+}
+''', logs);
+    if (result.exitCode != 0) {
+      return _RouteBatchResult(error: 'route_batch_failed', canFallback: true);
+    }
+
+    final parsed = _decodeJson(result.stdout);
+    if (parsed is! Map) {
+      return _RouteBatchResult(
+        error: 'route_batch_parse_failed',
+        canFallback: true,
+      );
+    }
+    final success =
+        parsed['Success'] == true ||
+        parsed['Success']?.toString().toLowerCase() == 'true';
+    if (!success) {
+      final error = parsed['Error']?.toString();
+      logs.add('Fast route setup failed: ${error ?? 'unknown error'}');
+      return _RouteBatchResult(
+        error: _routeBatchErrorMessage(error),
+        canFallback: false,
+      );
+    }
+
+    final tunName = parsed['TunName']?.toString();
+    final tunAddress = parsed['TunAddress']?.toString();
+    final tunIndex = int.tryParse('${parsed['TunInterfaceIndex'] ?? ''}');
+    if (tunName == null ||
+        tunName.isEmpty ||
+        tunAddress == null ||
+        tunAddress.isEmpty ||
+        tunIndex == null) {
+      return _RouteBatchResult(
+        error: 'route_batch_parse_failed',
+        canFallback: true,
+      );
+    }
+
+    logs.add('Selected TUN interface: $tunName (ifIndex=$tunIndex)');
+    logs.add('Selected TUN IPv4 address: $tunAddress');
+    logs.add('Route batch applied through $tunName');
+    return _RouteBatchResult(
+      session: WindowsRouteSession(
+        tunInterfaceName: tunName,
+        tunInterfaceIndex: tunIndex,
+        tunAddress: tunAddress,
+        uplinkInterfaceName: uplink.interfaceName,
+        uplinkInterfaceIndex: uplink.interfaceIndex,
+        uplinkGateway: uplink.gateway,
+        uplinkAddress: uplink.localAddress,
+        protectedPrefixes: protectedPrefixes,
+      ),
+    );
+  }
+
+  String _routeBatchErrorMessage(String? error) {
+    switch (error) {
+      case 'tun_not_found':
+        return 'Не удалось найти активный TUN интерфейс xray';
+      case 'tun_address_not_found':
+        return 'Не удалось определить IPv4 адрес TUN интерфейса';
+      case 'route_batch_parse_failed':
+        return 'Не удалось прочитать результат настройки маршрутов Windows';
+      default:
+        if (error != null && error.isNotEmpty) {
+          return 'Не удалось настроить маршруты Windows: $error';
+        }
+        return 'Не удалось настроить маршруты Windows';
+    }
+  }
+
   Future<bool> _applyRouteBatch({
     required List<String> protectedPrefixes,
     required int uplinkInterfaceIndex,
     required String uplinkGateway,
     required int tunInterfaceIndex,
     required String tunAddress,
+    required int tunPrefixLength,
     required List<String> logs,
   }) async {
     final protectedJson = jsonEncode(protectedPrefixes);
@@ -323,6 +758,14 @@ $protectedJson
 '@
 \$uplinkGateway = '${_escapePs(uplinkGateway)}'
 \$tunAddress = '${_escapePs(tunAddress)}'
+Set-NetIPInterface -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
+\$existingTunIp = Get-NetIPAddress -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -IPAddress \$tunAddress -ErrorAction SilentlyContinue
+if (-not \$existingTunIp) {
+  Get-NetIPAddress -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { \$_.IPAddress -like '169.254.*' } |
+    Remove-NetIPAddress -Confirm:\$false -ErrorAction SilentlyContinue
+  New-NetIPAddress -InterfaceIndex $tunInterfaceIndex -IPAddress \$tunAddress -PrefixLength $tunPrefixLength -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+}
 foreach (\$prefix in \$protected) {
   Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex $uplinkInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
     Where-Object { \$_.NextHop -eq \$uplinkGateway } |
@@ -335,7 +778,7 @@ Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -NextHop \$tunAddress -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -NextHop '0.0.0.0' -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 ''', logs);
     return result.exitCode == 0;
   }
@@ -358,7 +801,6 @@ foreach (\$prefix in \$protected) {
     Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 }
 Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Where-Object { \$_.NextHop -eq \$tunAddress } |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
@@ -463,4 +905,12 @@ class _TunInterface {
 
   final String name;
   final int interfaceIndex;
+}
+
+class _RouteBatchResult {
+  const _RouteBatchResult({this.session, this.error, this.canFallback = false});
+
+  final WindowsRouteSession? session;
+  final String? error;
+  final bool canFallback;
 }

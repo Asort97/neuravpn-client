@@ -27,6 +27,7 @@ class WindowsXrayCoreAdapter implements WindowsVpnCoreAdapter {
     required List<Map<String, dynamic>> extraRouteRules,
     required DpiEvasionConfig dpiEvasionConfig,
     required bool developerMode,
+    String? serverAddressOverride,
   }) {
     return generateXrayConfig(
       parsed,
@@ -42,6 +43,8 @@ class WindowsXrayCoreAdapter implements WindowsVpnCoreAdapter {
       extraRouteRules: extraRouteRules,
       apiPort: apiPort,
       logLevel: developerMode ? 'debug' : 'info',
+      serverAddressOverride: serverAddressOverride,
+      externalRouteManager: true,
     );
   }
 
