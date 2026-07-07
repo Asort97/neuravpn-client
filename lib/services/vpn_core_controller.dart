@@ -1438,6 +1438,11 @@ class VpnCoreController {
       if (_process != process) {
         return;
       }
+      final hint = _latestMeaningfulProcessLog();
+      _appendConnectionLog(
+        '[token=$token] xray-core exited code=$code'
+        '${hint == null ? '' : ' lastLog=$hint'}',
+      );
       await _teardownProcess();
       _windowsConnected = false;
       if (code == 1 && _accessDeniedDetected) {
@@ -2168,9 +2173,29 @@ if (-not \$s) { exit 0 }
     if (_recentLogs.length > 80) {
       _recentLogs.removeAt(0);
     }
-    if (isError) {
+    if (isError && !_isBenignWindowsCoreStderr(line)) {
       _lastStartError = line;
     }
+  }
+
+  bool _isBenignWindowsCoreStderr(String line) {
+    final normalized = line.toLowerCase();
+    return normalized.contains('using existing driver') ||
+        normalized.contains('creating adapter') ||
+        normalized.contains('removed orphaned adapter') ||
+        normalized.contains('failed to find matching adapter name');
+  }
+
+  String? _latestMeaningfulProcessLog() {
+    if (_lastStartError != null && _lastStartError!.isNotEmpty) {
+      return _lastStartError;
+    }
+    for (final line in _recentLogs.reversed) {
+      if (!_isBenignWindowsCoreStderr(line)) {
+        return line;
+      }
+    }
+    return _recentLogs.isNotEmpty ? _recentLogs.last : null;
   }
 
   Future<void> _cleanupSessionToken(int token, {required String reason}) async {
@@ -2261,9 +2286,7 @@ if (-not \$s) { exit 0 }
         while (DateTime.now().isBefore(deadline)) {
           final exitCode = await _tryReadEarlyExitCode(process);
           if (exitCode != null) {
-            final hint =
-                _lastStartError ??
-                (_recentLogs.isNotEmpty ? _recentLogs.last : null);
+            final hint = _latestMeaningfulProcessLog();
             final suffix = hint == null ? '' : ' ($hint)';
             _appendConnectionLog(
               'ERROR: xray-core exited early (code $exitCode)$suffix',
@@ -2289,6 +2312,12 @@ if (-not \$s) { exit 0 }
               const Duration(milliseconds: 900)) {
             lastAdapterProbe = now;
             final adapterUp = await _tunGuard.isAdapterUp(interfaceName);
+            if (_hasTunReadySignal()) {
+              _appendConnectionLog(
+                'Windows core reported TUN ready signal after adapter probe',
+              );
+              return null;
+            }
             if (adapterUp) {
               _appendConnectionLog('TUN adapter is up and ready');
               return null;
@@ -2298,9 +2327,21 @@ if (-not \$s) { exit 0 }
           await Future.delayed(const Duration(milliseconds: 80));
         }
 
-        final hint =
-            _lastStartError ??
-            (_recentLogs.isNotEmpty ? _recentLogs.last : null);
+        if (_hasTunReadySignal()) {
+          _appendConnectionLog(
+            'Windows core reported TUN ready signal at startup deadline',
+          );
+          return null;
+        }
+        final apiReady = await _isWindowsCoreApiResponsive();
+        if (apiReady) {
+          _appendConnectionLog(
+            'Windows core is ready via API at startup deadline',
+          );
+          return null;
+        }
+
+        final hint = _latestMeaningfulProcessLog();
         final suffix = hint == null ? '' : ' ($hint)';
         _appendConnectionLog('ERROR: TUN adapter did not come up$suffix');
         return 'TUN adapter did not come up$suffix';

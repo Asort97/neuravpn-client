@@ -229,15 +229,18 @@ class WindowsRouteManager {
     bool? isWindowsOverride,
     void Function(String category)? processLaunchRecorder,
     WindowsRouteNativeApi? nativeApi,
+    bool useNativeRouteApi = false,
   }) : _processRunner = processRunner ?? _defaultProcessRunner,
        _isWindowsOverride = isWindowsOverride,
        _processLaunchRecorder = processLaunchRecorder,
-       _nativeApi = nativeApi ?? const MethodChannelWindowsRouteNativeApi();
+       _nativeApi = nativeApi ?? const MethodChannelWindowsRouteNativeApi(),
+       _useNativeRouteApi = useNativeRouteApi;
 
   final WindowsRouteProcessRunner _processRunner;
   final bool? _isWindowsOverride;
   final void Function(String category)? _processLaunchRecorder;
   final WindowsRouteNativeApi _nativeApi;
+  final bool _useNativeRouteApi;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
 
@@ -246,14 +249,16 @@ class WindowsRouteManager {
   }) async {
     if (!_isWindows) return null;
     final sink = logs ?? <String>[];
-    final native = await _nativeApi.discoverPrimaryUplink();
-    if (native != null) {
-      sink.add(
-        'Selected uplink route (native): ${native.interfaceName} via '
-        '${native.gateway} (ifIndex=${native.interfaceIndex}, '
-        'ip=${native.localAddress})',
-      );
-      return native;
+    if (_useNativeRouteApi) {
+      final native = await _nativeApi.discoverPrimaryUplink();
+      if (native != null) {
+        sink.add(
+          'Selected uplink route (native): ${native.interfaceName} via '
+          '${native.gateway} (ifIndex=${native.interfaceIndex}, '
+          'ip=${native.localAddress})',
+        );
+        return native;
+      }
     }
     return _findPrimaryDefaultRoute(sink);
   }
@@ -295,20 +300,22 @@ class WindowsRouteManager {
       logs: logs,
     );
 
-    final nativeBatch = await _applyRouteBatchNative(
-      preferredTunInterface: preferredTunInterface,
-      tunAddress: hintedTunAddress,
-      tunPrefixLength: hintedTunPrefixLength,
-      uplink: selectedUplink,
-      protectedPrefixes: protectedPrefixes,
-      logs: logs,
-    );
-    if (nativeBatch.session != null) {
-      return WindowsRouteApplyResult(
-        success: true,
-        session: nativeBatch.session,
+    if (_useNativeRouteApi) {
+      final nativeBatch = await _applyRouteBatchNative(
+        preferredTunInterface: preferredTunInterface,
+        tunAddress: hintedTunAddress,
+        tunPrefixLength: hintedTunPrefixLength,
+        uplink: selectedUplink,
+        protectedPrefixes: protectedPrefixes,
         logs: logs,
       );
+      if (nativeBatch.session != null) {
+        return WindowsRouteApplyResult(
+          success: true,
+          session: nativeBatch.session,
+          logs: logs,
+        );
+      }
     }
 
     final fastBatch = await _applyRouteBatchFast(

@@ -111,6 +111,7 @@ void main() {
   test('applyRoutes prefers native batch and skips PowerShell', () async {
     final manager = WindowsRouteManager(
       nativeApi: const _SuccessfulNativeRouteApi(),
+      useNativeRouteApi: true,
       isWindowsOverride: true,
       processRunner: (executable, arguments) async {
         fail('PowerShell should not be launched when native route setup works');

@@ -20,16 +20,22 @@ class _FakeBinaryManager extends VpnCoreBinaryManager {
 }
 
 class _FakeTunGuard extends WindowsTunGuard {
-  _FakeTunGuard({required List<bool> waitForUp})
-    : _waitForUp = List<bool>.from(waitForUp),
-      super(
-        isWindowsOverride: true,
-        elevationChecker: () async => true,
-        processRunner: (executable, arguments) async =>
-            ProcessResult(1, 0, '', ''),
-      );
+  _FakeTunGuard({
+    required List<bool> waitForUp,
+    this.adapterUpDelay = Duration.zero,
+    List<bool>? adapterUp,
+  }) : _adapterUp = List<bool>.from(adapterUp ?? const <bool>[]),
+       _waitForUp = List<bool>.from(waitForUp),
+       super(
+         isWindowsOverride: true,
+         elevationChecker: () async => true,
+         processRunner: (executable, arguments) async =>
+             ProcessResult(1, 0, '', ''),
+       );
 
   final List<bool> _waitForUp;
+  final List<bool> _adapterUp;
+  final Duration adapterUpDelay;
   int prepareCalls = 0;
   final List<String> cleanupCalls = <String>[];
   final List<List<String>> bulkCleanupCalls = <List<String>>[];
@@ -78,6 +84,15 @@ class _FakeTunGuard extends WindowsTunGuard {
   Future<bool> waitForAdapterUp(String name, {Duration? timeout}) async {
     if (_waitForUp.isEmpty) return true;
     return _waitForUp.removeAt(0);
+  }
+
+  @override
+  Future<bool> isAdapterUp(String name) async {
+    if (adapterUpDelay > Duration.zero) {
+      await Future<void>.delayed(adapterUpDelay);
+    }
+    if (_adapterUp.isEmpty) return false;
+    return _adapterUp.removeAt(0);
   }
 }
 
@@ -431,6 +446,47 @@ void main() {
       await controller.disconnect();
     },
   );
+
+  test('slow adapter probe does not hide xray tun-ready signal', () async {
+    final guard = _FakeTunGuard(
+      waitForUp: const <bool>[],
+      adapterUp: const <bool>[false],
+      adapterUpDelay: const Duration(milliseconds: 3300),
+    );
+    final routeManager = _FakeWindowsRouteManager();
+    var startCount = 0;
+    final controller = VpnCoreController(
+      tunGuard: guard,
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async {
+        startCount += 1;
+        return _FakeProcess(
+          pid: 4502,
+          stdoutLines: const <String>[
+            '2026/06/30 13:58:10.344856 [Info] proxy/tun: xray0 created',
+            '2026/06/30 13:58:10.344856 [Info] proxy/tun: xray0 up',
+          ],
+          stderrLines: const <String>[
+            '2026/06/30 13:58:10.416435 Removed orphaned adapter "xray0 1"',
+          ],
+        );
+      },
+    );
+
+    final result = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+
+    expect(result.success, isTrue);
+    expect(startCount, 1);
+    expect(guard.prepareCalls, 1);
+    await controller.disconnect();
+  });
 
   test('connect uses info log level when developerMode is false', () async {
     final guard = _FakeTunGuard(waitForUp: const <bool>[true]);

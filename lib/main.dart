@@ -53,11 +53,10 @@ const MethodChannel _androidLaunchChannel = MethodChannel(
 );
 
 const Size _windowsPreferredShellSize = Size(420, 720);
+const Size _windowsMinimumShellSize = Size(360, 617);
 const Size _desktopPreferredShellSize = Size(1100, 760);
 const Size _desktopPreferredMinSize = Size(900, 640);
 const double _windowSafeMargin = 10.0;
-const double _windowsScreenWidthFraction = 0.18;
-const double _windowsScreenHeightFraction = 0.65;
 
 Size _resolveAdaptiveWindowSize({
   required Size preferredSize,
@@ -107,29 +106,42 @@ Future<Size> _resolveStartupWindowSize({
   );
 }
 
-Size _resolveWindowsFractionalWindowSize(Size workAreaSize) {
+Size _resolveWindowsShellWindowSize(Size workAreaSize) {
   if (workAreaSize.width <= 0 || workAreaSize.height <= 0) {
     return _windowsPreferredShellSize;
   }
 
-  final maxWidth = workAreaSize.width;
-  final maxHeight = workAreaSize.height;
+  final maxWidth = workAreaSize.width > _windowSafeMargin
+      ? workAreaSize.width - _windowSafeMargin
+      : workAreaSize.width;
+  final maxHeight = workAreaSize.height > _windowSafeMargin
+      ? workAreaSize.height - _windowSafeMargin
+      : workAreaSize.height;
 
   if (maxWidth <= 0 || maxHeight <= 0) {
     return _windowsPreferredShellSize;
   }
 
-  const minWidth = 220.0;
-  const minHeight = 220.0;
-  final width = (maxWidth * _windowsScreenWidthFraction).clamp(
-    minWidth,
-    maxWidth,
+  final fitScale = math.min(
+    1.0,
+    math.min(
+      maxWidth / _windowsPreferredShellSize.width,
+      maxHeight / _windowsPreferredShellSize.height,
+    ),
   );
-  final height = (maxHeight * _windowsScreenHeightFraction).clamp(
-    minHeight,
-    maxHeight,
+  final scaledSize = Size(
+    _windowsPreferredShellSize.width * fitScale,
+    _windowsPreferredShellSize.height * fitScale,
   );
-  return Size(width.toDouble(), height.toDouble());
+
+  return Size(
+    scaledSize.width
+        .clamp(math.min(_windowsMinimumShellSize.width, maxWidth), maxWidth)
+        .toDouble(),
+    scaledSize.height
+        .clamp(math.min(_windowsMinimumShellSize.height, maxHeight), maxHeight)
+        .toDouble(),
+  );
 }
 
 Future<Size> _resolveWindowsStartupWindowSize() async {
@@ -137,7 +149,40 @@ Future<Size> _resolveWindowsStartupWindowSize() async {
   if (workArea == null) {
     return _windowsPreferredShellSize;
   }
-  return _resolveWindowsFractionalWindowSize(workArea);
+  return _resolveWindowsShellWindowSize(workArea);
+}
+
+Future<void> _writeCrashReport(
+  String origin,
+  Object error,
+  StackTrace stack,
+) async {
+  try {
+    final dir = await getApplicationSupportDirectory();
+    final logDir = Directory(path.join(dir.path, 'logs'));
+    if (!await logDir.exists()) {
+      await logDir.create(recursive: true);
+    }
+    final file = File(path.join(logDir.path, 'crash.log'));
+    final stamp = DateTime.now().toIso8601String();
+    await file.writeAsString(
+      '[$stamp][$origin] $error\n$stack\n\n',
+      mode: FileMode.append,
+      flush: true,
+    );
+  } catch (_) {
+    try {
+      final file = File(
+        path.join(Directory.systemTemp.path, 'neuravpn_crash.log'),
+      );
+      final stamp = DateTime.now().toIso8601String();
+      await file.writeAsString(
+        '[$stamp][$origin] $error\n$stack\n\n',
+        mode: FileMode.append,
+        flush: true,
+      );
+    } catch (_) {}
+  }
 }
 
 @visibleForTesting
@@ -224,36 +269,59 @@ String? extractImportedVlessFromLaunchArgs(List<String> args) {
   return null;
 }
 
-Future<void> main(List<String> args) async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await initializeDateFormatting('ru_RU', null);
-  await DomainRuleNormalizer.initializeDefaultRules();
-  if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-    await windowManager.ensureInitialized();
-    final isWindowsDesktop = Platform.isWindows;
-    final startupSize = isWindowsDesktop
-        ? await _resolveWindowsStartupWindowSize()
-        : await _resolveStartupWindowSize(
-            preferredSize: _desktopPreferredShellSize,
-            minimumSize: _desktopPreferredMinSize,
-          );
-    final windowOptions = WindowOptions(
-      size: startupSize,
-      minimumSize: isWindowsDesktop ? startupSize : _desktopPreferredMinSize,
-      maximumSize: isWindowsDesktop ? startupSize : null,
-      center: true,
-      backgroundColor: Colors.transparent,
-      titleBarStyle: isWindowsDesktop
-          ? TitleBarStyle.hidden
-          : TitleBarStyle.normal,
-      title: 'neuravpn',
-    );
-    windowManager.waitUntilReadyToShow(windowOptions, () async {
-      await windowManager.show();
-      await windowManager.focus();
-    });
-  }
-  runApp(VpnApp(initialLaunchArgs: args));
+void main(List<String> args) {
+  runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      FlutterError.onError = (FlutterErrorDetails details) {
+        FlutterError.presentError(details);
+        unawaited(
+          _writeCrashReport(
+            'flutter',
+            details.exception,
+            details.stack ?? StackTrace.current,
+          ),
+        );
+      };
+      PlatformDispatcher.instance.onError = (error, stack) {
+        unawaited(_writeCrashReport('platform', error, stack));
+        return true;
+      };
+      await initializeDateFormatting('ru_RU', null);
+      await DomainRuleNormalizer.initializeDefaultRules();
+      if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
+        await windowManager.ensureInitialized();
+        final isWindowsDesktop = Platform.isWindows;
+        final startupSize = isWindowsDesktop
+            ? await _resolveWindowsStartupWindowSize()
+            : await _resolveStartupWindowSize(
+                preferredSize: _desktopPreferredShellSize,
+                minimumSize: _desktopPreferredMinSize,
+              );
+        final windowOptions = WindowOptions(
+          size: startupSize,
+          minimumSize: isWindowsDesktop
+              ? startupSize
+              : _desktopPreferredMinSize,
+          maximumSize: isWindowsDesktop ? startupSize : null,
+          center: true,
+          backgroundColor: Colors.transparent,
+          titleBarStyle: isWindowsDesktop
+              ? TitleBarStyle.hidden
+              : TitleBarStyle.normal,
+          title: 'neuravpn',
+        );
+        windowManager.waitUntilReadyToShow(windowOptions, () async {
+          await windowManager.show();
+          await windowManager.focus();
+        });
+      }
+      runApp(VpnApp(initialLaunchArgs: args));
+    },
+    (error, stack) {
+      unawaited(_writeCrashReport('zone', error, stack));
+    },
+  );
 }
 
 class VpnApp extends StatelessWidget {
@@ -267,6 +335,13 @@ class VpnApp extends StatelessWidget {
       title: 'neuravpn',
       theme: NeuraUi.buildTheme(),
       scrollBehavior: const _AppScrollBehavior(),
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        return MediaQuery(
+          data: media.copyWith(textScaler: const TextScaler.linear(1)),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
       home: VlessHomePage(initialLaunchArgs: initialLaunchArgs),
     );
   }
@@ -2516,7 +2591,7 @@ $regItems = foreach ($rp in $regPaths) {
     final displayWorkArea =
         await _resolveCurrentDisplayWorkAreaSize() ??
         await _resolvePrimaryDisplayWorkAreaSize();
-    final targetSize = _resolveWindowsFractionalWindowSize(
+    final targetSize = _resolveWindowsShellWindowSize(
       displayWorkArea ?? _windowsPreferredShellSize,
     );
     await windowManager.setSize(targetSize);
@@ -3349,49 +3424,73 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _start() async {
-    // Защита от спама - проверяем, не идёт ли уже подключение или отключение
     if (_isConnecting || _isDisconnecting) return;
 
-    if (Platform.isAndroid) {
-      await _vpnCoreController.syncRuntimeState();
-    }
+    try {
+      if (Platform.isAndroid) {
+        await _vpnCoreController.syncRuntimeState();
+      }
 
-    if (_isRunning) {
-      await _stop();
-      // Проверяем что действительно отключилось
-      await _ensureDisconnected();
-      await Future.delayed(const Duration(milliseconds: 150));
-    }
+      if (_isRunning) {
+        await _stop();
+        await _ensureDisconnected();
+        await Future.delayed(const Duration(milliseconds: 150));
+      }
 
-    setState(() {
-      _status =
-          '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
-      _isConnecting = true;
-      _logLines.clear();
-    });
-    unawaited(_updateTrayMenu());
-    _updateConnectGlowTicker();
-    _updateFrameAnimation();
-    final result = await _vpnCoreController.connect(
-      rawUri: _controller.text,
-      splitConfig: _configForConnection,
-      developerMode: _developerMode,
-      smartRouteEngine: _smartRouteEngine,
-      dpiEvasionConfig: _dpiEvasionConfig,
-      onStatus: (value) {
-        if (!mounted) return;
-        setState(() => _status = _mapStatus(value));
-        unawaited(_updateTrayMenu());
-      },
-      onLog: (line) {
-        _appendLogs([line]);
-      },
-    );
-
-    if (!result.success) {
       if (!mounted) return;
-      if (result.requiresAdmin && Platform.isWindows) {
-        _showFastSnack('Запустите приложение от имени администратора');
+      setState(() {
+        _status =
+            '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
+        _isConnecting = true;
+        _logLines.clear();
+      });
+      unawaited(_updateTrayMenu());
+      _updateConnectGlowTicker();
+      _updateFrameAnimation();
+
+      final result = await _vpnCoreController.connect(
+        rawUri: _controller.text,
+        splitConfig: _configForConnection,
+        developerMode: _developerMode,
+        smartRouteEngine: _smartRouteEngine,
+        dpiEvasionConfig: _dpiEvasionConfig,
+        onStatus: (value) {
+          if (!mounted) return;
+          setState(() => _status = _mapStatus(value));
+          unawaited(_updateTrayMenu());
+        },
+        onLog: (line) {
+          _appendLogs([line]);
+        },
+      );
+
+      if (!result.success) {
+        if (!mounted) return;
+        if (result.requiresAdmin && Platform.isWindows) {
+          _showFastSnack('Запустите приложение от имени администратора');
+          setState(() {
+            _status =
+                '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
+            _isConnecting = false;
+          });
+          unawaited(_updateTrayMenu());
+          _updateConnectGlowTicker();
+          _updateFrameAnimation();
+          _stopTrafficMonitor();
+          unawaited(_syncTrafficSamplingMode());
+          return;
+        }
+
+        final errorMsg = result.errorMessage ?? 'Ошибка подключения';
+        if (Platform.isWindows &&
+            (errorMsg.contains('TUN adapter') ||
+                errorMsg.contains('wintun') ||
+                errorMsg.toLowerCase().contains('interface'))) {
+          _showFastSnack('Ошибка сети: WinTun адаптер не готов.');
+        } else {
+          _showFastSnack(errorMsg);
+        }
+
         setState(() {
           _status =
               '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -3405,16 +3504,25 @@ $regItems = foreach ($rp in $regPaths) {
         return;
       }
 
-      final errorMsg = result.errorMessage ?? 'Ошибка подключения';
-      if (Platform.isWindows &&
-          (errorMsg.contains('TUN adapter') ||
-              errorMsg.contains('wintun') ||
-              errorMsg.toLowerCase().contains('interface'))) {
-        _showFastSnack('Ошибка сети: WinTun адаптер не готов.');
-      } else {
-        _showFastSnack(errorMsg);
+      await _saveUri();
+      if (!mounted) return;
+      setState(() {
+        _status =
+            '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
+        _isConnecting = false;
+      });
+      unawaited(_updateTrayMenu());
+      _updateConnectGlowTicker();
+      _updateFrameAnimation();
+      _startTrafficMonitor();
+      unawaited(_syncTrafficSamplingMode());
+      unawaited(_applyDpiEvasionInjector());
+      if (_smartRouting) {
+        unawaited(_refreshMetrics(silent: true));
       }
-
+    } catch (error, stack) {
+      unawaited(_writeCrashReport('connect', error, stack));
+      if (!mounted) return;
       setState(() {
         _status =
             '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -3425,23 +3533,7 @@ $regItems = foreach ($rp in $regPaths) {
       _updateFrameAnimation();
       _stopTrafficMonitor();
       unawaited(_syncTrafficSamplingMode());
-      return;
-    }
-
-    await _saveUri();
-    if (!mounted) return;
-    setState(() {
-      _status = '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
-      _isConnecting = false;
-    });
-    unawaited(_updateTrayMenu());
-    _updateConnectGlowTicker();
-    _updateFrameAnimation();
-    _startTrafficMonitor();
-    unawaited(_syncTrafficSamplingMode());
-    unawaited(_applyDpiEvasionInjector());
-    if (_smartRouting) {
-      unawaited(_refreshMetrics(silent: true));
+      _showFastSnack('Не удалось подключиться. Попробуйте ещё раз.');
     }
   }
 
@@ -4399,8 +4491,6 @@ $regItems = foreach ($rp in $regPaths) {
         _buildWindowsConnectionModule(),
         const SizedBox(height: 16),
         _buildWindowsProfilesModule(),
-        const SizedBox(height: 16),
-        _buildWindowsSmartRoutingModule(),
       ],
     );
   }
@@ -4913,10 +5003,6 @@ $regItems = foreach ($rp in $regPaths) {
     final pingLabel = _pingInProgress
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
-    final link = _currentLink;
-    final protocolLabel = link == null
-        ? 'VLESS'
-        : 'VLESS / ${(link.type ?? 'tcp').toUpperCase()}';
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
     final throughputLabel =
         'IN ${_formatThroughput(_latestDownlinkBps)}  •  OUT ${_formatThroughput(_latestUplinkBps)}';
@@ -4982,48 +5068,61 @@ $regItems = foreach ($rp in $regPaths) {
           Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Row(
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: statusColor,
-                      shape: BoxShape.circle,
-                      boxShadow: [
-                        if (isRunning)
-                          BoxShadow(
-                            color: _neuraRed.withOpacity(0.6),
-                            blurRadius: 12,
-                          ),
-                      ],
-                    ),
-                  ),
-                  const Spacer(),
-                  AnimatedSwitcher(
-                    duration: NeuraUi.fast,
-                    switchInCurve: NeuraUi.curve,
-                    switchOutCurve: Curves.easeInCubic,
-                    transitionBuilder: (child, animation) {
-                      return FadeTransition(
-                        opacity: animation,
-                        child: SlideTransition(
-                          position: Tween<Offset>(
-                            begin: const Offset(0, 0.08),
-                            end: Offset.zero,
-                          ).animate(animation),
-                          child: child,
+              SizedBox(
+                height: 24,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          color: statusColor,
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            if (isRunning)
+                              BoxShadow(
+                                color: _neuraRed.withOpacity(0.6),
+                                blurRadius: 12,
+                              ),
+                          ],
                         ),
-                      );
-                    },
-                    child: Text(
-                      statusText,
-                      key: ValueKey(statusText),
-                      style: const TextStyle(color: Colors.white70),
+                      ),
                     ),
-                  ),
-                  const Spacer(),
-                ],
+                    AnimatedSwitcher(
+                      duration: NeuraUi.fast,
+                      switchInCurve: NeuraUi.curve,
+                      switchOutCurve: Curves.easeInCubic,
+                      transitionBuilder: (child, animation) {
+                        return FadeTransition(
+                          opacity: animation,
+                          child: SlideTransition(
+                            position: Tween<Offset>(
+                              begin: const Offset(0, 0.08),
+                              end: Offset.zero,
+                            ).animate(animation),
+                            child: child,
+                          ),
+                        );
+                      },
+                      child: Text(
+                        statusText,
+                        key: ValueKey(statusText),
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                    ),
+                    if (isEnabled)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: _buildWindowsPingIndicator(
+                          pingLabel: pingLabel,
+                          canRefresh: canRefreshMetrics,
+                        ),
+                      ),
+                  ],
+                ),
               ),
               const SizedBox(height: 20),
               Center(
@@ -5333,116 +5432,111 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
               ),
-              if (isRunning) ...[
-                const SizedBox(height: 20),
-                Row(
-                  children: [
-                    Expanded(
-                      child: _neuraCard(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                const Icon(
-                                  Icons.bolt,
-                                  size: 16,
-                                  color: _neuraRed,
-                                ),
-                                const SizedBox(width: 6),
-                                Flexible(
-                                  child: Text(
-                                    'Задержка',
-                                    style: TextStyle(color: Colors.white54),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(width: 4),
-                                SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: IconButton(
-                                    tooltip: 'Обновить задержку',
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(),
-                                    iconSize: 16,
-                                    icon: const Icon(Icons.refresh),
-                                    color: Colors.white54,
-                                    onPressed: canRefreshMetrics
-                                        ? _refreshMetrics
-                                        : null,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            AnimatedSwitcher(
-                              duration: NeuraUi.fast,
-                              switchInCurve: NeuraUi.curve,
-                              switchOutCurve: Curves.easeInCubic,
-                              transitionBuilder: (child, animation) =>
-                                  FadeTransition(
-                                    opacity: animation,
-                                    child: child,
-                                  ),
-                              child: Text(
-                                pingLabel,
-                                key: ValueKey(pingLabel),
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: _neuraCard(
-                        padding: const EdgeInsets.all(14),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: const [
-                                Icon(
-                                  Icons.shield_outlined,
-                                  size: 16,
-                                  color: _neuraRed,
-                                ),
-                                SizedBox(width: 6),
-                                Text(
-                                  'Протокол',
-                                  style: TextStyle(color: Colors.white54),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            AnimatedSwitcher(
-                              duration: NeuraUi.fast,
-                              switchInCurve: NeuraUi.curve,
-                              switchOutCurve: Curves.easeInCubic,
-                              transitionBuilder: (child, animation) =>
-                                  FadeTransition(
-                                    opacity: animation,
-                                    child: child,
-                                  ),
-                              child: Text(
-                                protocolLabel,
-                                key: ValueKey(protocolLabel),
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+              const SizedBox(height: 18),
+              _buildWindowsInlineSmartRoutingToggle(),
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildWindowsPingIndicator({
+    required String pingLabel,
+    required bool canRefresh,
+  }) {
+    final tooltip = _pingInProgress
+        ? 'Проверяем задержку'
+        : canRefresh
+        ? 'Обновить задержку'
+        : 'Задержка';
+
+    return Tooltip(
+      message: tooltip,
+      child: Semantics(
+        button: canRefresh,
+        label: 'Задержка $pingLabel',
+        child: InkWell(
+          borderRadius: BorderRadius.circular(10),
+          mouseCursor: canRefresh
+              ? SystemMouseCursors.click
+              : SystemMouseCursors.basic,
+          onTap: canRefresh ? _refreshMetrics : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 4),
+            child: AnimatedSwitcher(
+              duration: NeuraUi.fast,
+              switchInCurve: NeuraUi.curve,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) =>
+                  FadeTransition(opacity: animation, child: child),
+              child: Text(
+                pingLabel,
+                key: ValueKey(pingLabel),
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.52),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWindowsInlineSmartRoutingToggle() {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: _neuraSurface.withOpacity(0.56),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.07)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 7, 8, 7),
+        child: Row(
+          children: [
+            Container(
+              width: 28,
+              height: 28,
+              decoration: BoxDecoration(
+                color: _neuraRed.withOpacity(_smartRouting ? 0.14 : 0.07),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Icon(
+                Icons.route_outlined,
+                color: _smartRouting ? _neuraRed : Colors.white54,
+                size: 15,
+              ),
+            ),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Умная маршрутизация',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 44,
+              height: 28,
+              child: FittedBox(
+                fit: BoxFit.contain,
+                child: Switch.adaptive(
+                  value: _smartRouting,
+                  activeColor: _neuraRed,
+                  onChanged: (value) => _setSmartRouting(value),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -5500,71 +5594,6 @@ $regItems = foreach ($rp in $regPaths) {
                 _removeProfileByName(profile.name);
               },
             ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWindowsSmartRoutingModule() {
-    return _neuraCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                width: 36,
-                height: 36,
-                decoration: BoxDecoration(
-                  color: _neuraSurface,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white.withOpacity(0.08)),
-                ),
-                child: const Icon(Icons.psychology, color: _neuraRed),
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'Умная маршрутизация',
-                  style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-              IconButton(
-                tooltip: 'Что это?',
-                icon: const Icon(Icons.help_outline, color: Colors.white70),
-                onPressed: () {
-                  showNeuraDialog(
-                    context: context,
-                    builder: (ctx) => NeuraOverlayDialog(
-                      title: const Text('Умная маршрутизация'),
-                      actions: [
-                        FilledButton(
-                          onPressed: () => Navigator.of(ctx).pop(),
-                          child: const Text('Понятно'),
-                        ),
-                      ],
-                      child: Text(
-                        'Некоторые сайты, где VPN не нужен, открываются без него.\n'
-                        'А сайты, которым нужен VPN, идут через него.',
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.75),
-                          height: 1.35,
-                        ),
-                      ),
-                    ),
-                  );
-                },
-              ),
-              Switch.adaptive(
-                value: _smartRouting,
-                activeColor: _neuraRed,
-                onChanged: (value) => _setSmartRouting(value),
-              ),
-            ],
           ),
         ],
       ),
