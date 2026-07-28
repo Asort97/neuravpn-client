@@ -25,6 +25,10 @@ void main() {
     expect(config['api'], isNotNull);
     expect(config['stats'], isNotNull);
     expect((config['outbounds'] as List).isNotEmpty, isTrue);
+    final dns = config['dns'] as Map<String, dynamic>;
+    expect(dns['servers'], <String>['9.9.9.9', '149.112.112.112']);
+    expect(jsonEncode(dns), isNot(contains('8.8.8.8')));
+    expect(jsonEncode(dns), isNot(contains('1.1.1.1')));
   });
 
   test('adds anti-loop guard rule for link-local UDP broadcast traffic', () {

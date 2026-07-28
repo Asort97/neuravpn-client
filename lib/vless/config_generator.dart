@@ -372,7 +372,9 @@ String generateXrayConfig(
       },
     },
     'dns': {
-      'servers': ['8.8.8.8', '1.1.1.1'],
+      // Quad9 stays inside the TUN default route on Windows. The VPN endpoint
+      // itself is pre-resolved and is the only host route kept on the uplink.
+      'servers': ['9.9.9.9', '149.112.112.112'],
       'queryStrategy': 'UseIPv4',
     },
     'inbounds': [

@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import '../models/split_tunnel_config.dart';
 import 'android_vpn_controller.dart';
 import 'vpn_core_binary_manager.dart';
+import 'windows_dns_manager.dart';
 import 'windows_tun_guard.dart';
 import 'windows_vpn_core.dart';
 import 'windows_xray_core.dart';
@@ -70,6 +71,7 @@ class VpnCoreController {
     AndroidVpnController? androidController,
     WindowsVpnCoreAdapter? windowsCoreAdapter,
     WindowsRouteManager? windowsRouteManager,
+    WindowsDnsManager? windowsDnsManager,
     VpnCoreProcessStarter? processStarter,
     VpnCoreProcessRunner? processRunner,
     bool? isWindowsOverride,
@@ -94,6 +96,14 @@ class VpnCoreController {
           processRunner: _processRunner,
           processLaunchRecorder: _recordProcessLaunch,
         );
+    _windowsDnsManager =
+        windowsDnsManager ??
+        WindowsDnsManager(
+          processRunner: _processRunner,
+          // Platform overrides are used by unit tests. DNS lifecycle tests
+          // inject their own manager instead of touching the host OS.
+          isWindowsOverride: isWindowsOverride == null ? null : false,
+        );
   }
 
   late final WintunManager _wintunManager;
@@ -102,6 +112,7 @@ class VpnCoreController {
   late final AndroidVpnController _androidController;
   late final WindowsVpnCoreAdapter _windowsCoreAdapter;
   late final WindowsRouteManager _windowsRouteManager;
+  late final WindowsDnsManager _windowsDnsManager;
   late final VpnCoreProcessStarter _processStarter;
   late final VpnCoreProcessRunner _processRunner;
   final bool? _isWindowsOverride;
@@ -157,10 +168,13 @@ class VpnCoreController {
   WindowsRouteSession? _activeWindowsRouteSession;
   final Map<int, WindowsRouteSession> _sessionRoutePlans =
       <int, WindowsRouteSession>{};
+  final Set<int> _sessionDnsTokens = <int>{};
   WindowsRouteUplink? _cachedWindowsUplink;
   String? _cachedWindowsExecutablePath;
   Future<void>? _windowsPrewarmFuture;
   bool _windowsRuntimePrepared = false;
+  bool _windowsDnsRecoveryChecked = false;
+  String? _windowsDnsRecoveryError;
   bool _pendingAggressiveRecovery = false;
   final _WindowsRuntimeSessionStore _sessionStore =
       const _WindowsRuntimeSessionStore();
@@ -297,6 +311,26 @@ class VpnCoreController {
     bool force = false,
   }) async {
     if (!_isWindows) return;
+    if (!_windowsDnsRecoveryChecked || force) {
+      final dnsRecovery = await _windowsDnsManager.recover();
+      _windowsDnsRecoveryChecked = true;
+      _windowsDnsRecoveryError = dnsRecovery.success
+          ? null
+          : dnsRecovery.error ?? 'dns_recovery_failed';
+      for (final line in dnsRecovery.logs) {
+        onLog?.call(line);
+        _logSink?.call(line);
+        _appendConnectionLog(line);
+      }
+      if (!dnsRecovery.success) {
+        final line =
+            '[recovery] Windows DNS restore failed: '
+            '${dnsRecovery.error ?? 'unknown'}';
+        onLog?.call(line);
+        _logSink?.call(line);
+        _appendConnectionLog(line);
+      }
+    }
     if (_windowsRuntimePrepared && !force) {
       unawaited(_startWindowsRuntimePrewarm(onLog: onLog));
       return;
@@ -506,6 +540,13 @@ class VpnCoreController {
 
     if (_isWindows) {
       await prepareWindowsRuntime(onLog: onLog);
+      if (_windowsDnsRecoveryError != null) {
+        return VpnCoreStartResult.failure(
+          'Не удалось восстановить DNS после предыдущей сессии: '
+          '$_windowsDnsRecoveryError',
+          requiresAdmin: true,
+        );
+      }
       if (!_isConnectionOperationCurrent(connectionOperation)) {
         return _cancelledConnectResult();
       }
@@ -729,6 +770,7 @@ class VpnCoreController {
       }
     }
     final environment = Map<String, String>.from(Platform.environment);
+    final useSecureWindowsDns = splitConfig.mode != 'whitelist';
     String? lastError;
 
     for (
@@ -843,6 +885,23 @@ class VpnCoreController {
           '${endpoint.serverAddressOverride} for ${parsed.host}',
         );
       }
+      if (useSecureWindowsDns) {
+        final dnsPrepare = await _measureConnectPhase(
+          'dns_backup',
+          () => _windowsDnsManager.prepare(
+            uplinkInterfaceIndex: uplink.interfaceIndex,
+          ),
+        );
+        _emitLogs(dnsPrepare.logs);
+        if (!dnsPrepare.success) {
+          lastError =
+              'Не удалось сохранить исходные DNS-настройки Windows: '
+              '${dnsPrepare.error ?? 'unknown'}';
+          await _cleanupSessionToken(token, reason: 'dns-backup-failed');
+          return VpnCoreStartResult.failure(lastError, requiresAdmin: true);
+        }
+        _sessionDnsTokens.add(token);
+      }
       _notifyStatus('Генерация конфига');
       final jsonConfig = _buildConfigJson(
         parsed: parsed,
@@ -928,7 +987,6 @@ class VpnCoreController {
             () => _windowsRouteManager.applyRoutes(
               preferredTunInterface: _activeInterfaceName ?? plan.interfaceName,
               remoteHost: endpoint.routeHost,
-              dnsServers: const <String>['8.8.8.8', '1.1.1.1'],
               tunAddressHint: plan.addresses.isEmpty
                   ? null
                   : plan.addresses.first,
@@ -960,6 +1018,29 @@ class VpnCoreController {
           }
           _activeWindowsRouteSession = routeResult.session;
           _sessionRoutePlans[token] = routeResult.session!;
+          if (useSecureWindowsDns) {
+            final dnsApply = await _measureConnectPhase(
+              'dns_apply',
+              () => _windowsDnsManager.apply(
+                uplinkInterfaceIndex: uplink.interfaceIndex,
+                tunInterfaceIndex: routeResult.session!.tunInterfaceIndex,
+              ),
+            );
+            _emitLogs(dnsApply.logs);
+            if (!dnsApply.success) {
+              final dnsError =
+                  'Не удалось включить защищённый DNS: '
+                  '${dnsApply.error ?? 'unknown'}';
+              _appendConnectionLog(
+                '[token=$token] secure DNS setup failed: $dnsError',
+              );
+              await _forceStopProcess(process);
+              await _teardownProcess();
+              _cachedWindowsUplink = null;
+              await _cleanupSessionToken(token, reason: 'dns-apply-failed');
+              return VpnCoreStartResult.failure(dnsError, requiresAdmin: true);
+            }
+          }
           // Xray can choose a runtime adapter name (usually xray0) that is
           // different from the requested session name. Keep the runtime name
           // for cleanup and adapter statistics, while retaining inboundTag.
@@ -1444,6 +1525,10 @@ class VpnCoreController {
       }
       _activeInterfaceName = null;
     }
+    if (_isWindows) {
+      final dnsRestore = await _windowsDnsManager.restore();
+      _emitLogs(dnsRestore.logs);
+    }
     _cachedWindowsUplink = null;
     await _sessionStore.clear();
     await _flushConnectionLog(force: true);
@@ -1503,6 +1588,10 @@ class VpnCoreController {
         _emitLogs(cleanup.logs);
       }
       _activeInterfaceName = null;
+    }
+    if (_isWindows) {
+      final dnsRestore = await _windowsDnsManager.restore();
+      _emitLogs(dnsRestore.logs);
     }
     _cachedWindowsUplink = null;
     await _sessionStore.clear();
@@ -2310,6 +2399,16 @@ if (-not \$s) { exit 0 }
       _appendConnectionLog(
         '[token=$token] cleanup started reason=$reason interface=${interfaceName ?? 'unknown'}',
       );
+      if (_isWindows && _sessionDnsTokens.remove(token)) {
+        final dnsRestore = await _windowsDnsManager.restore();
+        _emitLogs(dnsRestore.logs);
+        if (!dnsRestore.success) {
+          _appendConnectionLog(
+            '[token=$token] DNS restore failed: '
+            '${dnsRestore.error ?? 'unknown'}',
+          );
+        }
+      }
       if (_isWindows && routeSession != null) {
         final routeLogs = <String>[];
         await _windowsRouteManager.cleanupSession(

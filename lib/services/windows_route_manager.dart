@@ -272,7 +272,6 @@ class WindowsRouteManager {
   Future<WindowsRouteApplyResult> applyRoutes({
     required String preferredTunInterface,
     required String remoteHost,
-    required List<String> dnsServers,
     String? tunAddressHint,
     WindowsRouteUplink? uplink,
   }) async {
@@ -302,7 +301,6 @@ class WindowsRouteManager {
 
     final protected = await _resolveProtectedPrefixes(
       remoteHost: remoteHost,
-      dnsServers: dnsServers,
       logs: logs,
     );
     if (protected.remotePrefixes.isEmpty) {
@@ -603,7 +601,6 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
 
   Future<_ProtectedPrefixes> _resolveProtectedPrefixes({
     required String remoteHost,
-    required List<String> dnsServers,
     required List<String> logs,
   }) async {
     final remotePrefixes = <String>{};
@@ -625,14 +622,7 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
         logs.add('Remote host resolve failed for $remoteHost: $e');
       }
     }
-    final prefixes = <String>{...remotePrefixes};
-    for (final server in dnsServers) {
-      final trimmed = server.trim();
-      if (_looksLikeIpv4(trimmed)) {
-        prefixes.add(trimmed);
-      }
-    }
-    final result = prefixes.toList()..sort();
+    final result = remotePrefixes.toList()..sort();
     final resolvedRemote = remotePrefixes.toList()..sort();
     logs.add('Protected host routes: ${result.join(', ')}');
     return _ProtectedPrefixes(

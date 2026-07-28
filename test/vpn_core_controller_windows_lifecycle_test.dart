@@ -6,8 +6,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:happycat_vpnclient/models/split_tunnel_config.dart';
 import 'package:happycat_vpnclient/services/vpn_core_binary_manager.dart';
 import 'package:happycat_vpnclient/services/vpn_core_controller.dart';
+import 'package:happycat_vpnclient/services/windows_dns_manager.dart';
 import 'package:happycat_vpnclient/services/windows_route_manager.dart';
 import 'package:happycat_vpnclient/services/windows_tun_guard.dart';
+import 'package:happycat_vpnclient/services/windows_xray_core.dart';
 import 'package:path/path.dart' as path;
 
 class _FakeBinaryManager extends VpnCoreBinaryManager {
@@ -128,7 +130,6 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
   Future<WindowsRouteApplyResult> applyRoutes({
     required String preferredTunInterface,
     required String remoteHost,
-    required List<String> dnsServers,
     String? tunAddressHint,
     WindowsRouteUplink? uplink,
   }) async {
@@ -172,6 +173,58 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
     String? ownedInterfaceName,
     List<String>? logs,
   }) async => true;
+}
+
+class _FakeWindowsDnsManager extends WindowsDnsManager {
+  _FakeWindowsDnsManager()
+    : super(
+        isWindowsOverride: false,
+        processRunner: (executable, arguments) async =>
+            ProcessResult(1, 0, '', ''),
+      );
+
+  int recoverCalls = 0;
+  int prepareCalls = 0;
+  int applyCalls = 0;
+  int restoreCalls = 0;
+  int? preparedUplink;
+  int? appliedUplink;
+  int? appliedTun;
+
+  @override
+  Future<WindowsDnsResult> recover() async {
+    recoverCalls += 1;
+    return const WindowsDnsResult(success: true);
+  }
+
+  @override
+  Future<WindowsDnsResult> prepare({required int uplinkInterfaceIndex}) async {
+    prepareCalls += 1;
+    preparedUplink = uplinkInterfaceIndex;
+    return const WindowsDnsResult(success: true);
+  }
+
+  @override
+  Future<WindowsDnsResult> apply({
+    required int uplinkInterfaceIndex,
+    required int tunInterfaceIndex,
+  }) async {
+    applyCalls += 1;
+    appliedUplink = uplinkInterfaceIndex;
+    appliedTun = tunInterfaceIndex;
+    return const WindowsDnsResult(success: true);
+  }
+
+  @override
+  Future<WindowsDnsResult> restore() async {
+    restoreCalls += 1;
+    return const WindowsDnsResult(success: true);
+  }
+}
+
+class _IsolatedWindowsXrayCoreAdapter extends WindowsXrayCoreAdapter {
+  @override
+  int get apiPort => 65185;
 }
 
 Future<ProcessResult> _runnerWithXrayVersion(
@@ -268,10 +321,76 @@ Set<String> _existingConnectionLogPaths() {
 }
 
 void main() {
+  test('full-tunnel applies and restores managed Windows DNS', () async {
+    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+    final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
+    final dnsManager = _FakeWindowsDnsManager();
+    final controller = VpnCoreController(
+      tunGuard: guard,
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      windowsDnsManager: dnsManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async =>
+          _FakeProcess(pid: 9010),
+    );
+
+    final result = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+
+    expect(result.success, isTrue);
+    expect(dnsManager.recoverCalls, 1);
+    expect(dnsManager.prepareCalls, 1);
+    expect(dnsManager.preparedUplink, 12);
+    expect(dnsManager.applyCalls, 1);
+    expect(dnsManager.appliedUplink, 12);
+    expect(dnsManager.appliedTun, 77);
+
+    await controller.disconnect();
+
+    expect(dnsManager.restoreCalls, greaterThanOrEqualTo(1));
+  });
+
+  test('whitelist mode does not replace global Windows DNS', () async {
+    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+    final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
+    final dnsManager = _FakeWindowsDnsManager();
+    final controller = VpnCoreController(
+      tunGuard: guard,
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      windowsDnsManager: dnsManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async =>
+          _FakeProcess(pid: 9011),
+    );
+
+    final result = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'whitelist'),
+    );
+
+    expect(result.success, isTrue);
+    expect(dnsManager.recoverCalls, 1);
+    expect(dnsManager.prepareCalls, 0);
+    expect(dnsManager.applyCalls, 0);
+
+    await controller.disconnect();
+  });
+
   test(
     'auto-recover retries on recoverable TUN collision and succeeds',
     () async {
-      final guard = _FakeTunGuard(waitForUp: <bool>[true]);
+      final guard = _FakeTunGuard(
+        waitForUp: <bool>[true],
+        adapterUp: <bool>[false, true],
+      );
       final routeManager = _FakeWindowsRouteManager();
       final started = <_FakeProcess>[];
       var processIndex = 0;
@@ -291,6 +410,7 @@ void main() {
       final controller = VpnCoreController(
         tunGuard: guard,
         binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsCoreAdapter: _IsolatedWindowsXrayCoreAdapter(),
         windowsRouteManager: routeManager,
         isWindowsOverride: true,
         isAndroidOverride: false,

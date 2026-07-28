@@ -74,7 +74,6 @@ void main() {
       final result = await manager.applyRoutes(
         preferredTunInterface: 'tun-in-test',
         remoteHost: '203.0.113.10',
-        dnsServers: const <String>['8.8.8.8'],
         tunAddressHint: '172.25.1.1/30',
         uplink: const WindowsRouteUplink(
           interfaceName: 'Ethernet',
@@ -86,10 +85,10 @@ void main() {
 
       expect(result.success, isTrue);
       expect(result.session?.tunInterfaceIndex, 77);
-      expect(result.session?.protectedPrefixes, <String>[
-        '203.0.113.10',
-        '8.8.8.8',
-      ]);
+      expect(result.session?.protectedPrefixes, <String>['203.0.113.10']);
+      expect(scripts.single, isNot(contains('8.8.8.8')));
+      expect(scripts.single, isNot(contains('1.1.1.1')));
+      expect(scripts.single, isNot(contains('9.9.9.9')));
       expect(scripts, hasLength(1));
       expect(scripts.single, contains('Get-NetAdapter -IncludeHidden'));
       expect(scripts.single, contains('New-NetIPAddress -InterfaceIndex'));
@@ -131,7 +130,6 @@ void main() {
     final result = await manager.applyRoutes(
       preferredTunInterface: 'tun-in-native',
       remoteHost: '203.0.113.10',
-      dnsServers: const <String>['8.8.8.8'],
       tunAddressHint: '172.25.1.1/30',
       uplink: const WindowsRouteUplink(
         interfaceName: 'Ethernet',
