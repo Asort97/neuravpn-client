@@ -55,7 +55,8 @@ class UpdateCheckResult {
 }
 
 class GithubUpdateService {
-  GithubUpdateService({http.Client? client}) : _client = client ?? http.Client();
+  GithubUpdateService({http.Client? client})
+    : _client = client ?? http.Client();
 
   final http.Client _client;
 
@@ -65,13 +66,15 @@ class GithubUpdateService {
     bool includePrerelease = false,
   }) async {
     final uri = Uri.https('api.github.com', '/repos/$owner/$repo/releases');
-    final response = await _client.get(
-      uri,
-      headers: const {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'neuravpn',
-      },
-    ).timeout(const Duration(seconds: 10));
+    final response = await _client
+        .get(
+          uri,
+          headers: const {
+            'Accept': 'application/vnd.github+json',
+            'User-Agent': 'neuravpn',
+          },
+        )
+        .timeout(const Duration(seconds: 10));
     if (response.statusCode != 200) return null;
     final decoded = jsonDecode(response.body);
     if (decoded is! List) return null;
@@ -107,11 +110,13 @@ class GithubUpdateService {
         final url = (a['browser_download_url'] as String?)?.trim() ?? '';
         final size = a['size'] as int? ?? 0;
         if (assetName.isNotEmpty && url.isNotEmpty) {
-          assets.add(GithubReleaseAsset(
-            name: assetName,
-            downloadUrl: Uri.parse(url),
-            size: size,
-          ));
+          assets.add(
+            GithubReleaseAsset(
+              name: assetName,
+              downloadUrl: Uri.parse(url),
+              size: size,
+            ),
+          );
         }
       }
     }
@@ -149,12 +154,9 @@ class GithubUpdateService {
   }
 
   String _normalizeVersion(String raw) {
-    var v = raw.trim();
-    if (v.startsWith('v') || v.startsWith('V')) {
-      v = v.substring(1);
-    }
-    v = v.split('+').first;
-    v = v.split('-').first;
+    final match = RegExp(r'\d+(?:\.\d+)+').firstMatch(raw.trim());
+    if (match == null) return '';
+    final v = match.group(0)!;
     final parts = v.split('.');
     if (parts.length < 2) return '';
     for (final p in parts) {

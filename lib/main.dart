@@ -956,7 +956,11 @@ class _VlessHomePageState extends State<VlessHomePage>
       debugPrint('[UPDATE] Skipped: already checking');
       return;
     }
-    _checkingUpdates = true;
+    if (mounted) {
+      setState(() => _checkingUpdates = true);
+    } else {
+      _checkingUpdates = true;
+    }
     debugPrint('[UPDATE] Starting check (manual=$manual)...');
 
     try {
@@ -1015,7 +1019,11 @@ class _VlessHomePageState extends State<VlessHomePage>
         _showFastSnack('Ошибка проверки обновлений: $e');
       }
     } finally {
-      _checkingUpdates = false;
+      if (mounted) {
+        setState(() => _checkingUpdates = false);
+      } else {
+        _checkingUpdates = false;
+      }
     }
   }
 
@@ -4881,12 +4889,6 @@ $regItems = foreach ($rp in $regPaths) {
                     ],
                   ),
                 ],
-              ] else ...[
-                const SizedBox(height: 8),
-                Text(
-                  'Автопроверка выполняется раз в 12 часов.',
-                  style: TextStyle(color: Colors.white.withOpacity(0.5)),
-                ),
               ],
               const SizedBox(height: 10),
               Text(
