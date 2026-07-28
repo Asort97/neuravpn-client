@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollDirection;
 
 class NeuraUi {
   static const Color black = Color(0xFF0A0A0A);
@@ -117,6 +118,79 @@ class NeuraUi {
           TargetPlatform.windows: FadeForwardsPageTransitionsBuilder(),
           TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
           TargetPlatform.linux: FadeForwardsPageTransitionsBuilder(),
+        },
+      ),
+    );
+  }
+}
+
+class NeuraSmoothScrollController extends ScrollController {
+  NeuraSmoothScrollController({
+    super.initialScrollOffset,
+    super.keepScrollOffset,
+    super.debugLabel,
+    this.duration = const Duration(milliseconds: 190),
+    this.curve = NeuraUi.curve,
+  });
+
+  final Duration duration;
+  final Curve curve;
+
+  @override
+  ScrollPosition createScrollPosition(
+    ScrollPhysics physics,
+    ScrollContext context,
+    ScrollPosition? oldPosition,
+  ) {
+    return _NeuraSmoothScrollPosition(
+      physics: physics,
+      context: context,
+      oldPosition: oldPosition,
+      initialPixels: initialScrollOffset,
+      keepScrollOffset: keepScrollOffset,
+      debugLabel: debugLabel,
+      duration: duration,
+      curve: curve,
+    );
+  }
+}
+
+class _NeuraSmoothScrollPosition extends ScrollPositionWithSingleContext {
+  _NeuraSmoothScrollPosition({
+    required super.physics,
+    required super.context,
+    required super.initialPixels,
+    required super.keepScrollOffset,
+    required this.duration,
+    required this.curve,
+    super.oldPosition,
+    super.debugLabel,
+  });
+
+  final Duration duration;
+  final Curve curve;
+  double? _targetPixels;
+  int _animationGeneration = 0;
+
+  @override
+  void pointerScroll(double delta) {
+    if (delta == 0) return;
+
+    final base = _targetPixels ?? pixels;
+    final target = (base + delta).clamp(minScrollExtent, maxScrollExtent);
+    if (target == pixels && _targetPixels == null) return;
+
+    updateUserScrollDirection(
+      delta > 0 ? ScrollDirection.reverse : ScrollDirection.forward,
+    );
+    _targetPixels = target.toDouble();
+    final generation = ++_animationGeneration;
+    unawaited(
+      animateTo(_targetPixels!, duration: duration, curve: curve).whenComplete(
+        () {
+          if (generation == _animationGeneration) {
+            _targetPixels = null;
+          }
         },
       ),
     );

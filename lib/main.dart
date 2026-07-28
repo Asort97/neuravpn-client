@@ -31,6 +31,7 @@ import 'services/vpn_core_controller.dart';
 import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
+import 'services/windows_auto_start_manager.dart';
 import 'services/windows_uri_protocol_registrar.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
@@ -52,8 +53,8 @@ const MethodChannel _androidLaunchChannel = MethodChannel(
   'neuravpn/android_launch',
 );
 
-const Size _windowsPreferredShellSize = Size(420, 720);
-const Size _windowsMinimumShellSize = Size(360, 617);
+const Size _windowsPreferredShellSize = Size(640, 800);
+const Size _windowsMinimumShellSize = Size(420, 600);
 const Size _desktopPreferredShellSize = Size(1100, 760);
 const Size _desktopPreferredMinSize = Size(900, 640);
 const double _windowSafeMargin = 10.0;
@@ -301,9 +302,12 @@ void main(List<String> args) {
         final windowOptions = WindowOptions(
           size: startupSize,
           minimumSize: isWindowsDesktop
-              ? startupSize
+              ? Size(
+                  math.min(_windowsMinimumShellSize.width, startupSize.width),
+                  math.min(_windowsMinimumShellSize.height, startupSize.height),
+                )
               : _desktopPreferredMinSize,
-          maximumSize: isWindowsDesktop ? startupSize : null,
+          maximumSize: null,
           center: true,
           backgroundColor: Colors.transparent,
           titleBarStyle: isWindowsDesktop
@@ -335,13 +339,7 @@ class VpnApp extends StatelessWidget {
       title: 'neuravpn',
       theme: NeuraUi.buildTheme(),
       scrollBehavior: const _AppScrollBehavior(),
-      builder: (context, child) {
-        final media = MediaQuery.of(context);
-        return MediaQuery(
-          data: media.copyWith(textScaler: const TextScaler.linear(1)),
-          child: child ?? const SizedBox.shrink(),
-        );
-      },
+      builder: (context, child) => child ?? const SizedBox.shrink(),
       home: VlessHomePage(initialLaunchArgs: initialLaunchArgs),
     );
   }
@@ -410,6 +408,11 @@ class _VlessHomePageState extends State<VlessHomePage>
   VpnProfile? _selectedProfile;
   final VpnCoreController _vpnCoreController = VpnCoreController();
   final ScrollController _logScrollController = ScrollController();
+  final List<NeuraSmoothScrollController> _windowsPageScrollControllers =
+      List<NeuraSmoothScrollController>.generate(
+        3,
+        (_) => NeuraSmoothScrollController(),
+      );
   Timer? _logFlushTimer;
   final List<String> _pendingLogLines = <String>[];
   final List<double> _trafficHistory = <double>[];
@@ -423,9 +426,12 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _isExitingApp = false;
   bool _isConnecting = false;
   bool _isDisconnecting = false;
+  int _connectionUiEpoch = 0;
   bool _connectButtonHovered = false;
   bool _connectButtonPressed = false;
   bool _connectButtonFocused = false;
+  bool _connectQuickActionsOpen = false;
+  String? _connectQuickActionHover;
   bool _hasSubscriptions = false;
   bool _trayPopupMode = false;
   OverlayEntry? _trayOverlayEntry;
@@ -604,9 +610,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _hasEverAddedKey = false;
   bool _autoConnectOnStartup = false;
   bool _autoStartOnBoot = false;
+  bool _autoStartUpdating = false;
   static const String _autoConnectKey = 'auto_connect_on_startup';
   static const String _autoStartKey = 'auto_start_on_boot';
-  static const String _windowsAutoStartRegistryName = 'neuravpn';
   static const String _dpiAggressiveKey = 'dpi_evasion_aggressive';
   static const String _dpiFragmentationKey = 'dpi_fragmentation_enabled';
   static const String _dpiTlsFragmentKey = 'dpi_tls_fragment_enabled';
@@ -617,6 +623,8 @@ class _VlessHomePageState extends State<VlessHomePage>
   static const String _dpiTcpWindowClampKey = 'dpi_tcp_window_clamp_enabled';
   static const String _dpiSniRandomizationKey = 'dpi_sni_randomization_enabled';
   final SmartRouteEngine _smartRouteEngine = SmartRouteEngine();
+  final WindowsAutoStartManager _windowsAutoStartManager =
+      WindowsAutoStartManager();
   final ConnectivityTester _connectivityTester = ConnectivityTester();
   late final List<ConnectivityTestTarget> _connectivityTargets =
       buildDefaultConnectivityTargets();
@@ -805,7 +813,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       if (_isWindowsShellPlatform) {
         unawaited(_prepareWindowsRuntime());
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          unawaited(_fitWindowToDisplay());
+          unawaited(_fitWindowToDisplay(forceStartupLayout: true));
         });
       }
     }
@@ -826,6 +834,7 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   Future<void> _bootstrapInitialState() async {
     await _loadInitialData();
+    await _syncAutoStartRegistration();
     await _prepareWindowsRuntime();
     await _handleInitialLaunchArgs();
     await _handleInitialAndroidLaunchUri();
@@ -2584,25 +2593,77 @@ $regItems = foreach ($rp in $regPaths) {
     if (!_isDesktopPlatform) return;
     await windowManager.setPreventClose(true);
     await _setupTrayIcon();
-    unawaited(_syncAutoStartFromRegistry());
   }
 
-  Future<void> _fitWindowToDisplay() async {
+  Future<void> _fitWindowToDisplay({bool forceStartupLayout = false}) async {
     final displayWorkArea =
         await _resolveCurrentDisplayWorkAreaSize() ??
         await _resolvePrimaryDisplayWorkAreaSize();
     final targetSize = _resolveWindowsShellWindowSize(
       displayWorkArea ?? _windowsPreferredShellSize,
     );
-    await windowManager.setSize(targetSize);
-    await windowManager.setMinimumSize(targetSize);
-    await windowManager.setMaximumSize(targetSize);
-    await windowManager.setResizable(false);
-    await windowManager.center();
+    final runtimeMinimum = displayWorkArea == null
+        ? _windowsMinimumShellSize
+        : Size(
+            math.min(
+              _windowsMinimumShellSize.width,
+              math.max(1.0, displayWorkArea.width - _windowSafeMargin),
+            ),
+            math.min(
+              _windowsMinimumShellSize.height,
+              math.max(1.0, displayWorkArea.height - _windowSafeMargin),
+            ),
+          );
+
+    await windowManager.setMinimumSize(runtimeMinimum);
+    await windowManager.setResizable(true);
     await windowManager.setTitleBarStyle(
       TitleBarStyle.hidden,
       windowButtonVisibility: false,
     );
+
+    final currentBounds = await windowManager.getBounds();
+    final isVisible = await _isWindowVisibleOnAnyDisplay(currentBounds);
+    final isTraySized =
+        currentBounds.width + 1 < runtimeMinimum.width ||
+        currentBounds.height + 1 < runtimeMinimum.height;
+    if (forceStartupLayout || !isVisible || isTraySized) {
+      await windowManager.setSize(targetSize);
+      await windowManager.center();
+      return;
+    }
+
+    if (displayWorkArea == null) {
+      return;
+    }
+
+    final maxWidth = math.max(1.0, displayWorkArea.width - _windowSafeMargin);
+    final maxHeight = math.max(1.0, displayWorkArea.height - _windowSafeMargin);
+    final fittedSize = Size(
+      math.min(currentBounds.width, maxWidth),
+      math.min(currentBounds.height, maxHeight),
+    );
+    if (fittedSize != currentBounds.size) {
+      await windowManager.setSize(fittedSize);
+    }
+  }
+
+  Future<bool> _isWindowVisibleOnAnyDisplay(Rect bounds) async {
+    try {
+      final displays = await screenRetriever.getAllDisplays();
+      if (displays.isEmpty) {
+        return true;
+      }
+      for (final display in displays) {
+        final visibleArea = _displayWorkAreaRect(display);
+        if (_rectIntersectionArea(bounds, visibleArea) >= 4096) {
+          return true;
+        }
+      }
+      return false;
+    } catch (_) {
+      return true;
+    }
   }
 
   Future<void> _setupTrayIcon() async {
@@ -2740,11 +2801,22 @@ $regItems = foreach ($rp in $regPaths) {
       await windowManager.hide();
     }
 
-    final cursor = _getCursorPosition();
+    final cursor = await _getCursorPosition();
     const menuWidth = 220.0;
     const menuHeight = 168.0;
-    final x = math.max(0.0, cursor.dx - menuWidth + 12);
-    final y = math.max(0.0, cursor.dy - menuHeight - 8.0);
+    final displayArea = await _displayWorkAreaForPoint(cursor);
+    final minX = displayArea?.left ?? 0.0;
+    final minY = displayArea?.top ?? 0.0;
+    final maxX = math.max(
+      minX,
+      (displayArea?.right ?? double.infinity) - menuWidth,
+    );
+    final maxY = math.max(
+      minY,
+      (displayArea?.bottom ?? double.infinity) - menuHeight,
+    );
+    final x = (cursor.dx - menuWidth + 12).clamp(minX, maxX).toDouble();
+    final y = (cursor.dy - menuHeight - 8).clamp(minY, maxY).toDouble();
 
     setState(() => _trayPopupMode = true);
 
@@ -2757,8 +2829,27 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_syncTrafficSamplingMode());
   }
 
-  Offset _getCursorPosition() {
-    return Offset.zero;
+  Future<Offset> _getCursorPosition() async {
+    try {
+      return await screenRetriever.getCursorScreenPoint();
+    } catch (_) {
+      return Offset.zero;
+    }
+  }
+
+  Future<Rect?> _displayWorkAreaForPoint(Offset point) async {
+    try {
+      final displays = await screenRetriever.getAllDisplays();
+      for (final display in displays) {
+        final area = _displayWorkAreaRect(display);
+        if (area.contains(point)) {
+          return area;
+        }
+      }
+    } catch (_) {
+      // A fallback at the primary origin keeps the tray action usable.
+    }
+    return null;
   }
 
   Future<void> _restoreWindowFromTray() async {
@@ -3426,6 +3517,7 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _start() async {
     if (_isConnecting || _isDisconnecting) return;
 
+    var connectionEpoch = 0;
     try {
       if (Platform.isAndroid) {
         await _vpnCoreController.syncRuntimeState();
@@ -3438,6 +3530,7 @@ $regItems = foreach ($rp in $regPaths) {
       }
 
       if (!mounted) return;
+      connectionEpoch = ++_connectionUiEpoch;
       setState(() {
         _status =
             '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
@@ -3455,7 +3548,7 @@ $regItems = foreach ($rp in $regPaths) {
         smartRouteEngine: _smartRouteEngine,
         dpiEvasionConfig: _dpiEvasionConfig,
         onStatus: (value) {
-          if (!mounted) return;
+          if (!mounted || connectionEpoch != _connectionUiEpoch) return;
           setState(() => _status = _mapStatus(value));
           unawaited(_updateTrayMenu());
         },
@@ -3465,7 +3558,7 @@ $regItems = foreach ($rp in $regPaths) {
       );
 
       if (!result.success) {
-        if (!mounted) return;
+        if (!mounted || connectionEpoch != _connectionUiEpoch) return;
         if (result.requiresAdmin && Platform.isWindows) {
           _showFastSnack('Запустите приложение от имени администратора');
           setState(() {
@@ -3505,7 +3598,7 @@ $regItems = foreach ($rp in $regPaths) {
       }
 
       await _saveUri();
-      if (!mounted) return;
+      if (!mounted || connectionEpoch != _connectionUiEpoch) return;
       setState(() {
         _status =
             '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
@@ -3522,7 +3615,10 @@ $regItems = foreach ($rp in $regPaths) {
       }
     } catch (error, stack) {
       unawaited(_writeCrashReport('connect', error, stack));
-      if (!mounted) return;
+      if (!mounted ||
+          (connectionEpoch != 0 && connectionEpoch != _connectionUiEpoch)) {
+        return;
+      }
       setState(() {
         _status =
             '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -3541,7 +3637,17 @@ $regItems = foreach ($rp in $regPaths) {
     required bool isEnabled,
     required bool isRunning,
   }) {
-    if (_isConnecting || _isDisconnecting) return;
+    if (_connectQuickActionsOpen) {
+      setState(() {
+        _connectQuickActionsOpen = false;
+        _connectQuickActionHover = null;
+      });
+    }
+    if (_isDisconnecting) return;
+    if (_isConnecting) {
+      unawaited(_stop());
+      return;
+    }
 
     if (isRunning) {
       unawaited(_stop());
@@ -3560,7 +3666,7 @@ $regItems = foreach ($rp in $regPaths) {
     required bool isEnabled,
     required bool isRunning,
   }) {
-    if (_isConnecting) return 'Подключение...';
+    if (_isConnecting) return 'Отменить подключение';
     if (_isDisconnecting) return 'Отключение...';
     if (isRunning) return 'Отключить VPN';
     if (!isEnabled) return 'Выберите подписку для подключения';
@@ -3570,6 +3676,23 @@ $regItems = foreach ($rp in $regPaths) {
   void _setConnectButtonFocus(bool focused) {
     if (_connectButtonFocused == focused) return;
     setState(() => _connectButtonFocused = focused);
+  }
+
+  void _openConnectQuickActions() {
+    if (_connectQuickActionsOpen) return;
+    setState(() {
+      _connectQuickActionsOpen = true;
+      _connectButtonPressed = true;
+    });
+  }
+
+  void _closeConnectQuickActions() {
+    if (!_connectQuickActionsOpen && _connectQuickActionHover == null) return;
+    setState(() {
+      _connectQuickActionsOpen = false;
+      _connectQuickActionHover = null;
+      _connectButtonPressed = false;
+    });
   }
 
   /// Дополнительная проверка полного отключения with retry logic
@@ -3590,15 +3713,19 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _stop() async {
-    // Защита от спама - проверяем, не идёт ли уже отключение или подключение
-    if (_isDisconnecting || _isConnecting) return;
+    if (_isDisconnecting) return;
+    final stopEpoch = ++_connectionUiEpoch;
+    final wasConnecting = _isConnecting;
     if (Platform.isAndroid && !_isRunning) {
       await _vpnCoreController.syncRuntimeState();
     }
-    if (!_isRunning) return;
+    if (!_isRunning && !wasConnecting) return;
 
     setState(() {
       _isDisconnecting = true;
+      if (wasConnecting) {
+        _status = 'Отмена подключения';
+      }
     });
     _updateFrameAnimation();
 
@@ -3622,7 +3749,7 @@ $regItems = foreach ($rp in $regPaths) {
         ? await _vpnCoreController.syncRuntimeState()
         : false;
 
-    if (!mounted) return;
+    if (!mounted || stopEpoch != _connectionUiEpoch) return;
     setState(() {
       _status = androidStillRunning
           ? '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e'
@@ -3886,6 +4013,9 @@ $regItems = foreach ($rp in $regPaths) {
     _windowsPageController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
+    for (final controller in _windowsPageScrollControllers) {
+      controller.dispose();
+    }
     if (_isDesktopPlatform) {
       windowManager.removeListener(this);
       _trayManager.removeListener(this);
@@ -4116,10 +4246,13 @@ $regItems = foreach ($rp in $regPaths) {
           SafeArea(
             child: LayoutBuilder(
               builder: (context, constraints) {
+                final compact = constraints.maxWidth < 520;
+                final horizontalPadding = compact ? 16.0 : 28.0;
+                final contentMaxWidth = compact ? 520.0 : 760.0;
                 return Align(
                   alignment: Alignment.topCenter,
-                  child: SizedBox(
-                    width: math.min(constraints.maxWidth, 420),
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: contentMaxWidth),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
@@ -4135,7 +4268,12 @@ $regItems = foreach ($rp in $regPaths) {
                               ),
                             ),
                             Padding(
-                              padding: const EdgeInsets.fromLTRB(24, 8, 24, 0),
+                              padding: EdgeInsets.fromLTRB(
+                                horizontalPadding,
+                                8,
+                                horizontalPadding,
+                                0,
+                              ),
                               child: NeuraReveal(
                                 child: _buildWindowsTitleBar(),
                               ),
@@ -4145,7 +4283,9 @@ $regItems = foreach ($rp in $regPaths) {
                         const SizedBox(height: 12),
                         if (hasConnectable)
                           Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 24),
+                            padding: EdgeInsets.symmetric(
+                              horizontal: horizontalPadding,
+                            ),
                             child: _buildWindowsTabs(),
                           ),
                         const SizedBox(height: 12),
@@ -4167,18 +4307,29 @@ $regItems = foreach ($rp in $regPaths) {
                                   children: [
                                     _buildWindowsPage(
                                       _buildWindowsConnectionView(),
+                                      horizontalPadding: horizontalPadding,
+                                      controller:
+                                          _windowsPageScrollControllers[0],
                                     ),
-                                    _buildWindowsPage(_buildWindowsSplitView()),
+                                    _buildWindowsPage(
+                                      _buildWindowsSplitView(),
+                                      horizontalPadding: horizontalPadding,
+                                      controller:
+                                          _windowsPageScrollControllers[1],
+                                    ),
                                     _buildWindowsPage(
                                       _buildWindowsSettingsView(),
+                                      horizontalPadding: horizontalPadding,
+                                      controller:
+                                          _windowsPageScrollControllers[2],
                                     ),
                                   ],
                                 )
                               : SingleChildScrollView(
-                                  padding: const EdgeInsets.fromLTRB(
-                                    24,
+                                  padding: EdgeInsets.fromLTRB(
+                                    horizontalPadding,
                                     0,
-                                    24,
+                                    horizontalPadding,
                                     24,
                                   ),
                                   child: _buildWindowsEmptyState(),
@@ -4434,9 +4585,14 @@ $regItems = foreach ($rp in $regPaths) {
     );
   }
 
-  Widget _buildWindowsPage(Widget child) {
+  Widget _buildWindowsPage(
+    Widget child, {
+    required double horizontalPadding,
+    required ScrollController controller,
+  }) {
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+      controller: controller,
+      padding: EdgeInsets.fromLTRB(horizontalPadding, 0, horizontalPadding, 24),
       child: SizedBox(
         width: double.infinity,
         child: Column(
@@ -4509,56 +4665,76 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _setAutoStartOnBoot(bool value) async {
-    setState(() => _autoStartOnBoot = value);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_autoStartKey, value);
-    if (!Platform.isWindows) return;
+    if (_autoStartUpdating) return;
+    if (!Platform.isWindows) {
+      setState(() => _autoStartOnBoot = value);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_autoStartKey, value);
+      return;
+    }
+
+    setState(() => _autoStartUpdating = true);
     try {
-      final exePath = Platform.resolvedExecutable;
-      if (value) {
-        await Process.run('reg', [
-          'add',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v',
-          _windowsAutoStartRegistryName,
-          '/t',
-          'REG_SZ',
-          '/d',
-          '"$exePath"',
-          '/f',
-        ]);
-      } else {
-        await Process.run('reg', [
-          'delete',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v',
-          _windowsAutoStartRegistryName,
-          '/f',
-        ]);
+      final result = value
+          ? await _windowsAutoStartManager.enable(Platform.resolvedExecutable)
+          : await _windowsAutoStartManager.disable();
+      if (result.logs.isNotEmpty) {
+        _appendLogs(result.logs);
       }
+      if (!mounted) return;
+
+      if (!result.success) {
+        _showFastSnack(
+          'Не удалось изменить автозапуск: ${result.error ?? 'ошибка Windows'}',
+        );
+        return;
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_autoStartKey, result.enabled);
+      if (!mounted) return;
+      setState(() => _autoStartOnBoot = result.enabled);
+      _showFastSnack(
+        result.enabled ? 'Автозапуск включён' : 'Автозапуск отключён',
+      );
     } catch (e) {
-      _appendLogs(['[autostart] Failed to update registry: $e']);
+      _appendLogs(['[autostart] Failed to update scheduled task: $e']);
+      if (mounted) {
+        _showFastSnack('Не удалось изменить автозапуск');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _autoStartUpdating = false);
+      }
     }
   }
 
-  Future<void> _syncAutoStartFromRegistry() async {
+  Future<void> _syncAutoStartRegistration() async {
     if (!Platform.isWindows) return;
     try {
-      final result = await Process.run('reg', [
-        'query',
-        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v',
-        _windowsAutoStartRegistryName,
-      ]);
-      final registered =
-          result.exitCode == 0 &&
-          result.stdout.toString().contains(_windowsAutoStartRegistryName);
-      if (registered != _autoStartOnBoot) {
-        setState(() => _autoStartOnBoot = registered);
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setBool(_autoStartKey, registered);
+      final result = await _windowsAutoStartManager.reconcile(
+        desiredEnabled: _autoStartOnBoot,
+        executablePath: Platform.resolvedExecutable,
+      );
+      if (result.logs.isNotEmpty) {
+        _appendLogs(result.logs);
       }
-    } catch (_) {}
+      if (!result.success) {
+        _appendLogs([
+          '[autostart] Reconciliation failed: ${result.error ?? 'unknown'}',
+        ]);
+        return;
+      }
+
+      if (result.enabled != _autoStartOnBoot) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_autoStartKey, result.enabled);
+        if (!mounted) return;
+        setState(() => _autoStartOnBoot = result.enabled);
+      }
+    } catch (error) {
+      _appendLogs(['[autostart] Reconciliation failed: $error']);
+    }
   }
 
   Widget _buildWindowsSettingsView() {
@@ -4811,7 +4987,9 @@ $regItems = foreach ($rp in $regPaths) {
                   Switch.adaptive(
                     value: _autoStartOnBoot,
                     activeColor: _neuraRed,
-                    onChanged: (v) => _setAutoStartOnBoot(v),
+                    onChanged: _autoStartUpdating
+                        ? null
+                        : (v) => _setAutoStartOnBoot(v),
                   ),
                 ],
               ),
@@ -4984,7 +5162,7 @@ $regItems = foreach ($rp in $regPaths) {
   Widget _buildWindowsConnectionModule() {
     final isRunning = _isRunning;
     final isEnabled = _selectedProfile != null;
-    final canInteract = !_isConnecting && !_isDisconnecting;
+    final canInteract = !_isDisconnecting;
     final statusColor = isRunning
         ? _neuraRed
         : _isConnecting
@@ -5188,6 +5366,20 @@ $regItems = foreach ($rp in $regPaths) {
                               setState(() => _connectButtonPressed = false);
                             }
                           },
+                          onLongPressStart:
+                              canInteract && !_isConnecting && !isRunning
+                              ? (_) => _openConnectQuickActions()
+                              : null,
+                          onLongPressEnd:
+                              canInteract && !_isConnecting && !isRunning
+                              ? (_) {
+                                  if (_connectButtonPressed) {
+                                    setState(
+                                      () => _connectButtonPressed = false,
+                                    );
+                                  }
+                                }
+                              : null,
                           onTap: canInteract
                               ? () => _onMainConnectButtonPressed(
                                   isEnabled: isEnabled,
@@ -5389,6 +5581,17 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
               ),
+              AnimatedSize(
+                duration: NeuraUi.normal,
+                curve: NeuraUi.curve,
+                alignment: Alignment.topCenter,
+                child: _connectQuickActionsOpen
+                    ? Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: _buildWindowsConnectQuickActions(),
+                      )
+                    : const SizedBox.shrink(),
+              ),
               const SizedBox(height: 16),
               AnimatedSwitcher(
                 duration: NeuraUi.fast,
@@ -5486,6 +5689,111 @@ $regItems = foreach ($rp in $regPaths) {
     );
   }
 
+  Widget _buildWindowsConnectQuickActions() {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.34),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Row(
+          children: [
+            _buildWindowsConnectQuickAction(
+              id: 'routing',
+              icon: Icons.route_outlined,
+              label: _smartRouting ? 'Маршрутизация: вкл' : 'Маршрутизация',
+              onTap: () {
+                unawaited(_setSmartRouting(!_smartRouting));
+                _closeConnectQuickActions();
+              },
+            ),
+            const SizedBox(width: 4),
+            _buildWindowsConnectQuickAction(
+              id: 'settings',
+              icon: Icons.tune_rounded,
+              label: 'Настройки',
+              onTap: () {
+                _setWindowsView(_WindowsView.settings);
+                _closeConnectQuickActions();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWindowsConnectQuickAction({
+    required String id,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    final highlighted = _connectQuickActionHover == id;
+    return Expanded(
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) {
+          if (_connectQuickActionHover != id) {
+            setState(() => _connectQuickActionHover = id);
+          }
+        },
+        onExit: (_) {
+          if (_connectQuickActionHover == id) {
+            setState(() => _connectQuickActionHover = null);
+          }
+        },
+        child: Tooltip(
+          message: label,
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(10),
+              onTap: onTap,
+              child: AnimatedContainer(
+                duration: NeuraUi.fast,
+                curve: NeuraUi.curve,
+                height: 38,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  color: highlighted
+                      ? _neuraRed.withOpacity(0.16)
+                      : Colors.transparent,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      icon,
+                      size: 16,
+                      color: highlighted ? _neuraRed : Colors.white60,
+                    ),
+                    const SizedBox(width: 7),
+                    Flexible(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: highlighted ? Colors.white : Colors.white70,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildWindowsInlineSmartRoutingToggle() {
     return DecoratedBox(
       decoration: BoxDecoration(
@@ -5568,15 +5876,28 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
               ),
-              IconButton(
-                onPressed: _showProfileDialog,
-                icon: const Icon(Icons.add, color: Colors.white70),
+              SizedBox(
+                width: 36,
+                height: 36,
+                child: IconButton(
+                  tooltip: 'Добавить профиль или подписку',
+                  onPressed: _showProfileDialog,
+                  style: IconButton.styleFrom(
+                    backgroundColor: _neuraSurface,
+                    foregroundColor: Colors.white70,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      side: BorderSide(color: Colors.white.withOpacity(0.08)),
+                    ),
+                  ),
+                  icon: const Icon(Icons.add, size: 20),
+                ),
               ),
             ],
           ),
           const SizedBox(height: 12),
-          SizedBox(
-            height: 320,
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 420),
             child: ProfileListView(
               profiles: _profiles,
               selectedProfile: _selectedProfile,

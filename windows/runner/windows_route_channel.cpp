@@ -21,6 +21,12 @@
 namespace {
 std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> g_channel;
 
+// Keep these low enough to beat the physical default route. Cleanup matches
+// the full tuple (interface, next hop and metric), so it never wipes a route
+// that belongs to the user or another VPN client.
+constexpr uint32_t kProtectedRouteMetric = 4;
+constexpr uint32_t kTunDefaultRouteMetric = 5;
+
 void LogDebug(const std::string& message) {
   OutputDebugStringA((std::string("[windows_route] ") + message + "\n").c_str());
 }
@@ -249,7 +255,9 @@ std::optional<std::string> AdapterStatusNative(const std::string& name) {
 
 void DeleteMatchingRoutes(uint32_t interface_index, const IN_ADDR& destination,
                           uint8_t prefix_length,
-                          const std::optional<IN_ADDR>& next_hop) {
+                          const std::optional<IN_ADDR>& next_hop,
+                          const std::optional<uint32_t>& metric =
+                              std::nullopt) {
   MIB_IPFORWARD_TABLE2* table = nullptr;
   if (GetIpForwardTable2(AF_INET, &table) != NO_ERROR || table == nullptr) {
     return;
@@ -261,6 +269,9 @@ void DeleteMatchingRoutes(uint32_t interface_index, const IN_ADDR& destination,
       continue;
     }
     if (next_hop.has_value() && !SameIpv4(row.NextHop, next_hop.value())) {
+      continue;
+    }
+    if (metric.has_value() && row.Metric != metric.value()) {
       continue;
     }
     DeleteIpForwardEntry2(&row);
@@ -286,33 +297,6 @@ DWORD CreateIpv4Route(uint32_t interface_index, const IN_ADDR& destination,
   const DWORD status = CreateIpForwardEntry2(&row);
   if (status == ERROR_OBJECT_ALREADY_EXISTS) {
     return NO_ERROR;
-  }
-  return status;
-}
-
-DWORD SetIpv4InterfaceMetric(uint32_t interface_index, uint32_t metric) {
-  MIB_IPINTERFACE_ROW row = {};
-  InitializeIpInterfaceEntry(&row);
-  row.Family = AF_INET;
-  row.InterfaceIndex = interface_index;
-  DWORD status = GetIpInterfaceEntry(&row);
-  if (status != NO_ERROR) {
-    return status;
-  }
-  row.UseAutomaticMetric = false;
-  row.Metric = metric;
-  return SetIpInterfaceEntry(&row);
-}
-
-DWORD SetIpv4InterfaceMetricWithRetry(uint32_t interface_index,
-                                      uint32_t metric) {
-  DWORD status = NO_ERROR;
-  for (int attempt = 0; attempt < 8; ++attempt) {
-    status = SetIpv4InterfaceMetric(interface_index, metric);
-    if (status == NO_ERROR) {
-      return NO_ERROR;
-    }
-    Sleep(attempt < 2 ? 25 : 50);
   }
   return status;
 }
@@ -507,37 +491,43 @@ flutter::EncodableMap ApplyRoutesNative(const flutter::EncodableMap& args) {
   if (status != NO_ERROR) {
     return ErrorMap("tun_address_assign_failed", status);
   }
-  // Some Wintun/xray adapters expose the IP interface row a little later than
-  // the adapter row. The metric is important for route priority, but a short
-  // native retry is much cheaper than falling back to PowerShell.
-  SetIpv4InterfaceMetricWithRetry(tun->interface_index, 1);
-
   const auto protected_prefixes = GetStringListArg(args, "protectedPrefixes");
+  const auto cleanup_owned_routes = [&]() {
+    for (const auto& prefix : protected_prefixes) {
+      const auto address = ParseIpv4(prefix);
+      if (address.has_value()) {
+        DeleteMatchingRoutes(uplink_index, address.value(), 32,
+                             uplink_gateway, kProtectedRouteMetric);
+      }
+    }
+    IN_ADDR zero = {};
+    DeleteMatchingRoutes(tun->interface_index, zero, 0, zero,
+                         kTunDefaultRouteMetric);
+  };
   for (const auto& prefix : protected_prefixes) {
     const auto address = ParseIpv4(prefix);
     if (!address.has_value()) {
       continue;
     }
-    DeleteMatchingRoutes(uplink_index, address.value(), 32, uplink_gateway);
+    DeleteMatchingRoutes(uplink_index, address.value(), 32, uplink_gateway,
+                         kProtectedRouteMetric);
     status = CreateIpv4RouteWithRetry(uplink_index, address.value(), 32,
-                                      uplink_gateway.value(), 1);
+                                      uplink_gateway.value(),
+                                      kProtectedRouteMetric);
     if (status != NO_ERROR) {
+      cleanup_owned_routes();
       return ErrorMap("protected_route_failed", status);
     }
   }
 
   IN_ADDR zero = {};
-  IN_ADDR half = {};
-  const auto half_parsed = ParseIpv4("128.0.0.0");
-  if (half_parsed.has_value()) {
-    half = half_parsed.value();
-  }
-  DeleteMatchingRoutes(tun->interface_index, zero, 0, std::nullopt);
-  DeleteMatchingRoutes(tun->interface_index, zero, 1, std::nullopt);
-  DeleteMatchingRoutes(tun->interface_index, half, 1, std::nullopt);
+  DeleteMatchingRoutes(tun->interface_index, zero, 0, zero,
+                       kTunDefaultRouteMetric);
 
-  status = CreateIpv4RouteWithRetry(tun->interface_index, zero, 0, zero, 3);
+  status = CreateIpv4RouteWithRetry(tun->interface_index, zero, 0, zero,
+                                     kTunDefaultRouteMetric);
   if (status != NO_ERROR) {
+    cleanup_owned_routes();
     return ErrorMap("default_route_failed", status);
   }
 

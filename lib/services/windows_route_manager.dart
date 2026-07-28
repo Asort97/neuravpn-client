@@ -224,6 +224,12 @@ class MethodChannelWindowsRouteNativeApi implements WindowsRouteNativeApi {
 }
 
 class WindowsRouteManager {
+  // Route metrics identify entries that this client owns. They must remain
+  // low enough to win over the physical default route; ownership is scoped by
+  // interface, next hop and metric during cleanup.
+  static const int _protectedRouteMetric = 4;
+  static const int _tunDefaultRouteMetric = 5;
+
   WindowsRouteManager({
     WindowsRouteProcessRunner? processRunner,
     bool? isWindowsOverride,
@@ -294,11 +300,20 @@ class WindowsRouteManager {
       );
     }
 
-    final protectedPrefixes = await _resolveProtectedPrefixes(
+    final protected = await _resolveProtectedPrefixes(
       remoteHost: remoteHost,
       dnsServers: dnsServers,
       logs: logs,
     );
+    if (protected.remotePrefixes.isEmpty) {
+      return WindowsRouteApplyResult(
+        success: false,
+        error:
+            'Не удалось определить IPv4 адрес VPN-сервера; маршруты не менялись',
+        logs: logs,
+      );
+    }
+    final protectedPrefixes = protected.allPrefixes;
 
     if (_useNativeRouteApi) {
       final nativeBatch = await _applyRouteBatchNative(
@@ -452,13 +467,29 @@ class WindowsRouteManager {
       return;
     }
     final sink = logs ?? <String>[];
-    await _cleanupSessionBatch(session, sink);
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      final applied = await _cleanupSessionBatch(session, sink);
+      final clean = await _verifySessionCleanup(session, sink);
+      if (applied && clean) {
+        return;
+      }
+      sink.add('Route cleanup verification failed on attempt $attempt/2.');
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
   }
 
-  Future<void> cleanupStale({List<String>? logs}) async {
-    if (!_isWindows) return;
+  Future<bool> cleanupStale({
+    String? ownedInterfaceName,
+    List<String>? logs,
+  }) async {
+    if (!_isWindows) return true;
     final sink = logs ?? <String>[];
-    await _cleanupStaleBatch(sink);
+    final normalizedName = ownedInterfaceName?.trim();
+    if (normalizedName == null || normalizedName.isEmpty) {
+      sink.add('Skipping stale-route cleanup without an owned interface name.');
+      return false;
+    }
+    return _cleanupStaleBatch(normalizedName, sink);
   }
 
   Future<_TunInterface?> _findTunInterface(
@@ -570,14 +601,14 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
     );
   }
 
-  Future<List<String>> _resolveProtectedPrefixes({
+  Future<_ProtectedPrefixes> _resolveProtectedPrefixes({
     required String remoteHost,
     required List<String> dnsServers,
     required List<String> logs,
   }) async {
-    final prefixes = <String>{};
+    final remotePrefixes = <String>{};
     if (_looksLikeIpv4(remoteHost)) {
-      prefixes.add(remoteHost);
+      remotePrefixes.add(remoteHost);
     } else {
       try {
         final resolved = await InternetAddress.lookup(
@@ -585,7 +616,7 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
         ).timeout(const Duration(milliseconds: 900));
         for (final address in resolved) {
           if (address.type == InternetAddressType.IPv4) {
-            prefixes.add(address.address);
+            remotePrefixes.add(address.address);
           }
         }
       } on TimeoutException {
@@ -594,6 +625,7 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
         logs.add('Remote host resolve failed for $remoteHost: $e');
       }
     }
+    final prefixes = <String>{...remotePrefixes};
     for (final server in dnsServers) {
       final trimmed = server.trim();
       if (_looksLikeIpv4(trimmed)) {
@@ -601,8 +633,12 @@ $routes | Select-Object -First 1 | ConvertTo-Json -Compress
       }
     }
     final result = prefixes.toList()..sort();
+    final resolvedRemote = remotePrefixes.toList()..sort();
     logs.add('Protected host routes: ${result.join(', ')}');
-    return result;
+    return _ProtectedPrefixes(
+      allPrefixes: result,
+      remotePrefixes: resolvedRemote,
+    );
   }
 
   Future<_RouteBatchResult> _applyRouteBatchFast({
@@ -647,7 +683,6 @@ try {
     [pscustomobject]@{ Success = \$false; Error = 'tun_address_not_found'; TunName = \$selected.Name; TunInterfaceIndex = [int]\$selected.InterfaceIndex } | ConvertTo-Json -Compress
     exit 0
   }
-  Set-NetIPInterface -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
   \$existingTunIp = Get-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -IPAddress \$tunAddress -ErrorAction SilentlyContinue
   if (-not \$existingTunIp) {
     Get-NetIPAddress -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -658,17 +693,14 @@ try {
   foreach (\$prefix in @(\$protected)) {
     if (-not \$prefix) { continue }
     Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-      Where-Object { \$_.NextHop -eq \$uplinkGateway } |
+      Where-Object { \$_.NextHop -eq \$uplinkGateway -and \$_.RouteMetric -eq $_protectedRouteMetric } |
       Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-    New-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -NextHop \$uplinkGateway -RouteMetric 1 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    New-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -NextHop \$uplinkGateway -RouteMetric $_protectedRouteMetric -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
   }
   Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric } |
     Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-  Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-  Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-  New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -NextHop '0.0.0.0' -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -NextHop '0.0.0.0' -RouteMetric $_tunDefaultRouteMetric -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
   [pscustomobject]@{
     Success = \$true
     TunName = \$selected.Name
@@ -676,6 +708,14 @@ try {
     TunAddress = \$tunAddress
   } | ConvertTo-Json -Compress
 } catch {
+  foreach (\$prefix in @(\$protected)) {
+    Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${uplink.interfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+      Where-Object { \$_.NextHop -eq \$uplinkGateway -and \$_.RouteMetric -eq $_protectedRouteMetric } |
+      Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
+  }
+  Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$selected.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric } |
+    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
   [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } | ConvertTo-Json -Compress
 }
 ''', logs);
@@ -765,7 +805,6 @@ $protectedJson
 '@
 \$uplinkGateway = '${_escapePs(uplinkGateway)}'
 \$tunAddress = '${_escapePs(tunAddress)}'
-Set-NetIPInterface -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
 \$existingTunIp = Get-NetIPAddress -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -IPAddress \$tunAddress -ErrorAction SilentlyContinue
 if (-not \$existingTunIp) {
   Get-NetIPAddress -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -775,27 +814,24 @@ if (-not \$existingTunIp) {
 }
 foreach (\$prefix in \$protected) {
   Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex $uplinkInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { \$_.NextHop -eq \$uplinkGateway } |
+    Where-Object { \$_.NextHop -eq \$uplinkGateway -and \$_.RouteMetric -eq $_protectedRouteMetric } |
     Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-  New-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex $uplinkInterfaceIndex -NextHop \$uplinkGateway -RouteMetric 1 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+  New-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex $uplinkInterfaceIndex -NextHop \$uplinkGateway -RouteMetric $_protectedRouteMetric -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 }
 Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric } |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $tunInterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -NextHop '0.0.0.0' -RouteMetric 3 -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $tunInterfaceIndex -NextHop '0.0.0.0' -RouteMetric $_tunDefaultRouteMetric -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
 ''', logs);
     return result.exitCode == 0;
   }
 
-  Future<void> _cleanupSessionBatch(
+  Future<bool> _cleanupSessionBatch(
     WindowsRouteSession session,
     List<String> logs,
   ) async {
     final protectedJson = jsonEncode(session.protectedPrefixes);
-    await _runPowerShell(
+    final result = await _runPowerShell(
       '''
 \$protected = ConvertFrom-Json @'
 $protectedJson
@@ -804,38 +840,63 @@ $protectedJson
 \$tunAddress = '${_escapePs(session.tunAddress)}'
 foreach (\$prefix in \$protected) {
   Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${session.uplinkInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Where-Object { \$_.NextHop -eq \$uplinkGateway } |
+    Where-Object { \$_.NextHop -eq \$uplinkGateway -and \$_.RouteMetric -eq $_protectedRouteMetric } |
     Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 }
 Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-  Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
-Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric } |
   Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 ''',
       logs,
       tolerateFailure: true,
     );
+    return result.exitCode == 0;
   }
 
-  Future<void> _cleanupStaleBatch(List<String> logs) async {
-    await _runPowerShell(
-      r'''
-$ifaces = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue |
-Where-Object { $_.Name -like 'xray*' -or $_.Name -like 'tun-in*' -or $_.Name -like 'wintun*' }
-foreach ($iface in $ifaces) {
-  Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-  Get-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-  Get-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex $($iface.InterfaceIndex) -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+  Future<bool> _verifySessionCleanup(
+    WindowsRouteSession session,
+    List<String> logs,
+  ) async {
+    final protectedJson = jsonEncode(session.protectedPrefixes);
+    final result = await _runPowerShell(
+      '''
+\$protected = ConvertFrom-Json @'
+$protectedJson
+'@
+\$remaining = @()
+foreach (\$prefix in \$protected) {
+  \$remaining += Get-NetRoute -DestinationPrefix "\$prefix/32" -InterfaceIndex ${session.uplinkInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { \$_.NextHop -eq '${_escapePs(session.uplinkGateway)}' -and \$_.RouteMetric -eq $_protectedRouteMetric }
+}
+\$remaining += Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex ${session.tunInterfaceIndex} -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric }
+if (\$remaining.Count -eq 0) { exit 0 }
+exit 1
+''',
+      logs,
+      tolerateFailure: true,
+    );
+    return result.exitCode == 0;
+  }
+
+  Future<bool> _cleanupStaleBatch(
+    String ownedInterfaceName,
+    List<String> logs,
+  ) async {
+    final escapedName = _escapePs(ownedInterfaceName);
+    final result = await _runPowerShell(
+      '''
+\$iface = Get-NetAdapter -Name '$escapedName' -IncludeHidden -ErrorAction SilentlyContinue
+if (\$iface) {
+  Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex \$iface.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+    Where-Object { \$_.RouteMetric -eq $_tunDefaultRouteMetric } |
+    Remove-NetRoute -Confirm:\$false -ErrorAction SilentlyContinue
 }
 ''',
       logs,
       tolerateFailure: true,
     );
+    return result.exitCode == 0;
   }
 
   Future<ProcessResult> _run(
@@ -920,4 +981,14 @@ class _RouteBatchResult {
   final WindowsRouteSession? session;
   final String? error;
   final bool canFallback;
+}
+
+class _ProtectedPrefixes {
+  const _ProtectedPrefixes({
+    required this.allPrefixes,
+    required this.remotePrefixes,
+  });
+
+  final List<String> allPrefixes;
+  final List<String> remotePrefixes;
 }

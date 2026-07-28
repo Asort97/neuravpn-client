@@ -144,6 +144,9 @@ class VpnCoreController {
   String? _verifiedWindowsBinarySignature;
   int _droppedConnectionLogLines = 0;
   bool _connectionLogThrottleMarkerQueued = false;
+  // Every start/stop invalidates older async work. This prevents a late
+  // startup callback from reviving a session that the user has cancelled.
+  int _connectionOperationEpoch = 0;
   int _sessionEpoch = 0;
   int? _activeConnectionToken;
   final Map<int, String> _sessionInterfaces = <int, String>{};
@@ -310,19 +313,34 @@ class VpnCoreController {
     ];
     _pendingAggressiveRecovery = true;
     try {
-      await _terminateExistingProcesses(forceGlobal: true);
-      await _windowsRouteManager.cleanupStale(logs: logs);
-      final tunCleanup = await _tunGuard.cleanupStaleTunAdapters();
-      logs.addAll(tunCleanup.logs);
-      if (tunCleanup.success) {
+      var cleanupSucceeded = true;
+      await _terminateExistingProcesses();
+      final staleRoutesCleaned = await _windowsRouteManager.cleanupStale(
+        ownedInterfaceName: state.interfaceName,
+        logs: logs,
+      );
+      if (!staleRoutesCleaned) {
+        logs.add('[recovery] Unable to verify stale route cleanup.');
+        cleanupSucceeded = false;
+      }
+      final knownInterface = state.interfaceName;
+      if (knownInterface != null && knownInterface.startsWith('tun-in-')) {
+        final tunCleanup = await _tunGuard.cleanupAdapter(knownInterface);
+        logs.addAll(tunCleanup.logs);
+        if (!tunCleanup.success) {
+          logs.add('[recovery] Managed TUN adapter remains: $knownInterface');
+          cleanupSucceeded = false;
+        }
+      } else if (knownInterface != null) {
+        logs.add(
+          '[recovery] Skipping adapter deletion for runtime interface '
+          '$knownInterface; Xray owns its lifecycle.',
+        );
+      }
+      if (cleanupSucceeded) {
         await _sessionStore.clear();
         _pendingAggressiveRecovery = false;
         logs.add('[recovery] Previous Windows VPN session cleanup completed.');
-      } else {
-        logs.add(
-          '[recovery] Stale adapters remain: '
-          '${tunCleanup.stillPresentAdapters.join(', ')}',
-        );
       }
     } catch (e) {
       logs.add('[recovery] Cleanup exception: $e');
@@ -448,6 +466,7 @@ class VpnCoreController {
     void Function(String status)? onStatus,
     void Function(String log)? onLog,
   }) async {
+    final connectionOperation = ++_connectionOperationEpoch;
     _statusSink = onStatus;
     _logSink = onLog;
     _developerModeEnabled = developerMode;
@@ -475,6 +494,10 @@ class VpnCoreController {
         'Небезопасный профиль: поддерживаются только TLS/Reality',
       );
     }
+    final transportError = validateVlessTransportForXray(parsed);
+    if (transportError != null) {
+      return VpnCoreStartResult.failure(transportError);
+    }
     _parsedLink = parsed;
     _activeWindowsOutboundTag = parsed.tag ?? 'proxy';
     if (!_isWindows && !_isAndroid) {
@@ -483,6 +506,9 @@ class VpnCoreController {
 
     if (_isWindows) {
       await prepareWindowsRuntime(onLog: onLog);
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelledConnectResult();
+      }
     }
 
     final androidPackages = _isAndroid
@@ -625,6 +651,7 @@ class VpnCoreController {
       dnsFinalTag: dnsFinalTag,
       dpiEvasionConfig: dpiEvasionConfig,
       developerMode: developerMode,
+      connectionOperation: connectionOperation,
     );
     if (!result.success) {
       await _captureFailureDiagnostics(
@@ -647,8 +674,12 @@ class VpnCoreController {
     required String? dnsFinalTag,
     required DpiEvasionConfig dpiEvasionConfig,
     required bool developerMode,
+    required int connectionOperation,
   }) async {
     await _awaitWindowsPrewarmBudget();
+    if (!_isConnectionOperationCurrent(connectionOperation)) {
+      return _cancelledConnectResult();
+    }
     _notifyStatus('Поиск xray-core');
     var exePath = _cachedWindowsExecutablePath;
     if (exePath != null && !File(exePath).existsSync()) {
@@ -677,6 +708,9 @@ class VpnCoreController {
       'binary_verify',
       () => _verifyWindowsCoreBinary(resolvedExePath),
     );
+    if (!_isConnectionOperationCurrent(connectionOperation)) {
+      return _cancelledConnectResult();
+    }
     if (sanityError != null) {
       return VpnCoreStartResult.failure(sanityError);
     }
@@ -702,6 +736,9 @@ class VpnCoreController {
       attempt <= _maxWindowsAutoRecoverAttempts;
       attempt++
     ) {
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelledConnectResult();
+      }
       final token = ++_sessionEpoch;
       _activeConnectionToken = token;
       _notifyStatus(
@@ -720,6 +757,9 @@ class VpnCoreController {
         ),
       );
       _emitLogs(plan.logs);
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelWindowsAttempt(token);
+      }
       if (!plan.success) {
         await _cleanupSessionToken(token, reason: 'prepare-failed');
         final message = plan.requiresElevation
@@ -766,21 +806,18 @@ class VpnCoreController {
         interfaceName: plan.interfaceName,
         remoteHost: parsed.host,
       );
-      WindowsRouteUplink? uplink = _cachedWindowsUplink;
-      if (uplink != null) {
-        _lastConnectPhaseDurationsMs['uplink_discovery'] = 0;
-        _appendConnectionLog(
-          '[token=$token] reusing cached uplink ${uplink.interfaceName} via ${uplink.gateway}',
-        );
-      } else {
-        final uplinkDiscoveryLogs = <String>[];
-        uplink = await _measureConnectPhase(
-          'uplink_discovery',
-          () => _windowsRouteManager.discoverPrimaryUplink(
-            logs: uplinkDiscoveryLogs,
-          ),
-        );
-        _emitLogs(uplinkDiscoveryLogs);
+      // A prewarm result is advisory only. The physical route may change
+      // between app launch and the moment we redirect the default route.
+      final uplinkDiscoveryLogs = <String>[];
+      final uplink = await _measureConnectPhase(
+        'uplink_discovery',
+        () => _windowsRouteManager.discoverPrimaryUplink(
+          logs: uplinkDiscoveryLogs,
+        ),
+      );
+      _emitLogs(uplinkDiscoveryLogs);
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelWindowsAttempt(token);
       }
       if (uplink == null) {
         lastError = 'Не удалось определить активный uplink Windows';
@@ -797,6 +834,9 @@ class VpnCoreController {
         'endpoint_resolve',
         () => _resolveWindowsEndpoint(parsed.host),
       );
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelWindowsAttempt(token);
+      }
       if (endpoint.serverAddressOverride != null) {
         _appendConnectionLog(
           '[token=$token] using resolved server IP '
@@ -834,6 +874,22 @@ class VpnCoreController {
         () => cfgFile.writeAsString(jsonConfig),
       );
       _configFile = cfgFile;
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelWindowsAttempt(token);
+      }
+
+      _notifyStatus('Проверка конфигурации');
+      final configValidationError = await _measureConnectPhase(
+        'config_validate',
+        () => _validateWindowsConfig(resolvedExePath, cfgFile),
+      );
+      if (!_isConnectionOperationCurrent(connectionOperation)) {
+        return _cancelWindowsAttempt(token);
+      }
+      if (configValidationError != null) {
+        await _cleanupSessionToken(token, reason: 'config-validation-failed');
+        return VpnCoreStartResult.failure(configValidationError);
+      }
 
       _notifyStatus('Запуск процесса');
       _appendConnectionLog(
@@ -850,16 +906,22 @@ class VpnCoreController {
           ], environment: environment),
         );
         _process = process;
-        _attachProcessHandlers(process, plan.interfaceName, token);
+        _attachProcessHandlers(process, token);
         await _sessionStore.markDirty(
           interfaceName: plan.interfaceName,
           remoteHost: parsed.host,
           pid: process.pid,
         );
+        if (!_isConnectionOperationCurrent(connectionOperation)) {
+          return _cancelWindowsAttempt(token, process: process);
+        }
         final startupError = await _measureConnectPhase(
           'startup_verify',
           () => _verifyStartup(process, plan.interfaceName),
         );
+        if (!_isConnectionOperationCurrent(connectionOperation)) {
+          return _cancelWindowsAttempt(token, process: process);
+        }
         if (startupError == null) {
           final routeResult = await _measureConnectPhase(
             'route_apply',
@@ -874,6 +936,9 @@ class VpnCoreController {
             ),
           );
           _emitLogs(routeResult.logs);
+          if (!_isConnectionOperationCurrent(connectionOperation)) {
+            return _cancelWindowsAttempt(token, process: process);
+          }
           if (!routeResult.success || routeResult.session == null) {
             final routeError =
                 routeResult.error ??
@@ -895,6 +960,16 @@ class VpnCoreController {
           }
           _activeWindowsRouteSession = routeResult.session;
           _sessionRoutePlans[token] = routeResult.session!;
+          // Xray can choose a runtime adapter name (usually xray0) that is
+          // different from the requested session name. Keep the runtime name
+          // for cleanup and adapter statistics, while retaining inboundTag.
+          _activeInterfaceName = routeResult.session!.tunInterfaceName;
+          _sessionInterfaces[token] = routeResult.session!.tunInterfaceName;
+          await _sessionStore.markDirty(
+            interfaceName: routeResult.session!.tunInterfaceName,
+            remoteHost: parsed.host,
+            pid: process.pid,
+          );
           _cachedWindowsUplink = uplink;
           _pendingAggressiveRecovery = false;
           _windowsConnected = true;
@@ -951,6 +1026,26 @@ class VpnCoreController {
       lastError ?? 'Ошибка запуска: неизвестная ошибка',
     );
   }
+
+  bool _isConnectionOperationCurrent(int operation) =>
+      operation == _connectionOperationEpoch;
+
+  VpnCoreStartResult _cancelledConnectResult() =>
+      VpnCoreStartResult.failure('Подключение отменено');
+
+  Future<VpnCoreStartResult> _cancelWindowsAttempt(
+    int token, {
+    Process? process,
+  }) async {
+    if (process != null && identical(_process, process)) {
+      await _forceStopProcess(process);
+      await _teardownProcess();
+    }
+    await _cleanupSessionToken(token, reason: 'connect-cancelled');
+    return _cancelledConnectResult();
+  }
+
+  bool _isManagedTunPlanName(String name) => name.startsWith('tun-in-');
 
   String _buildConfigJson({
     required VlessLink parsed,
@@ -1128,6 +1223,28 @@ class VpnCoreController {
     }
   }
 
+  Future<String?> _validateWindowsConfig(
+    String executablePath,
+    File configFile,
+  ) async {
+    try {
+      final result = await _runMeasuredProcess(executablePath, [
+        'run',
+        '-test',
+        '-c',
+        configFile.path,
+      ]);
+      if (result.exitCode == 0) return null;
+      final details = '${result.stderr}\n${result.stdout}'.trim();
+      final compact = details.replaceAll(RegExp(r'\s+'), ' ');
+      return compact.isEmpty
+          ? 'Конфигурация Xray не прошла проверку'
+          : 'Конфигурация Xray не прошла проверку: $compact';
+    } catch (e) {
+      return 'Не удалось проверить конфигурацию Xray: $e';
+    }
+  }
+
   String? _computeWindowsRuleHash(String jsonConfig) {
     if (!_isWindows) return null;
     return _windowsCoreAdapter.computeRuleHash(jsonConfig);
@@ -1251,25 +1368,12 @@ class VpnCoreController {
     return false;
   }
 
-  Future<void> _terminateExistingProcesses({bool forceGlobal = false}) async {
+  Future<void> _terminateExistingProcesses() async {
     if (!_isWindows) return;
-    if (!forceGlobal) {
-      final process = _process;
-      if (process != null) {
-        await _forceStopProcess(process);
-        await _teardownProcess();
-      }
-      return;
-    }
-    try {
-      await _runMeasuredProcess('taskkill', [
-        '/F',
-        '/IM',
-        _windowsCoreAdapter.processName,
-      ]);
-      await Future.delayed(const Duration(milliseconds: 120));
-    } catch (_) {
-      // Best-effort cleanup before starting a new instance.
+    final process = _process;
+    if (process != null) {
+      await _forceStopProcess(process);
+      await _teardownProcess();
     }
   }
 
@@ -1277,6 +1381,7 @@ class VpnCoreController {
     void Function(String status)? onStatus,
     void Function(String log)? onLog,
   }) async {
+    _connectionOperationEpoch++;
     _statusSink = onStatus ?? _statusSink;
     _logSink = onLog ?? _logSink;
 
@@ -1333,8 +1438,10 @@ class VpnCoreController {
         _emitLogs(routeLogs);
         _activeWindowsRouteSession = null;
       }
-      final cleanup = await _tunGuard.cleanupAdapter(_activeInterfaceName);
-      _emitLogs(cleanup.logs);
+      if (_isManagedTunPlanName(_activeInterfaceName!)) {
+        final cleanup = await _tunGuard.cleanupAdapter(_activeInterfaceName);
+        _emitLogs(cleanup.logs);
+      }
       _activeInterfaceName = null;
     }
     _cachedWindowsUplink = null;
@@ -1344,6 +1451,7 @@ class VpnCoreController {
   }
 
   Future<void> forceTerminate() async {
+    _connectionOperationEpoch++;
     if (_isAndroid) {
       final running = await syncRuntimeState();
       if (running) {
@@ -1370,15 +1478,6 @@ class VpnCoreController {
 
     if (_isWindows) {
       _windowsConnected = false;
-      try {
-        await _runMeasuredProcess('taskkill', [
-          '/F',
-          '/IM',
-          _windowsCoreAdapter.processName,
-        ]);
-      } catch (_) {
-        // Best-effort cleanup for stray xray-core processes.
-      }
     }
 
     final process = _process;
@@ -1399,8 +1498,10 @@ class VpnCoreController {
         _emitLogs(routeLogs);
         _activeWindowsRouteSession = null;
       }
-      final cleanup = await _tunGuard.cleanupAdapter(_activeInterfaceName);
-      _emitLogs(cleanup.logs);
+      if (_isManagedTunPlanName(_activeInterfaceName!)) {
+        final cleanup = await _tunGuard.cleanupAdapter(_activeInterfaceName);
+        _emitLogs(cleanup.logs);
+      }
       _activeInterfaceName = null;
     }
     _cachedWindowsUplink = null;
@@ -1415,11 +1516,7 @@ class VpnCoreController {
     await _flushConnectionLog(force: true);
   }
 
-  void _attachProcessHandlers(
-    Process process,
-    String interfaceName,
-    int token,
-  ) {
+  void _attachProcessHandlers(Process process, int token) {
     _stdoutSub?.cancel();
     _stderrSub?.cancel();
 
@@ -2221,9 +2318,16 @@ if (-not \$s) { exit 0 }
         );
         _emitLogs(routeLogs);
       }
-      if (_isWindows && interfaceName != null) {
+      if (_isWindows &&
+          interfaceName != null &&
+          _isManagedTunPlanName(interfaceName)) {
         final cleanup = await _tunGuard.cleanupAdapter(interfaceName);
         _emitLogs(cleanup.logs);
+      } else if (_isWindows && interfaceName != null) {
+        _appendConnectionLog(
+          '[token=$token] skipping adapter removal for runtime interface '
+          '$interfaceName; Xray owns the adapter lifecycle',
+        );
       }
       _sessionInterfaces.remove(token);
       _sessionRoutePlans.remove(token);
@@ -2388,51 +2492,13 @@ if (-not \$s) { exit 0 }
   }
 
   Future<void> _warmupConnection() async {
-    // Расширенный прогрев с DNS-предзагрузкой популярных доменов.
-    const warmupDomains = [
-      // Основные CDN
-      'google.com',
-      'youtube.com',
-      'gstatic.com',
-      'ytimg.com',
-      'cloudflare.com',
-      'fastly.net',
-      // Популярные сервисы
-      'github.com',
-      'discord.com',
-      'telegram.org',
-      'facebook.com',
-      'instagram.com',
-      'twitter.com',
-      'reddit.com',
-      'netflix.com',
-      'spotify.com',
-      'amazon.com',
-      'apple.com',
-      'microsoft.com',
-    ];
+    final process = _process;
+    if (_isWindows && (process == null || !_windowsConnected)) return;
 
-    // DNS-предзагрузка без HTTP-запросов (быстрее)
-    for (final domain in warmupDomains) {
-      unawaited(_preloadDns(domain));
-    }
-
-    // Минимальный HTTP-прогрев, чтобы гарантированно создать реальный трафик через TUN.
-    // Это помогает диагностике (появятся outbound/handshake логи) и сразу отмечает клиента "online" на панели.
-    const warmupHttpDomains = ['cloudflare.com', 'www.microsoft.com'];
-    for (final domain in warmupHttpDomains) {
-      unawaited(_warmupDomain(domain));
-    }
-  }
-
-  Future<void> _preloadDns(String domain) async {
-    try {
-      await InternetAddress.lookup(
-        domain,
-      ).timeout(const Duration(milliseconds: 800));
-    } catch (_) {
-      // Тихое игнорирование ошибок DNS-прогрева.
-    }
+    // One bounded probe is enough to create a first flow for diagnostics.
+    // A fan-out over popular sites made startup noisy and could race cleanup.
+    await _warmupDomain('www.msftconnecttest.com');
+    if (_isWindows && !identical(_process, process)) return;
   }
 
   Future<void> _warmupDomain(String domain) async {

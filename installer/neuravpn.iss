@@ -74,6 +74,8 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 
 [UninstallRun]
 Filename: "taskkill"; Parameters: "/F /IM {#AppExeName}"; Flags: runhidden; RunOnceId: "KillApp"
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""neuravpn"" /F"; Flags: runhidden; RunOnceId: "DeleteAutoStartTask"
+Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""neuravpn"" /f"; Flags: runhidden; RunOnceId: "DeleteLegacyAutoStart"
 
 [Code]
 // Kill running instance before installing/updating

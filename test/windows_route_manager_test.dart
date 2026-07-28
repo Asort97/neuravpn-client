@@ -97,7 +97,17 @@ void main() {
         scripts.single,
         contains('-IPAddress \$tunAddress -PrefixLength \$tunPrefixLength'),
       );
-      expect(scripts.single, contains('Set-NetIPInterface -InterfaceIndex'));
+      expect(
+        scripts.single,
+        isNot(contains('Set-NetIPInterface -InterfaceIndex')),
+      );
+      expect(scripts.single, contains('-RouteMetric 4'));
+      expect(scripts.single, contains('-RouteMetric 5'));
+      expect(scripts.single, isNot(contains("DestinationPrefix '0.0.0.0/1'")));
+      expect(
+        scripts.single,
+        isNot(contains("DestinationPrefix '128.0.0.0/1'")),
+      );
       expect(
         scripts.single,
         contains(

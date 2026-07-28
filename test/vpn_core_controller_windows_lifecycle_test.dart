@@ -97,15 +97,19 @@ class _FakeTunGuard extends WindowsTunGuard {
 }
 
 class _FakeWindowsRouteManager extends WindowsRouteManager {
-  _FakeWindowsRouteManager()
-    : super(
-        processRunner: (executable, arguments) async =>
-            ProcessResult(1, 0, '', ''),
-        isWindowsOverride: true,
-      );
+  _FakeWindowsRouteManager({
+    this.applyDelay = Duration.zero,
+    this.actualTunName,
+  }) : super(
+         processRunner: (executable, arguments) async =>
+             ProcessResult(1, 0, '', ''),
+         isWindowsOverride: true,
+       );
 
   final List<String> applyCalls = <String>[];
   final List<String> cleanupCalls = <String>[];
+  final Duration applyDelay;
+  final String? actualTunName;
   bool applyShouldFail = false;
 
   @override
@@ -129,6 +133,9 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
     WindowsRouteUplink? uplink,
   }) async {
     applyCalls.add(preferredTunInterface);
+    if (applyDelay > Duration.zero) {
+      await Future<void>.delayed(applyDelay);
+    }
     if (applyShouldFail) {
       return const WindowsRouteApplyResult(
         success: false,
@@ -138,7 +145,7 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
     return WindowsRouteApplyResult(
       success: true,
       session: WindowsRouteSession(
-        tunInterfaceName: preferredTunInterface,
+        tunInterfaceName: actualTunName ?? preferredTunInterface,
         tunInterfaceIndex: 77,
         tunAddress: '172.19.0.1',
         uplinkInterfaceName: 'Ethernet',
@@ -161,7 +168,10 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
   }
 
   @override
-  Future<void> cleanupStale({List<String>? logs}) async {}
+  Future<bool> cleanupStale({
+    String? ownedInterfaceName,
+    List<String>? logs,
+  }) async => true;
 }
 
 Future<ProcessResult> _runnerWithXrayVersion(
@@ -335,6 +345,106 @@ void main() {
 
     expect(result.success, isFalse);
     expect(startCount, 1);
+  });
+
+  test('disconnect cancels an in-flight Windows connection', () async {
+    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+    final routeManager = _FakeWindowsRouteManager(
+      applyDelay: const Duration(milliseconds: 80),
+    );
+    final controller = VpnCoreController(
+      tunGuard: guard,
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async =>
+          _FakeProcess(pid: 2500),
+    );
+
+    final connecting = controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await controller.disconnect();
+    final result = await connecting;
+
+    expect(result.success, isFalse);
+    expect(result.errorMessage, 'Подключение отменено');
+    expect(controller.isRunning, isFalse);
+  });
+
+  test(
+    'rejects an invalid Xray configuration before process startup',
+    () async {
+      final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+      final routeManager = _FakeWindowsRouteManager();
+      var startCalls = 0;
+      final controller = VpnCoreController(
+        tunGuard: guard,
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: routeManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: (executable, arguments) async {
+          if (arguments.contains('version')) {
+            return ProcessResult(1, 0, 'Xray 1.8.24', '');
+          }
+          if (arguments.length >= 2 &&
+              arguments[0] == 'run' &&
+              arguments[1] == '-test') {
+            return ProcessResult(1, 1, '', 'invalid xhttp settings');
+          }
+          return ProcessResult(1, 0, '', '');
+        },
+        processStarter: (executable, arguments, {environment}) async {
+          startCalls += 1;
+          return _FakeProcess(pid: 2600);
+        },
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+      );
+
+      expect(result.success, isFalse);
+      expect(
+        result.errorMessage,
+        contains('Конфигурация Xray не прошла проверку'),
+      );
+      expect(startCalls, 0);
+    },
+  );
+
+  test('uses the runtime Xray adapter name for routes and cleanup', () async {
+    final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+    final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
+    final controller = VpnCoreController(
+      tunGuard: guard,
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async =>
+          _FakeProcess(pid: 2700),
+    );
+
+    final result = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+
+    expect(result.success, isTrue);
+    expect(controller.interfaceLabel, 'xray0');
+
+    await controller.disconnect();
+
+    expect(routeManager.cleanupCalls, contains('xray0'));
+    expect(guard.cleanupCalls, isNot(contains('xray0')));
   });
 
   test(

@@ -6,6 +6,27 @@ import 'vless_parser.dart';
 import '../models/split_tunnel_config.dart';
 import '../services/dpi_evasion_config.dart';
 
+/// Validates transport options that need semantic parsing before Xray sees
+/// them. Syntax is still finally checked by `xray run -test` on Windows.
+String? validateVlessTransportForXray(VlessLink link) {
+  final transport = _normalizeXrayNetwork(
+    (link.params['type'] ?? 'tcp').trim().toLowerCase(),
+  );
+  if (transport != 'xhttp') return null;
+
+  final rawExtra = link.params['extra'];
+  if (rawExtra == null || rawExtra.trim().isEmpty) return null;
+  try {
+    final decoded = jsonDecode(rawExtra);
+    if (decoded is! Map) {
+      return 'Параметр XHTTP extra должен быть JSON-объектом';
+    }
+  } on FormatException {
+    return 'Параметр XHTTP extra содержит некорректный JSON';
+  }
+  return null;
+}
+
 /// Генерация конфигурационного JSON для sing-box с TUN (wintun)
 /// Полноценный VPN туннель для всего устройства без SOCKS прокси
 String generateSingBoxConfig(
@@ -1137,10 +1158,11 @@ Map<String, dynamic> _buildXrayStreamSettings({
       };
       break;
     case 'xhttp':
-      settings['xhttpSettings'] = {
-        if (path != null && path.isNotEmpty) 'path': path,
-        'host': headerHost,
-      };
+      settings['xhttpSettings'] = _buildXhttpSettings(
+        params: params,
+        path: path,
+        headerHost: headerHost,
+      );
       break;
     case 'quic':
       settings['quicSettings'] = {
@@ -1155,6 +1177,76 @@ Map<String, dynamic> _buildXrayStreamSettings({
   }
 
   return settings;
+}
+
+Map<String, dynamic> _buildXhttpSettings({
+  required Map<String, String> params,
+  required String? path,
+  required String headerHost,
+}) {
+  final outer = _decodeXhttpExtra(params['extra']);
+  final nested = outer?['extra'];
+  final transportExtra = nested is Map
+      ? Map<String, dynamic>.from(nested)
+      : const <String, dynamic>{};
+
+  String? stringValue(String key) {
+    final direct = params[key]?.trim();
+    if (direct != null && direct.isNotEmpty) return direct;
+    final value = outer?[key];
+    final normalized = value?.toString().trim();
+    return normalized == null || normalized.isEmpty ? null : normalized;
+  }
+
+  final configuredPath = path?.trim().isNotEmpty == true
+      ? path!.trim()
+      : stringValue('path');
+  final configuredHost = params.containsKey('host')
+      ? headerHost
+      : (outer != null && outer.containsKey('host')
+            ? outer['host']?.toString() ?? ''
+            : headerHost);
+  final settings = <String, dynamic>{
+    if (configuredPath != null && configuredPath.isNotEmpty)
+      'path': configuredPath,
+    'host': configuredHost,
+  };
+
+  final mode = stringValue('mode');
+  if (mode != null) {
+    settings['mode'] = mode;
+  }
+
+  // These fields are emitted by common VLESS subscription generators. Keep
+  // their values untouched: several permit ranges such as `100-1000`.
+  for (final key in const <String>[
+    'xPaddingBytes',
+    'scMaxEachPostBytes',
+    'scMinPostsIntervalMs',
+    'scMaxBufferedPosts',
+    'scStreamUpServerSecs',
+    'noSSEHeader',
+    'xmux',
+  ]) {
+    final value = transportExtra[key];
+    if (value != null) {
+      settings[key] = value;
+    }
+  }
+  return settings;
+}
+
+Map<String, dynamic>? _decodeXhttpExtra(String? raw) {
+  if (raw == null || raw.trim().isEmpty) return null;
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) return null;
+    return decoded.map<String, dynamic>(
+      (key, value) => MapEntry(key.toString(), value),
+    );
+  } catch (_) {
+    return null;
+  }
 }
 
 String _normalizeXrayNetwork(String transportType) {

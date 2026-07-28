@@ -55,11 +55,7 @@ VlessLink? parseVlessUri(String raw) {
   final hashIndex = withoutScheme.indexOf('#');
   if (hashIndex != -1) {
     final rawTag = withoutScheme.substring(hashIndex + 1).trim();
-    try {
-      tag = Uri.decodeComponent(rawTag);
-    } catch (_) {
-      tag = rawTag;
-    }
+    tag = _decodeComponentOrRaw(rawTag);
     mainPart = withoutScheme.substring(0, hashIndex);
   }
 
@@ -85,10 +81,22 @@ VlessLink? parseVlessUri(String raw) {
   );
   if (!uuidRegex.hasMatch(uuid)) return null;
 
-  final colonIndex = hostPort.lastIndexOf(':');
-  if (colonIndex == -1) return null;
-  final host = hostPort.substring(0, colonIndex);
-  final portStr = hostPort.substring(colonIndex + 1);
+  String host;
+  String portStr;
+  if (hostPort.startsWith('[')) {
+    final closingBracket = hostPort.indexOf(']');
+    if (closingBracket <= 1 || closingBracket + 2 > hostPort.length) {
+      return null;
+    }
+    if (hostPort[closingBracket + 1] != ':') return null;
+    host = hostPort.substring(1, closingBracket);
+    portStr = hostPort.substring(closingBracket + 2);
+  } else {
+    final colonIndex = hostPort.lastIndexOf(':');
+    if (colonIndex == -1) return null;
+    host = hostPort.substring(0, colonIndex);
+    portStr = hostPort.substring(colonIndex + 1);
+  }
   final port = int.tryParse(portStr);
   if (port == null || port < 1 || port > 65535) return null;
 
@@ -101,10 +109,10 @@ VlessLink? parseVlessUri(String raw) {
       if (segment.isEmpty) continue;
       final eqIndex = segment.indexOf('=');
       if (eqIndex == -1) {
-        params[Uri.decodeComponent(segment)] = '';
+        params[_decodeComponentOrRaw(segment)] = '';
       } else {
-        final key = Uri.decodeComponent(segment.substring(0, eqIndex));
-        final value = Uri.decodeComponent(segment.substring(eqIndex + 1));
+        final key = _decodeComponentOrRaw(segment.substring(0, eqIndex));
+        final value = _decodeComponentOrRaw(segment.substring(eqIndex + 1));
         params[key] = value;
       }
     }
@@ -117,4 +125,12 @@ VlessLink? parseVlessUri(String raw) {
     params: params,
     tag: tag,
   );
+}
+
+String _decodeComponentOrRaw(String value) {
+  try {
+    return Uri.decodeComponent(value);
+  } on FormatException {
+    return value;
+  }
 }

@@ -28,7 +28,10 @@ class SubscriptionService {
     try {
       // Добавляем проверку на валидный URL
       final uri = Uri.tryParse(url);
-      if (uri == null || !uri.isAbsolute || uri.host.isEmpty) {
+      if (uri == null ||
+          !uri.isAbsolute ||
+          uri.host.isEmpty ||
+          (uri.scheme != 'https' && uri.scheme != 'http')) {
         throw const SubscriptionFetchException('Неверный формат URL');
       }
 
@@ -58,6 +61,10 @@ class SubscriptionService {
       );
     } on SocketException catch (e) {
       throw SubscriptionFetchException('Ошибка сети: ${e.message}');
+    } on http.ClientException catch (e) {
+      throw SubscriptionFetchException(
+        'Ошибка загрузки подписки: ${e.message}',
+      );
     } on TimeoutException {
       throw const SubscriptionFetchException(
         'Сервер подписки не ответил вовремя',
@@ -85,6 +92,10 @@ class SubscriptionService {
       final fallback = await _fetchBodyWithCurl(uri);
       if (fallback != null) return fallback;
       rethrow;
+    } on http.ClientException {
+      final fallback = await _fetchBodyWithCurl(uri);
+      if (fallback != null) return fallback;
+      rethrow;
     }
   }
 
@@ -93,8 +104,11 @@ class SubscriptionService {
     try {
       final result = await Process.run('curl.exe', <String>[
         '--location',
+        '--fail',
         '--silent',
         '--show-error',
+        '--connect-timeout',
+        '10',
         '--max-time',
         '${_timeout.inSeconds}',
         '--user-agent',
@@ -105,7 +119,9 @@ class SubscriptionService {
         final body = result.stdout?.toString() ?? '';
         if (body.trim().isNotEmpty) return body;
       }
-    } catch (_) {}
+    } catch (_) {
+      // The original transport error is more useful to the caller.
+    }
     return null;
   }
 
@@ -121,19 +137,25 @@ class SubscriptionService {
       final normalized = base64.normalize(compact);
       return utf8.decode(base64.decode(normalized), allowMalformed: true);
     } catch (_) {
-      return null;
+      try {
+        final normalized = base64Url.normalize(compact);
+        return utf8.decode(base64Url.decode(normalized), allowMalformed: true);
+      } catch (_) {
+        return null;
+      }
     }
   }
 
   /// Парсить VLESS URI из текста.
   List<String> _parseProfiles(String content) {
     final profiles = <String>[];
+    final seen = <String>{};
 
     final matches = RegExp(r'vless://[^\s]+').allMatches(content);
     for (final match in matches) {
-      final uri = match.group(0)?.trim();
+      final uri = match.group(0)?.trim().replaceFirst(RegExp("[\"',;]+\$"), '');
       if (uri == null || uri.isEmpty) continue;
-      if (isSecureVlessUri(uri)) {
+      if (isSecureVlessUri(uri) && seen.add(uri)) {
         profiles.add(uri);
       }
     }

@@ -79,56 +79,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       maxLines: 1,
       overflow: TextOverflow.ellipsis,
       style: TextStyle(
-        fontSize: 13,
+        fontSize: 13.5,
         color: Colors.white,
         fontWeight: enabled ? FontWeight.w700 : FontWeight.w500,
-      ),
-    );
-  }
-
-  List<String> _buildVlessTags(String uri) {
-    final parsed = parseVlessUri(uri);
-    if (parsed == null) return const [];
-
-    final tags = <String>['VLESS'];
-
-    final transport = (parsed.type?.trim().isNotEmpty ?? false)
-        ? parsed.type!.trim()
-        : 'tcp';
-    tags.add(transport.toUpperCase());
-
-    final security = parsed.security?.trim().toLowerCase() ?? '';
-    if (security == 'reality') {
-      tags.add('REALITY');
-    } else if (security == 'tls') {
-      tags.add('TLS');
-    } else {
-      tags.add('PLAIN');
-    }
-
-    final flow = parsed.flow?.trim();
-    if (flow != null && flow.isNotEmpty) {
-      tags.add(flow.toUpperCase());
-    }
-
-    return tags;
-  }
-
-  Widget _tagPill(String text) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: _surfaceColor,
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: Colors.white.withOpacity(0.08)),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          color: Colors.white.withOpacity(0.85),
-          fontSize: 11.5,
-          fontWeight: FontWeight.w600,
-        ),
       ),
     );
   }
@@ -155,16 +108,14 @@ class _ProfileListViewState extends State<ProfileListView> {
 
   late final SubscriptionRepository _repository;
   final SubscriptionService _manager = SubscriptionService();
+  final NeuraSmoothScrollController _scrollController =
+      NeuraSmoothScrollController();
   List<VpnSubscription> _subscriptions = const [];
   final Map<String, bool> _expandedSubscriptions = <String, bool>{};
+  final Set<String> _refreshingSubscriptions = <String>{};
   bool _isLoading = false;
   late int _lastRefreshToken;
 
-  bool get _isMobile =>
-      Theme.of(context).platform == TargetPlatform.android ||
-      Theme.of(context).platform == TargetPlatform.iOS;
-  static const Color _cardColor = Color(0xFF1A1A1A);
-  static const Color _surfaceColor = Color(0xFF2A2A2A);
   static const Color _borderColor = Color(0x14FFFFFF);
   static const Color _accentColor = Color(0xFFEF4444);
 
@@ -183,6 +134,12 @@ class _ProfileListViewState extends State<ProfileListView> {
       _lastRefreshToken = widget.subscriptionsRefreshToken;
       unawaited(_loadSubscriptions());
     }
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadSubscriptions() async {
@@ -207,6 +164,8 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   Future<void> _refreshSubscription(VpnSubscription subscription) async {
+    if (_refreshingSubscriptions.contains(subscription.id)) return;
+    setState(() => _refreshingSubscriptions.add(subscription.id));
     try {
       final profiles = await _manager.fetchSubscription(subscription.url);
       if (profiles.isEmpty) {
@@ -229,8 +188,8 @@ class _ProfileListViewState extends State<ProfileListView> {
         final newIndex = (oldIndex >= 0 && oldIndex < profiles.length)
             ? oldIndex
             : (subscription.selectedIndex < profiles.length
-                ? subscription.selectedIndex
-                : 0);
+                  ? subscription.selectedIndex
+                  : 0);
         if (newIndex < profiles.length) {
           final newUri = profiles[newIndex];
           final profile = VpnProfile(
@@ -246,6 +205,10 @@ class _ProfileListViewState extends State<ProfileListView> {
     } catch (e) {
       if (!mounted) return;
       _toast('Не удалось обновить подписку: $e', tone: NeuraToastTone.error);
+    } finally {
+      if (mounted) {
+        setState(() => _refreshingSubscriptions.remove(subscription.id));
+      }
     }
   }
 
@@ -290,6 +253,11 @@ class _ProfileListViewState extends State<ProfileListView> {
 
     final children = <Widget>[];
 
+    final selectedProfile = widget.selectedProfile;
+    if (selectedProfile != null) {
+      children.add(_buildCurrentSelection(selectedProfile));
+    }
+
     if (widget.profiles.isNotEmpty) {
       // Standalone VLESS keys imported manually
       children.add(_buildSectionHeader('Конфигурации'));
@@ -305,7 +273,12 @@ class _ProfileListViewState extends State<ProfileListView> {
       return const Center(child: Text('Профилей нет'));
     }
 
-    return ListView(children: children);
+    return ListView(
+      controller: _scrollController,
+      shrinkWrap: true,
+      padding: const EdgeInsets.only(bottom: 8),
+      children: children,
+    );
   }
 
   Widget _buildSectionHeader(String title) {
@@ -322,7 +295,6 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   List<Widget> _buildRegularKeys() {
-    final scheme = Theme.of(context).colorScheme;
     return List.generate(widget.profiles.length, (index) {
       final profile = widget.profiles[index];
       final isSelected = widget.selectedProfile?.uri == profile.uri;
@@ -394,105 +366,156 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   List<Widget> _buildSubscriptions() {
-    return _subscriptions.map((subscription) {
+    return List<Widget>.generate(_subscriptions.length, (index) {
+      final subscription = _subscriptions[index];
       final isExpanded = _expandedSubscriptions[subscription.id] ?? true;
-      return _buildSubscriptionCard(subscription, isExpanded);
-    }).toList();
+      return _buildSubscriptionCard(subscription, index, isExpanded);
+    });
   }
 
-  Widget _buildSubscriptionCard(VpnSubscription subscription, bool isExpanded) {
-    final scheme = Theme.of(context).colorScheme;
+  Widget _buildSubscriptionCard(
+    VpnSubscription subscription,
+    int subscriptionIndex,
+    bool isExpanded,
+  ) {
+    final isRefreshing = _refreshingSubscriptions.contains(subscription.id);
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
       child: Container(
         decoration: BoxDecoration(
-          color: Colors.transparent,
-          border: Border(
-            top: BorderSide(color: _borderColor),
-            bottom: BorderSide(color: _borderColor),
-          ),
+          color: Colors.white.withOpacity(0.018),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: _borderColor),
         ),
+        clipBehavior: Clip.antiAlias,
         child: Column(
           children: [
-            ListTile(
-              dense: true,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: 12,
-                vertical: 2,
-              ),
-              leading: Icon(Icons.cloud_download, color: scheme.primary),
-              title: Text(
-                subscription.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: IconButton(
-                icon: Icon(isExpanded ? Icons.expand_less : Icons.expand_more),
-                onPressed: () {
+            Material(
+              color: Colors.transparent,
+              child: InkWell(
+                onTap: () {
                   setState(() {
                     _expandedSubscriptions[subscription.id] = !isExpanded;
                   });
                 },
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        decoration: BoxDecoration(
+                          color: _accentColor.withOpacity(0.11),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.cloud_download_outlined,
+                          color: _accentColor,
+                          size: 18,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Tooltip(
+                          message: subscription.url,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                _subscriptionDisplayName(
+                                  subscription,
+                                  subscriptionIndex,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                '${_profileCountLabel(subscription.profileCount)} · ${_lastUpdatedLabel(subscription.lastUpdated)}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: Colors.white.withOpacity(0.48),
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      _subscriptionAction(
+                        tooltip: 'Обновить подписку',
+                        onPressed: isRefreshing
+                            ? null
+                            : () => _refreshSubscription(subscription),
+                        child: isRefreshing
+                            ? const SizedBox(
+                                width: 15,
+                                height: 15,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 1.8,
+                                  color: Colors.white54,
+                                ),
+                              )
+                            : const Icon(Icons.refresh_rounded, size: 18),
+                      ),
+                      _subscriptionAction(
+                        tooltip: 'Удалить подписку',
+                        onPressed: () => _deleteSubscription(subscription),
+                        hoverColor: NeuraUi.danger.withOpacity(0.12),
+                        child: const Icon(
+                          Icons.delete_outline_rounded,
+                          size: 18,
+                        ),
+                      ),
+                      _subscriptionAction(
+                        tooltip: isExpanded ? 'Свернуть' : 'Развернуть',
+                        onPressed: () {
+                          setState(() {
+                            _expandedSubscriptions[subscription.id] =
+                                !isExpanded;
+                          });
+                        },
+                        child: AnimatedRotation(
+                          turns: isExpanded ? 0.5 : 0,
+                          duration: NeuraUi.fast,
+                          curve: NeuraUi.curve,
+                          child: const Icon(
+                            Icons.expand_more_rounded,
+                            size: 19,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
-              onTap: () {
-                setState(() {
-                  _expandedSubscriptions[subscription.id] = !isExpanded;
-                });
-              },
             ),
-            if (isExpanded) ...[
-              const Divider(height: 1, indent: 12, endIndent: 12),
-              ..._buildSubscriptionProfiles(subscription),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                child: _isMobile
-                    ? Row(
-                        mainAxisAlignment: MainAxisAlignment.end,
+            ClipRect(
+              child: AnimatedSize(
+                duration: NeuraUi.normal,
+                curve: NeuraUi.curve,
+                alignment: Alignment.topCenter,
+                child: isExpanded
+                    ? Column(
                         children: [
-                          IconButton(
-                            tooltip: 'Обновить',
-                            onPressed: () => _refreshSubscription(subscription),
-                            icon: const Icon(Icons.refresh),
+                          Divider(
+                            height: 1,
+                            color: Colors.white.withOpacity(0.06),
                           ),
-                          IconButton(
-                            tooltip: 'Удалить',
-                            onPressed: () => _deleteSubscription(subscription),
-                            icon: const Icon(Icons.delete),
-                            color: NeuraUi.danger,
-                          ),
+                          ..._buildSubscriptionProfiles(subscription),
                         ],
                       )
-                    : Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                        children: [
-                          OutlinedButton.icon(
-                            onPressed: () => _refreshSubscription(subscription),
-                            icon: const Icon(Icons.refresh, size: 18),
-                            label: const Text('Обновить'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.white70,
-                              side: BorderSide(
-                                color: Colors.white.withOpacity(0.18),
-                              ),
-                              backgroundColor: _surfaceColor,
-                            ),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () => _deleteSubscription(subscription),
-                            icon: const Icon(Icons.delete, size: 18),
-                            label: const Text('Удалить'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.white,
-                              side: BorderSide(
-                                color: NeuraUi.danger.withOpacity(0.6),
-                              ),
-                              backgroundColor: NeuraUi.danger.withOpacity(0.2),
-                            ),
-                          ),
-                        ],
-                      ),
+                    : const SizedBox(width: double.infinity),
               ),
-            ],
+            ),
           ],
         ),
       ),
@@ -500,48 +523,275 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   List<Widget> _buildSubscriptionProfiles(VpnSubscription subscription) {
-    final scheme = Theme.of(context).colorScheme;
     return List.generate(subscription.profiles.length, (index) {
       final vlessUri = subscription.profiles[index];
       final isSelected = widget.selectedProfile?.uri == vlessUri;
 
-      return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 2),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            color: isSelected ? _accentColor.withOpacity(0.14) : null,
-            border: Border.all(
+      return Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: () {
+            final profile = VpnProfile(
+              name: _formatVlessSummary(vlessUri),
+              uri: vlessUri,
+            );
+            widget.onProfileSelected(profile);
+          },
+          hoverColor: Colors.white.withOpacity(0.035),
+          child: AnimatedContainer(
+            duration: NeuraUi.fast,
+            curve: NeuraUi.curve,
+            constraints: const BoxConstraints(minHeight: 58),
+            decoration: BoxDecoration(
               color: isSelected
-                  ? _accentColor.withOpacity(0.95)
+                  ? _accentColor.withOpacity(0.095)
                   : Colors.transparent,
-              width: isSelected ? 1.3 : 0,
+              border: Border(
+                bottom: BorderSide(color: Colors.white.withOpacity(0.045)),
+              ),
             ),
-            boxShadow: isSelected
-                ? [
-                    BoxShadow(
-                      color: _accentColor.withOpacity(0.18),
-                      blurRadius: 14,
-                      offset: const Offset(0, 6),
+            child: Stack(
+              children: [
+                if (isSelected)
+                  const Positioned(
+                    left: 0,
+                    top: 9,
+                    bottom: 9,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: _accentColor,
+                        borderRadius: BorderRadius.only(
+                          topRight: Radius.circular(3),
+                          bottomRight: Radius.circular(3),
+                        ),
+                      ),
+                      child: SizedBox(width: 3),
                     ),
-                  ]
-                : null,
-          ),
-          child: ListTile(
-            dense: true,
-            contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            title: _subscriptionProfileTitle(vlessUri, selected: true),
-            onTap: () {
-              final profile = VpnProfile(
-                name: _formatVlessSummary(vlessUri),
-                uri: vlessUri,
-              );
-              widget.onProfileSelected(profile);
-            },
+                  ),
+                ListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.fromLTRB(14, 6, 12, 6),
+                  title: _subscriptionProfileTitle(
+                    vlessUri,
+                    selected: isSelected,
+                  ),
+                  trailing: AnimatedSwitcher(
+                    duration: NeuraUi.fast,
+                    child: isSelected
+                        ? Container(
+                            key: const ValueKey('selected'),
+                            width: 24,
+                            height: 24,
+                            decoration: BoxDecoration(
+                              color: _accentColor.withOpacity(0.16),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.check_rounded,
+                              color: _accentColor,
+                              size: 16,
+                            ),
+                          )
+                        : const SizedBox(
+                            key: ValueKey('not-selected'),
+                            width: 24,
+                            height: 24,
+                          ),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
     });
+  }
+
+  Widget _buildCurrentSelection(VpnProfile profile) {
+    final subscription = _subscriptionForUri(profile.uri);
+    final subscriptionIndex = subscription == null
+        ? -1
+        : _subscriptions.indexOf(subscription);
+    final source = subscription == null
+        ? 'Локальная конфигурация'
+        : _subscriptionDisplayName(subscription, subscriptionIndex);
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 4, 4, 6),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 0, 8, 7),
+            child: Text(
+              'Текущий выбор',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.48),
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+            decoration: BoxDecoration(
+              color: _accentColor.withOpacity(0.085),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: _accentColor.withOpacity(0.2)),
+            ),
+            child: Row(
+              children: [
+                Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: _accentColor.withOpacity(0.16),
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(
+                    Icons.check_rounded,
+                    color: _accentColor,
+                    size: 17,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _vlessDisplayName(profile.uri),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        '$source · ${_vlessProtocolLine(profile.uri)}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.52),
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _subscriptionAction({
+    required String tooltip,
+    required VoidCallback? onPressed,
+    required Widget child,
+    Color? hoverColor,
+  }) {
+    return SizedBox(
+      width: 34,
+      height: 34,
+      child: IconButton(
+        tooltip: tooltip,
+        onPressed: onPressed,
+        padding: EdgeInsets.zero,
+        splashRadius: 18,
+        color: Colors.white54,
+        hoverColor: hoverColor ?? Colors.white.withOpacity(0.06),
+        icon: child,
+      ),
+    );
+  }
+
+  VpnSubscription? _subscriptionForUri(String uri) {
+    for (final subscription in _subscriptions) {
+      if (subscription.profiles.contains(uri)) return subscription;
+    }
+    return null;
+  }
+
+  String _subscriptionDisplayName(
+    VpnSubscription subscription,
+    int subscriptionIndex,
+  ) {
+    final name = subscription.name.trim();
+    final host = Uri.tryParse(subscription.url)?.host.trim() ?? '';
+    if (name.isNotEmpty && name.toLowerCase() != host.toLowerCase()) {
+      return name;
+    }
+
+    final commonProfileName = _commonProfileName(subscription.profiles);
+    if (commonProfileName.isNotEmpty) return commonProfileName;
+    if (name.isNotEmpty) return name;
+    return 'Подписка ${subscriptionIndex + 1}';
+  }
+
+  String _commonProfileName(List<String> profiles) {
+    if (profiles.isEmpty) return '';
+    final tokenLists = profiles
+        .map(_vlessDisplayName)
+        .map((name) => name.trim().split(RegExp(r'\s+')))
+        .where((tokens) => tokens.isNotEmpty)
+        .toList();
+    if (tokenLists.isEmpty) return '';
+
+    final shared = <String>[];
+    for (var index = 0; index < tokenLists.first.length; index++) {
+      final candidate = tokenLists.first[index];
+      if (tokenLists.every(
+        (tokens) =>
+            tokens.length > index &&
+            tokens[index].toLowerCase() == candidate.toLowerCase(),
+      )) {
+        shared.add(candidate);
+      } else {
+        break;
+      }
+    }
+
+    while (shared.isNotEmpty &&
+        !RegExp(r'[A-Za-zА-Яа-яЁё0-9]').hasMatch(shared.first)) {
+      shared.removeAt(0);
+    }
+    while (shared.isNotEmpty && RegExp(r'^\d+$').hasMatch(shared.last)) {
+      shared.removeLast();
+    }
+    return shared.join(' ').trim();
+  }
+
+  String _profileCountLabel(int count) {
+    final mod10 = count % 10;
+    final mod100 = count % 100;
+    final noun = mod10 == 1 && mod100 != 11
+        ? 'сервер'
+        : (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14))
+        ? 'сервера'
+        : 'серверов';
+    return '$count $noun';
+  }
+
+  String _lastUpdatedLabel(DateTime value) {
+    final difference = DateTime.now().difference(value);
+    if (difference.isNegative || difference.inMinutes < 1) {
+      return 'обновлено сейчас';
+    }
+    if (difference.inMinutes < 60) {
+      return 'обновлено ${difference.inMinutes} мин назад';
+    }
+    if (difference.inHours < 24) {
+      return 'обновлено ${difference.inHours} ч назад';
+    }
+    final day = value.day.toString().padLeft(2, '0');
+    final month = value.month.toString().padLeft(2, '0');
+    return 'обновлено $day.$month.${value.year}';
   }
 }

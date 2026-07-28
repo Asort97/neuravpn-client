@@ -84,6 +84,49 @@ void main() {
     expect(stream['xhttpSettings']['path'], '/edge');
   });
 
+  test('preserves XHTTP mode and nested extra settings from subscriptions', () {
+    final extra = Uri.encodeComponent(
+      jsonEncode({
+        'path': '/',
+        'host': '',
+        'mode': 'auto',
+        'extra': {
+          'xPaddingBytes': '100-1000',
+          'scMaxBufferedPosts': 30,
+          'noSSEHeader': false,
+          'xmux': {'maxConcurrency': '16-32'},
+        },
+      }),
+    );
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=reality&type=xhttp&sni=example.com&path=%2F&extra=$extra#proxy',
+    );
+    final config =
+        jsonDecode(generateXrayConfig(link, SplitTunnelConfig(mode: 'all')))
+            as Map<String, dynamic>;
+    final proxy = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((item) => item['tag'] == 'proxy');
+    final settings =
+        (proxy['streamSettings'] as Map<String, dynamic>)['xhttpSettings']
+            as Map<String, dynamic>;
+
+    expect(settings['host'], '');
+    expect(settings['mode'], 'auto');
+    expect(settings['xPaddingBytes'], '100-1000');
+    expect(settings['scMaxBufferedPosts'], 30);
+    expect(settings['noSSEHeader'], isFalse);
+    expect(settings['xmux'], {'maxConcurrency': '16-32'});
+    expect(validateVlessTransportForXray(link), isNull);
+  });
+
+  test('reports malformed XHTTP extra before Xray startup', () {
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=tls&type=xhttp&extra=%7Bbad#proxy',
+    );
+    expect(validateVlessTransportForXray(link), isNotNull);
+  });
+
   test('binds outbound sockets to selected uplink interface', () {
     final link = _parse(
       'vless://$_uuid@example.com:443?security=tls&type=tcp&sni=example.com#proxy',

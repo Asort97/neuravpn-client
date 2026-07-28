@@ -132,12 +132,13 @@ function Build-Windows([object]$config) {
     Compress-Archive -Path "$buildOutput\*" -DestinationPath $zipPath -Force
     Write-Host "Created release zip: $zipPath" -ForegroundColor Green
 
-    # Build Inno Setup installer if iscc is available
+    # Build Inno Setup installer. A release without a fresh installer is invalid.
     $iscc = Get-Command "iscc" -ErrorAction SilentlyContinue
     if (-not $iscc) {
       # Try standard Inno Setup install locations
       $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
       $isccPaths = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'),
         (Join-Path $pf86 'Inno Setup 6\ISCC.exe'),
         (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
       )
@@ -148,17 +149,24 @@ function Build-Windows([object]$config) {
       $iscc = $iscc.Source
     }
 
-    if ($iscc) {
-      $issPath = Join-Path $repoRoot 'installer' 'neuravpn.iss'
-      & $iscc "/DAppVersion=$($config.windows.buildName)" $issPath
-      if ($LASTEXITCODE -ne 0) {
-        Write-Host "Inno Setup build failed" -ForegroundColor Red
-      } else {
-        Write-Host "Installer created in build/" -ForegroundColor Green
-      }
-    } else {
-      Write-Host "Inno Setup not found — skipping installer. Install from https://jrsoftware.org/isinfo.php" -ForegroundColor Yellow
+    if (-not $iscc) {
+      throw "Inno Setup not found. Install it before building a Windows release."
     }
+
+    $issPath = Join-Path (Join-Path $repoRoot 'installer') 'neuravpn.iss'
+    $installerPath = Join-Path $repoRoot "build\neuravpn-setup-v$($config.windows.buildName).exe"
+    if (Test-Path $installerPath) {
+      Remove-Item $installerPath -Force
+    }
+
+    & $iscc "/DAppVersion=$($config.windows.buildName)" $issPath
+    if ($LASTEXITCODE -ne 0) {
+      throw "Inno Setup build failed"
+    }
+    if (-not (Test-Path $installerPath)) {
+      throw "Inno Setup reported success but installer was not created: $installerPath"
+    }
+    Write-Host "Created installer: $installerPath" -ForegroundColor Green
   } finally {
     Pop-Location
   }
