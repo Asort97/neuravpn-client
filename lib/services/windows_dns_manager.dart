@@ -35,9 +35,10 @@ class WindowsDnsTestResult extends WindowsDnsResult {
 
 /// Owns the Windows DNS changes made for a full-tunnel Xray session.
 ///
-/// The original interface and DoH state is persisted before any mutation.
-/// NRPT is intentionally not modified, so rules owned by Windows or other
-/// VPN clients remain untouched.
+/// Only the TUN interface DNS state is changed. A uniquely-owned NRPT root
+/// rule prevents DNS leaks while Xray intercepts port 53 and resolves through
+/// its own cached DNS layer. Legacy DoH backup data is still restored when
+/// recovering sessions created by older client versions.
 class WindowsDnsManager {
   WindowsDnsManager({
     WindowsDnsProcessRunner? processRunner,
@@ -48,11 +49,6 @@ class WindowsDnsManager {
        _backupFileOverride = backupFile;
 
   static const String managedRuleName = 'NeuraVPN Secure DNS';
-  static const List<String> secureDnsServers = <String>[
-    '9.9.9.9',
-    '149.112.112.112',
-  ];
-  static const String dohTemplate = 'https://dns.quad9.net/dns-query';
   static const String defaultProbeUrl =
       'https://tr.rbxcdn.com/'
       '180DAY-24b227dfaa727ea3b643df52ab801d3a/'
@@ -68,6 +64,12 @@ class WindowsDnsManager {
     if (!_isWindows) {
       return const WindowsDnsResult(success: true);
     }
+    if (uplinkInterfaceIndex <= 0) {
+      return const WindowsDnsResult(
+        success: false,
+        error: 'dns_uplink_interface_invalid',
+      );
+    }
     final backup = _backupFile;
     if (await backup.exists()) {
       return const WindowsDnsResult(
@@ -77,30 +79,7 @@ class WindowsDnsManager {
         ],
       );
     }
-
-    final result = await _runPowerShell(
-      _captureStateScript(uplinkInterfaceIndex),
-    );
-    if (result.exitCode != 0) {
-      return WindowsDnsResult(success: false, error: _resultDetails(result));
-    }
-    final decoded = _decodeMap(result.stdout);
-    if (decoded == null || decoded['Interfaces'] == null) {
-      return const WindowsDnsResult(
-        success: false,
-        error: 'dns_backup_parse_failed',
-      );
-    }
-    decoded['Version'] = 1;
-    decoded['ManagedBy'] = managedRuleName;
-    decoded['Phase'] = 'prepared';
-    decoded['CreatedAt'] = DateTime.now().toUtc().toIso8601String();
-    await backup.parent.create(recursive: true);
-    await backup.writeAsString(jsonEncode(decoded), flush: true);
-    return WindowsDnsResult(
-      success: true,
-      logs: <String>['[dns] Original Windows DNS state saved: ${backup.path}'],
-    );
+    return const WindowsDnsResult(success: true);
   }
 
   Future<WindowsDnsResult> apply({
@@ -110,19 +89,32 @@ class WindowsDnsManager {
     if (!_isWindows) {
       return const WindowsDnsResult(success: true);
     }
+    if (uplinkInterfaceIndex <= 0) {
+      return const WindowsDnsResult(
+        success: false,
+        error: 'dns_uplink_interface_invalid',
+      );
+    }
     final backup = _backupFile;
     if (!await backup.exists()) {
-      final prepared = await prepare(
-        uplinkInterfaceIndex: uplinkInterfaceIndex,
+      await backup.parent.create(recursive: true);
+      await backup.writeAsString(
+        jsonEncode(<String, dynamic>{
+          'Version': 2,
+          'ManagedBy': managedRuleName,
+          'Phase': 'preparing',
+          'CreatedAt': DateTime.now().toUtc().toIso8601String(),
+          'Interfaces': <Map<String, dynamic>>[],
+        }),
+        flush: true,
       );
-      if (!prepared.success) return prepared;
     }
 
     final state = await _readBackup();
-    if (state == null) {
+    if (state == null || state['ManagedBy'] != managedRuleName) {
       return const WindowsDnsResult(
         success: false,
-        error: 'dns_backup_invalid',
+        error: 'dns_backup_invalid_or_foreign',
       );
     }
     final interfaces = _asMapList(state['Interfaces']);
@@ -169,10 +161,11 @@ class WindowsDnsManager {
     return WindowsDnsResult(
       success: true,
       logs: <String>[
-        '[dns] Quad9 DNS assigned to the TUN interface.',
-        '[dns] Managed NRPT root rule directs system DNS through the tunnel.',
-        '[dns] Windows DoH enabled without UDP fallback.',
-        '[dns] Probe resolved tr.rbxcdn.com: ${addresses.join(', ')}',
+        '[dns] TUN DNS is routed into the Xray resolver.',
+        '[dns] Managed NRPT root rule prevents DNS leaks.',
+        '[dns] Xray handles DNS cache and upstream fallback.',
+        if (addresses.isNotEmpty)
+          '[dns] Active resolver addresses: ${addresses.join(', ')}',
       ],
     );
   }
@@ -311,39 +304,6 @@ if (\$success -eq $safeAttempts) {
     return null;
   }
 
-  String _captureStateScript(int interfaceIndex) {
-    final serversJson = jsonEncode(secureDnsServers);
-    return '''
-\$interface = & {
-${_captureInterfaceBody(interfaceIndex)}
-}
-\$managedServers = ConvertFrom-Json @'
-$serversJson
-'@
-\$doh = @()
-if (Get-Command Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue) {
-  foreach (\$server in @(\$managedServers)) {
-    \$entry = Get-DnsClientDohServerAddress -ServerAddress \$server -ErrorAction SilentlyContinue
-    if (\$entry) {
-      \$doh += [pscustomobject]@{
-        ServerAddress = \$server
-        Existed = \$true
-        DohTemplate = \$entry.DohTemplate
-        AllowFallbackToUdp = [bool]\$entry.AllowFallbackToUdp
-        AutoUpgrade = [bool]\$entry.AutoUpgrade
-      }
-    } else {
-      \$doh += [pscustomobject]@{ ServerAddress = \$server; Existed = \$false }
-    }
-  }
-}
-[pscustomobject]@{
-  Interfaces = @(\$interface)
-  Doh = @(\$doh)
-} | ConvertTo-Json -Depth 6 -Compress
-''';
-  }
-
   String _captureInterfaceScript(int interfaceIndex) {
     return '''
 \$interface = & {
@@ -369,29 +329,36 @@ if (-not \$interface) { throw 'dns_interface_not_found:$interfaceIndex' }
 
   String _applyScript(List<int> interfaceIndexes) {
     final targetsJson = jsonEncode(interfaceIndexes);
-    final serversJson = jsonEncode(secureDnsServers);
     return '''
 \$ErrorActionPreference = 'Stop'
 \$managedRuleName = '$managedRuleName'
 \$targets = ConvertFrom-Json @'
 $targetsJson
 '@
-\$servers = ConvertFrom-Json @'
-$serversJson
-'@
 try {
+  \$servers = @()
   foreach (\$index in @(\$targets | Sort-Object -Unique)) {
     \$iface = Get-NetIPInterface -InterfaceIndex \$index -AddressFamily IPv4 -ErrorAction SilentlyContinue
     if (\$iface) {
-      Set-DnsClientServerAddress -InterfaceIndex \$index -ServerAddresses @(\$servers) -ErrorAction Stop
+      \$tunAddress = Get-NetIPAddress -InterfaceIndex \$index -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { \$_.IPAddress -and \$_.IPAddress -notlike '169.254.*' } |
+        Select-Object -First 1
+      if (-not \$tunAddress) { throw "dns_tun_address_not_found:\$index" }
+      if ([int]\$tunAddress.PrefixLength -ne 30) {
+        throw "dns_tun_prefix_unsupported:\$([int]\$tunAddress.PrefixLength)"
+      }
+      \$bytes = [Net.IPAddress]::Parse(\$tunAddress.IPAddress).GetAddressBytes()
+      \$last = [int]\$bytes[3]
+      \$network = \$last - (\$last % 4)
+      \$peerLast = if (\$last -eq (\$network + 1)) { \$network + 2 } else { \$network + 1 }
+      \$bytes[3] = [byte]\$peerLast
+      \$resolverAddress = ([Net.IPAddress]::new(\$bytes)).IPAddressToString
+      \$servers += \$resolverAddress
+      Set-DnsClientServerAddress -InterfaceIndex \$index -ServerAddresses @(\$resolverAddress) -ErrorAction Stop
     }
   }
-  if (-not (Get-Command Set-DnsClientDohServerAddress -ErrorAction SilentlyContinue)) {
-    throw 'windows_doh_not_supported'
-  }
-  foreach (\$server in @(\$servers)) {
-    Set-DnsClientDohServerAddress -ServerAddress \$server -DohTemplate '$dohTemplate' -AllowFallbackToUdp \$false -AutoUpgrade \$true -ErrorAction Stop
-  }
+  \$servers = @(\$servers | Sort-Object -Unique)
+  if (\$servers.Count -eq 0) { throw 'dns_tun_resolver_not_found' }
   if (-not (Get-Command Add-DnsClientNrptRule -ErrorAction SilentlyContinue)) {
     throw 'windows_nrpt_not_supported'
   }
@@ -404,25 +371,9 @@ try {
     Remove-DnsClientNrptRule -Name \$rule.Name -Force -ErrorAction Stop
   }
   Add-DnsClientNrptRule -Namespace '.' -NameServers @(\$servers) -DisplayName \$managedRuleName -Comment \$managedRuleName -ErrorAction Stop | Out-Null
-  Clear-DnsClientCache -ErrorAction SilentlyContinue
-  \$addresses = @()
-  \$lastError = \$null
-  for (\$attempt = 0; \$attempt -lt 5 -and \$addresses.Count -eq 0; \$attempt++) {
-    try {
-      \$addresses = @(Resolve-DnsName -Name 'tr.rbxcdn.com' -Type A -DnsOnly -ErrorAction Stop |
-        Where-Object { \$_.IPAddress } |
-        Select-Object -ExpandProperty IPAddress)
-    } catch {
-      \$lastError = \$_.Exception.Message
-      Start-Sleep -Milliseconds 250
-    }
-  }
-  if (\$addresses.Count -eq 0) {
-    throw "dns_probe_failed: \$lastError"
-  }
   [pscustomobject]@{
     Success = \$true
-    Addresses = @(\$addresses | Sort-Object -Unique)
+    Addresses = @(\$servers)
   } | ConvertTo-Json -Compress
 } catch {
   [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } |
@@ -474,7 +425,6 @@ try {
       }
     }
   }
-  Clear-DnsClientCache -ErrorAction SilentlyContinue
   [pscustomobject]@{ Success = \$true } | ConvertTo-Json -Compress
 } catch {
   [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } |

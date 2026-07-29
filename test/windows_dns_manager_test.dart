@@ -29,6 +29,8 @@ const _tunState = <String, dynamic>{
   'InterfaceIndex': 77,
   'InterfaceAlias': 'xray0',
   'ServerAddresses': <String>[],
+  'IPAddress': '172.25.10.1',
+  'PrefixLength': 30,
 };
 
 class _DnsScriptRunner {
@@ -49,7 +51,7 @@ class _DnsScriptRunner {
       return ProcessResult(
         1,
         0,
-        '{"Success":true,"Addresses":["18.65.1.1"]}',
+        '{"Success":true,"Addresses":["172.25.10.2"]}',
         '',
       );
     }
@@ -98,7 +100,7 @@ void main() {
     }
   });
 
-  test('prepare saves original uplink DNS and DoH before mutation', () async {
+  test('prepare stays off the critical path and does not mutate DNS', () async {
     final runner = _DnsScriptRunner();
     final manager = WindowsDnsManager(
       isWindowsOverride: true,
@@ -109,23 +111,11 @@ void main() {
     final result = await manager.prepare(uplinkInterfaceIndex: 12);
 
     expect(result.success, isTrue);
-    expect(await backupFile.exists(), isTrue);
-    final state =
-        jsonDecode(await backupFile.readAsString()) as Map<String, dynamic>;
-    expect(state['ManagedBy'], WindowsDnsManager.managedRuleName);
-    expect(state['Phase'], 'prepared');
-    expect((state['Interfaces'] as List).first['ServerAddresses'], <String>[
-      '192.168.0.1',
-    ]);
-    expect(
-      (state['Doh'] as List).first['DohTemplate'],
-      contains('old.example'),
-    );
-    expect(runner.scripts, hasLength(1));
-    expect(runner.scripts.single, isNot(contains('Set-DnsClient')));
+    expect(await backupFile.exists(), isFalse);
+    expect(runner.scripts, isEmpty);
   });
 
-  test('apply backs up TUN and enables managed Quad9 DNS routing', () async {
+  test('apply backs up TUN and enables managed DNS routing', () async {
     final runner = _DnsScriptRunner();
     final manager = WindowsDnsManager(
       isWindowsOverride: true,
@@ -143,19 +133,25 @@ void main() {
     final state =
         jsonDecode(await backupFile.readAsString()) as Map<String, dynamic>;
     expect(state['Phase'], 'applied');
+    expect(state['Version'], 2);
     expect(
       (state['Interfaces'] as List).map((item) => item['InterfaceIndex']),
-      containsAll(<int>[12, 77]),
+      <int>[77],
     );
     final applyScript = runner.scripts.firstWhere(
       (script) => script.contains(r'$targets = ConvertFrom-Json'),
     );
-    expect(applyScript, contains('9.9.9.9'));
-    expect(applyScript, contains('149.112.112.112'));
-    expect(applyScript, contains(WindowsDnsManager.dohTemplate));
-    expect(applyScript, contains(r'-AllowFallbackToUdp $false'));
-    expect(applyScript, contains(r'-AutoUpgrade $true'));
-    expect(applyScript, contains('Clear-DnsClientCache'));
+    expect(applyScript, contains('Get-NetIPAddress'));
+    expect(applyScript, contains(r'$tunAddress.PrefixLength -ne 30'));
+    expect(applyScript, contains(r'$last % 4'));
+    expect(applyScript, isNot(contains('9.9.9.9')));
+    expect(applyScript, isNot(contains('149.112.112.112')));
+    expect(applyScript, isNot(contains('Set-DnsClientDohServerAddress')));
+    expect(applyScript, isNot(contains('AllowFallbackToUdp')));
+    expect(applyScript, isNot(contains('AutoUpgrade')));
+    expect(applyScript, isNot(contains('Clear-DnsClientCache')));
+    expect(applyScript, isNot(contains('Resolve-DnsName')));
+    expect(applyScript, isNot(contains('Start-Sleep')));
     expect(applyScript, isNot(contains('New-NetRoute')));
     expect(applyScript, contains("Add-DnsClientNrptRule -Namespace '.'"));
     expect(
@@ -192,35 +188,38 @@ void main() {
     );
   });
 
-  test(
-    'restore returns original DNS and DoH state and deletes backup',
-    () async {
-      final runner = _DnsScriptRunner();
-      final manager = WindowsDnsManager(
-        isWindowsOverride: true,
-        backupFile: backupFile,
-        processRunner: runner.call,
-      );
-      await manager.prepare(uplinkInterfaceIndex: 12);
-      await manager.apply(uplinkInterfaceIndex: 12, tunInterfaceIndex: 77);
+  test('restore supports legacy DNS and DoH backup state', () async {
+    final runner = _DnsScriptRunner();
+    final manager = WindowsDnsManager(
+      isWindowsOverride: true,
+      backupFile: backupFile,
+      processRunner: runner.call,
+    );
+    final legacyState = <String, dynamic>{
+      ..._uplinkState,
+      'Version': 1,
+      'ManagedBy': WindowsDnsManager.managedRuleName,
+      'Phase': 'applied',
+    };
+    await backupFile.parent.create(recursive: true);
+    await backupFile.writeAsString(jsonEncode(legacyState));
 
-      final result = await manager.restore();
+    final result = await manager.restore();
 
-      expect(result.success, isTrue);
-      expect(await backupFile.exists(), isFalse);
-      final restoreScript = runner.scripts.firstWhere(
-        (script) => script.contains(r'$interfaces = ConvertFrom-Json'),
-      );
-      expect(restoreScript, contains('192.168.0.1'));
-      expect(restoreScript, contains('https://old.example/dns-query'));
-      expect(restoreScript, contains(r'-AllowFallbackToUdp ([bool]$item.'));
-      expect(restoreScript, contains('Remove-DnsClientDohServerAddress'));
-      expect(restoreScript, contains('Remove-DnsClientNrptRule'));
-      expect(restoreScript, contains(r'$_.DisplayName -eq $managedRuleName'));
-      expect(restoreScript, contains(r'$_.Comment -eq $managedRuleName'));
-      expect(restoreScript, contains('Clear-DnsClientCache'));
-    },
-  );
+    expect(result.success, isTrue);
+    expect(await backupFile.exists(), isFalse);
+    final restoreScript = runner.scripts.firstWhere(
+      (script) => script.contains(r'$interfaces = ConvertFrom-Json'),
+    );
+    expect(restoreScript, contains('192.168.0.1'));
+    expect(restoreScript, contains('https://old.example/dns-query'));
+    expect(restoreScript, contains(r'-AllowFallbackToUdp ([bool]$item.'));
+    expect(restoreScript, contains('Remove-DnsClientDohServerAddress'));
+    expect(restoreScript, contains('Remove-DnsClientNrptRule'));
+    expect(restoreScript, contains(r'$_.DisplayName -eq $managedRuleName'));
+    expect(restoreScript, contains(r'$_.Comment -eq $managedRuleName'));
+    expect(restoreScript, isNot(contains('Clear-DnsClientCache')));
+  });
 
   test('failed restore keeps backup for next-launch recovery', () async {
     final runner = _DnsScriptRunner(failRestore: true);
@@ -229,7 +228,15 @@ void main() {
       backupFile: backupFile,
       processRunner: runner.call,
     );
-    await manager.prepare(uplinkInterfaceIndex: 12);
+    await backupFile.parent.create(recursive: true);
+    await backupFile.writeAsString(
+      jsonEncode(<String, dynamic>{
+        ..._uplinkState,
+        'Version': 1,
+        'ManagedBy': WindowsDnsManager.managedRuleName,
+        'Phase': 'applied',
+      }),
+    );
 
     final result = await manager.restore();
 

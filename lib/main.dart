@@ -32,6 +32,7 @@ import 'services/subscription_repository.dart';
 import 'services/subscription_manager.dart';
 import 'services/update_service.dart';
 import 'services/windows_auto_start_manager.dart';
+import 'services/windows_preferences_recovery.dart';
 import 'services/windows_uri_protocol_registrar.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
@@ -186,6 +187,23 @@ Future<void> _writeCrashReport(
   }
 }
 
+Future<void> _recoverWindowsPreferences() async {
+  if (!Platform.isWindows) return;
+
+  try {
+    final supportDirectory = await getApplicationSupportDirectory();
+    final result = await WindowsPreferencesRecovery.recover(supportDirectory);
+    if (result.changed) {
+      debugPrint(
+        '[PREFS] Recovery action: ${result.action.name}'
+        '${result.quarantinedPath == null ? '' : ', quarantined=${result.quarantinedPath}'}',
+      );
+    }
+  } catch (error, stack) {
+    await _writeCrashReport('preferences-recovery', error, stack);
+  }
+}
+
 @visibleForTesting
 bool isSupportedLaunchImportValue(String value) {
   final trimmed = value.trim();
@@ -288,6 +306,7 @@ void main(List<String> args) {
         unawaited(_writeCrashReport('platform', error, stack));
         return true;
       };
+      await _recoverWindowsPreferences();
       await initializeDateFormatting('ru_RU', null);
       await DomainRuleNormalizer.initializeDefaultRules();
       if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
@@ -3288,8 +3307,12 @@ $regItems = foreach ($rp in $regPaths) {
           tone: NeuraToastTone.warning,
         );
       }
-    } catch (e) {
-      showNeuraToast(context, 'Ошибка: $e', tone: NeuraToastTone.error);
+    } catch (e, stack) {
+      unawaited(_writeCrashReport('subscription-import', e, stack));
+      final message = e is FormatException
+          ? 'Локальные настройки повреждены. Перезапустите приложение для восстановления.'
+          : 'Ошибка: $e';
+      showNeuraToast(context, message, tone: NeuraToastTone.error);
     }
   }
 

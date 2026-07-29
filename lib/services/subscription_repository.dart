@@ -19,7 +19,6 @@ class SubscriptionRepository {
   /// Получить все подписки
   Future<List<VpnSubscription>> getAllSubscriptions() async {
     await initialize();
-    await _prefs.reload();
     final stored = _prefs.getStringList(_storageKey) ?? [];
     return stored
         .map((json) {
@@ -149,7 +148,6 @@ class SubscriptionRepository {
   /// Получить выбранную подписку (ID)
   Future<String?> getSelectedSubscriptionId() async {
     await initialize();
-    await _prefs.reload();
     return _prefs.getString(_selectedSubscriptionKey);
   }
 

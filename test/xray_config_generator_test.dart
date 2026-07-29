@@ -24,11 +24,50 @@ void main() {
 
     expect(config['api'], isNotNull);
     expect(config['stats'], isNotNull);
-    expect((config['outbounds'] as List).isNotEmpty, isTrue);
+    final outbounds = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(outbounds, isNotEmpty);
     final dns = config['dns'] as Map<String, dynamic>;
-    expect(dns['servers'], <String>['9.9.9.9', '149.112.112.112']);
-    expect(jsonEncode(dns), isNot(contains('8.8.8.8')));
-    expect(jsonEncode(dns), isNot(contains('1.1.1.1')));
+    final dnsServers = (dns['servers'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(dnsServers.map((server) => server['address']), <String>[
+      'https://9.9.9.9/dns-query',
+      'https://1.1.1.1/dns-query',
+    ]);
+    expect(dnsServers.map((server) => server['timeoutMs']), everyElement(1500));
+    expect(dns['disableCache'], isFalse);
+    expect(dns['serveStale'], isTrue);
+    expect(dns['serveExpiredTTL'], 300);
+    expect(dns['enableParallelQuery'], isTrue);
+    expect(dns['tag'], 'dns-query');
+
+    final dnsOutbound = outbounds.firstWhere(
+      (outbound) => outbound['tag'] == 'dns-out',
+    );
+    expect(dnsOutbound['protocol'], 'dns');
+    expect(dnsOutbound['settings']['nonIPQuery'], 'skip');
+    expect(dnsOutbound['proxySettings']['tag'], 'proxy');
+
+    final rules =
+        ((config['routing'] as Map<String, dynamic>)['rules'] as List<dynamic>)
+            .cast<Map<String, dynamic>>();
+    final interceptedDnsRule = rules.firstWhere(
+      (rule) =>
+          rule['port'] == 53 &&
+          rule['network'] == 'tcp,udp' &&
+          rule['outboundTag'] == 'dns-out',
+    );
+    expect(interceptedDnsRule['type'], 'field');
+    expect(interceptedDnsRule['inboundTag'], <String>['tun-in']);
+    expect(
+      rules.any(
+        (rule) =>
+            rule['outboundTag'] == 'proxy' &&
+            (rule['inboundTag'] as List<dynamic>? ?? const <dynamic>[])
+                .contains('dns-query'),
+      ),
+      isTrue,
+    );
   });
 
   test('adds anti-loop guard rule for link-local UDP broadcast traffic', () {
@@ -233,6 +272,17 @@ void main() {
     final outbounds = (config['outbounds'] as List<dynamic>)
         .cast<Map<String, dynamic>>();
     expect(outbounds.first['tag'], 'direct');
+    expect(outbounds.any((outbound) => outbound['tag'] == 'dns-out'), isFalse);
+    final dns = config['dns'] as Map<String, dynamic>;
+    expect(dns['servers'], <String>['9.9.9.9', '149.112.112.112']);
+    expect(rules.any((rule) => rule['outboundTag'] == 'dns-out'), isFalse);
+    expect(
+      rules.any(
+        (rule) => (rule['inboundTag'] as List<dynamic>? ?? const <dynamic>[])
+            .contains('dns-query'),
+      ),
+      isFalse,
+    );
   });
 
   test('uses proxy as default outbound for blacklist mode', () {

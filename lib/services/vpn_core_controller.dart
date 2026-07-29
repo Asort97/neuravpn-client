@@ -1506,6 +1506,10 @@ class VpnCoreController {
     }
     await _teardownProcess();
 
+    if (_isWindows) {
+      final dnsRestore = await _windowsDnsManager.restore();
+      _emitLogs(dnsRestore.logs);
+    }
     final activeToken = _activeConnectionToken;
     if (activeToken != null) {
       await _cleanupSessionToken(activeToken, reason: 'manual-disconnect');
@@ -1524,10 +1528,6 @@ class VpnCoreController {
         _emitLogs(cleanup.logs);
       }
       _activeInterfaceName = null;
-    }
-    if (_isWindows) {
-      final dnsRestore = await _windowsDnsManager.restore();
-      _emitLogs(dnsRestore.logs);
     }
     _cachedWindowsUplink = null;
     await _sessionStore.clear();
@@ -1570,6 +1570,10 @@ class VpnCoreController {
       await _forceStopProcess(process);
       await _teardownProcess();
     }
+    if (_isWindows) {
+      final dnsRestore = await _windowsDnsManager.restore();
+      _emitLogs(dnsRestore.logs);
+    }
     final token = _activeConnectionToken;
     if (token != null) {
       await _cleanupSessionToken(token, reason: 'force-terminate');
@@ -1588,10 +1592,6 @@ class VpnCoreController {
         _emitLogs(cleanup.logs);
       }
       _activeInterfaceName = null;
-    }
-    if (_isWindows) {
-      final dnsRestore = await _windowsDnsManager.restore();
-      _emitLogs(dnsRestore.logs);
     }
     _cachedWindowsUplink = null;
     await _sessionStore.clear();

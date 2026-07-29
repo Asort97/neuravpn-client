@@ -260,6 +260,7 @@ String generateXrayConfig(
   final realityPublicKey = p['pbk'];
   final realityShortId = p['sid'];
   final vpnTag = link.tag ?? 'proxy';
+  final useSecureDnsProxy = splitConfig.mode != 'whitelist';
   final trimmedInterfaceName = outboundInterfaceName?.trim();
   final trimmedBindAddress = outboundBindAddress?.trim();
   final outboundServerAddress = serverAddressOverride?.trim().isNotEmpty == true
@@ -314,6 +315,17 @@ String generateXrayConfig(
   final primaryOutbounds = splitConfig.mode == 'whitelist'
       ? <Map<String, dynamic>>[directOutbound, outbound]
       : <Map<String, dynamic>>[outbound, directOutbound];
+  final dnsOutbound = <String, dynamic>{
+    'tag': 'dns-out',
+    'protocol': 'dns',
+    'settings': {
+      'network': 'udp',
+      'address': '9.9.9.9',
+      'port': 53,
+      'nonIPQuery': 'skip',
+    },
+    'proxySettings': {'tag': vpnTag},
+  };
 
   final routeRules = <Map<String, dynamic>>[
     {
@@ -321,6 +333,20 @@ String generateXrayConfig(
       'inboundTag': ['api-in'],
       'outboundTag': 'api',
     },
+    if (useSecureDnsProxy) ...[
+      {
+        'type': 'field',
+        'inboundTag': [inboundTag],
+        'port': 53,
+        'network': 'tcp,udp',
+        'outboundTag': 'dns-out',
+      },
+      {
+        'type': 'field',
+        'inboundTag': ['dns-query'],
+        'outboundTag': vpnTag,
+      },
+    ],
     // Prevent Windows link-local broadcast/multicast UDP loops via TUN.
     // These packets are not useful for the VPN session and may recurse back
     // into the TUN device, exhausting socket buffers and starving real traffic.
@@ -371,12 +397,23 @@ String generateXrayConfig(
         'statsOutboundDownlink': true,
       },
     },
-    'dns': {
-      // Quad9 stays inside the TUN default route on Windows. The VPN endpoint
-      // itself is pre-resolved and is the only host route kept on the uplink.
-      'servers': ['9.9.9.9', '149.112.112.112'],
-      'queryStrategy': 'UseIPv4',
-    },
+    'dns': useSecureDnsProxy
+        ? {
+            'servers': [
+              {'address': 'https://9.9.9.9/dns-query', 'timeoutMs': 1500},
+              {'address': 'https://1.1.1.1/dns-query', 'timeoutMs': 1500},
+            ],
+            'queryStrategy': 'UseIPv4',
+            'disableCache': false,
+            'serveStale': true,
+            'serveExpiredTTL': 300,
+            'enableParallelQuery': true,
+            'tag': 'dns-query',
+          }
+        : {
+            'servers': ['9.9.9.9', '149.112.112.112'],
+            'queryStrategy': 'UseIPv4',
+          },
     'inbounds': [
       {
         'tag': inboundTag,
@@ -404,6 +441,7 @@ String generateXrayConfig(
     ],
     'outbounds': [
       ...primaryOutbounds,
+      if (useSecureDnsProxy) dnsOutbound,
       {'tag': 'block', 'protocol': 'blackhole'},
       _buildXrayApiOutbound(
         {'tag': 'api', 'protocol': 'freedom'},
