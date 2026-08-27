@@ -158,12 +158,18 @@ class WindowsDnsManager {
     state['Phase'] = 'applied';
     await backup.writeAsString(jsonEncode(state), flush: true);
     final addresses = _asStringList(decoded['Addresses']);
+    final nrptApplied = decoded['NrptApplied'] == true;
+    final warning = decoded['Warning']?.toString().trim();
     return WindowsDnsResult(
       success: true,
       logs: <String>[
         '[dns] TUN DNS is routed into the Xray resolver.',
-        '[dns] Managed NRPT root rule prevents DNS leaks.',
+        if (nrptApplied)
+          '[dns] Managed NRPT root rule prevents DNS leaks.'
+        else
+          '[dns] NRPT is unavailable; using TUN DNS priority fallback.',
         '[dns] Xray handles DNS cache and upstream fallback.',
+        if (warning != null && warning.isNotEmpty) '[dns] Warning: $warning',
         if (addresses.isNotEmpty)
           '[dns] Active resolver addresses: ${addresses.join(', ')}',
       ],
@@ -208,12 +214,43 @@ class WindowsDnsManager {
 
   Future<WindowsDnsResult> recover() async {
     final result = await restore();
-    if (!result.success || result.logs.isEmpty) return result;
-    return WindowsDnsResult(
+    if (result.success) {
+      if (result.logs.isEmpty) return result;
+      return WindowsDnsResult(
+        success: true,
+        logs: <String>[
+          '[dns] Recovered unfinished NeuraVPN DNS session.',
+          ...result.logs,
+        ],
+      );
+    }
+
+    if (result.error != 'dns_backup_invalid_or_foreign') {
+      return result;
+    }
+
+    // A stale/corrupt snapshot must not permanently prevent the VPN from
+    // starting. Only remove policy owned by NeuraVPN, then start clean.
+    final policyCleanup = await _runPowerShell(_clearManagedPolicyScript());
+    final decoded = _decodeMap(policyCleanup.stdout);
+    final policyClean =
+        policyCleanup.exitCode == 0 &&
+        decoded != null &&
+        decoded['Success'] == true;
+    if (!policyClean) return result;
+
+    try {
+      if (await _backupFile.exists()) {
+        await _backupFile.delete();
+      }
+    } catch (_) {
+      return result;
+    }
+    return const WindowsDnsResult(
       success: true,
       logs: <String>[
-        '[dns] Recovered unfinished NeuraVPN DNS session.',
-        ...result.logs,
+        '[dns] Discarded an unusable DNS recovery snapshot.',
+        '[dns] Removed stale NeuraVPN DNS policy.',
       ],
     );
   }
@@ -337,6 +374,8 @@ $targetsJson
 '@
 try {
   \$servers = @()
+  \$nrptApplied = \$false
+  \$warning = \$null
   foreach (\$index in @(\$targets | Sort-Object -Unique)) {
     \$iface = Get-NetIPInterface -InterfaceIndex \$index -AddressFamily IPv4 -ErrorAction SilentlyContinue
     if (\$iface) {
@@ -355,26 +394,66 @@ try {
       \$resolverAddress = ([Net.IPAddress]::new(\$bytes)).IPAddressToString
       \$servers += \$resolverAddress
       Set-DnsClientServerAddress -InterfaceIndex \$index -ServerAddresses @(\$resolverAddress) -ErrorAction Stop
+      Set-NetIPInterface -InterfaceIndex \$index -AddressFamily IPv4 -AutomaticMetric Disabled -InterfaceMetric 1 -ErrorAction SilentlyContinue | Out-Null
     }
   }
   \$servers = @(\$servers | Sort-Object -Unique)
   if (\$servers.Count -eq 0) { throw 'dns_tun_resolver_not_found' }
-  if (-not (Get-Command Add-DnsClientNrptRule -ErrorAction SilentlyContinue)) {
-    throw 'windows_nrpt_not_supported'
+  \$hasNrpt = (
+    (Get-Command Get-DnsClientNrptRule -ErrorAction SilentlyContinue) -and
+    (Get-Command Add-DnsClientNrptRule -ErrorAction SilentlyContinue) -and
+    (Get-Command Remove-DnsClientNrptRule -ErrorAction SilentlyContinue)
+  )
+  if (\$hasNrpt) {
+    try {
+      \$existingManagedRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+        Where-Object {
+          \$_.DisplayName -eq \$managedRuleName -and
+          \$_.Comment -eq \$managedRuleName
+        })
+      foreach (\$rule in \$existingManagedRules) {
+        Remove-DnsClientNrptRule -Name \$rule.Name -Force -ErrorAction Stop
+      }
+      Add-DnsClientNrptRule -Namespace '.' -NameServers @(\$servers) -DisplayName \$managedRuleName -Comment \$managedRuleName -ErrorAction Stop | Out-Null
+      \$nrptApplied = \$true
+    } catch {
+      \$warning = "windows_nrpt_apply_failed: \$(\$_.Exception.Message)"
+    }
+  } else {
+    \$warning = 'windows_nrpt_not_supported'
   }
-  \$existingManagedRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
-    Where-Object {
-      \$_.DisplayName -eq \$managedRuleName -and
-      \$_.Comment -eq \$managedRuleName
-    })
-  foreach (\$rule in \$existingManagedRules) {
-    Remove-DnsClientNrptRule -Name \$rule.Name -Force -ErrorAction Stop
-  }
-  Add-DnsClientNrptRule -Namespace '.' -NameServers @(\$servers) -DisplayName \$managedRuleName -Comment \$managedRuleName -ErrorAction Stop | Out-Null
   [pscustomobject]@{
     Success = \$true
     Addresses = @(\$servers)
+    NrptApplied = \$nrptApplied
+    Warning = \$warning
   } | ConvertTo-Json -Compress
+} catch {
+  [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } |
+    ConvertTo-Json -Compress
+}
+''';
+  }
+
+  String _clearManagedPolicyScript() {
+    return '''
+\$ErrorActionPreference = 'Stop'
+\$managedRuleName = '$managedRuleName'
+try {
+  if (
+    (Get-Command Get-DnsClientNrptRule -ErrorAction SilentlyContinue) -and
+    (Get-Command Remove-DnsClientNrptRule -ErrorAction SilentlyContinue)
+  ) {
+    \$managedRules = @(Get-DnsClientNrptRule -ErrorAction SilentlyContinue |
+      Where-Object {
+        \$_.DisplayName -eq \$managedRuleName -and
+        \$_.Comment -eq \$managedRuleName
+      })
+    foreach (\$rule in \$managedRules) {
+      Remove-DnsClientNrptRule -Name \$rule.Name -Force -ErrorAction Stop
+    }
+  }
+  [pscustomobject]@{ Success = \$true } | ConvertTo-Json -Compress
 } catch {
   [pscustomobject]@{ Success = \$false; Error = \$_.Exception.Message } |
     ConvertTo-Json -Compress

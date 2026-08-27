@@ -10,9 +10,25 @@ class VpnCoreBinaryManager {
   static const String _androidXrayBinaryName = 'xray';
   static const String _windowsAsset = 'assets/bin/xray.exe';
   static const String _windowsBinaryName = 'xray.exe';
+  static const String _windowsSingBoxAsset = 'assets/bin/sing-box.exe';
+  static const String _windowsSingBoxBinaryName = 'sing-box.exe';
 
   String? _cachedPath;
   String? _cachedRuntimeKey;
+  String? _cachedWindowsSingBoxPath;
+
+  Future<String?> resolveWindowsSingBoxExecutable() async {
+    if (!Platform.isWindows) return null;
+    final cached = _cachedWindowsSingBoxPath;
+    if (cached != null && File(cached).existsSync()) {
+      return cached;
+    }
+    _cachedWindowsSingBoxPath = await _extractAssetBinary(
+      assetPath: _windowsSingBoxAsset,
+      fileName: _windowsSingBoxBinaryName,
+    );
+    return _cachedWindowsSingBoxPath;
+  }
 
   Future<String?> resolveExecutable({String? androidRuntime}) async {
     final runtimeKey = Platform.isAndroid

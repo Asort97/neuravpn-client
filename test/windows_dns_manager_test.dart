@@ -34,10 +34,15 @@ const _tunState = <String, dynamic>{
 };
 
 class _DnsScriptRunner {
-  _DnsScriptRunner({this.failTunCapture = false, this.failRestore = false});
+  _DnsScriptRunner({
+    this.failTunCapture = false,
+    this.failRestore = false,
+    this.nrptApplied = true,
+  });
 
   final bool failTunCapture;
   final bool failRestore;
+  final bool nrptApplied;
   final List<String> scripts = <String>[];
 
   Future<ProcessResult> call(String executable, List<String> arguments) async {
@@ -51,9 +56,18 @@ class _DnsScriptRunner {
       return ProcessResult(
         1,
         0,
-        '{"Success":true,"Addresses":["172.25.10.2"]}',
+        jsonEncode(<String, dynamic>{
+          'Success': true,
+          'Addresses': <String>['172.25.10.2'],
+          'NrptApplied': nrptApplied,
+          if (!nrptApplied) 'Warning': 'windows_nrpt_not_supported',
+        }),
         '',
       );
+    }
+    if (script.contains(r'$managedRules = @(') &&
+        !script.contains(r'$interfaces = ConvertFrom-Json')) {
+      return ProcessResult(1, 0, '{"Success":true}', '');
     }
     if (script.contains(r'$interfaces = ConvertFrom-Json')) {
       if (failRestore) {
@@ -153,6 +167,9 @@ void main() {
     expect(applyScript, isNot(contains('Resolve-DnsName')));
     expect(applyScript, isNot(contains('Start-Sleep')));
     expect(applyScript, isNot(contains('New-NetRoute')));
+    expect(applyScript, isNot(contains("throw 'windows_nrpt_not_supported'")));
+    expect(applyScript, contains(r'$nrptApplied = $false'));
+    expect(applyScript, contains(r"$warning = 'windows_nrpt_not_supported'"));
     expect(applyScript, contains("Add-DnsClientNrptRule -Namespace '.'"));
     expect(
       applyScript,
@@ -161,6 +178,24 @@ void main() {
     expect(applyScript, contains(r'$_.DisplayName -eq $managedRuleName'));
     expect(applyScript, contains(r'$_.Comment -eq $managedRuleName'));
     expect(applyScript, contains('[77]'));
+  });
+
+  test('apply succeeds without NRPT support and reports fallback', () async {
+    final runner = _DnsScriptRunner(nrptApplied: false);
+    final manager = WindowsDnsManager(
+      isWindowsOverride: true,
+      backupFile: backupFile,
+      processRunner: runner.call,
+    );
+
+    final result = await manager.apply(
+      uplinkInterfaceIndex: 12,
+      tunInterfaceIndex: 77,
+    );
+
+    expect(result.success, isTrue);
+    expect(result.logs, contains(contains('priority fallback')));
+    expect(result.logs, contains(contains('windows_nrpt_not_supported')));
   });
 
   test('apply refuses mutation when TUN state cannot be backed up', () async {
@@ -245,6 +280,34 @@ void main() {
     expect(await backupFile.exists(), isTrue);
   });
 
+  test(
+    'recover keeps a valid backup after an operational restore failure',
+    () async {
+      final runner = _DnsScriptRunner(failRestore: true);
+      final manager = WindowsDnsManager(
+        isWindowsOverride: true,
+        backupFile: backupFile,
+        processRunner: runner.call,
+      );
+      await backupFile.parent.create(recursive: true);
+      await backupFile.writeAsString(
+        jsonEncode(<String, dynamic>{
+          ..._uplinkState,
+          'Version': 1,
+          'ManagedBy': WindowsDnsManager.managedRuleName,
+          'Phase': 'applied',
+        }),
+      );
+
+      final result = await manager.recover();
+
+      expect(result.success, isFalse);
+      expect(result.error, 'restore denied');
+      expect(await backupFile.exists(), isTrue);
+      expect(runner.scripts, hasLength(1));
+    },
+  );
+
   test('recover restores a stale managed backup', () async {
     final runner = _DnsScriptRunner();
     final staleState = <String, dynamic>{
@@ -267,6 +330,34 @@ void main() {
     expect(await backupFile.exists(), isFalse);
     expect(result.logs.first, contains('Recovered unfinished'));
   });
+
+  test(
+    'recover discards corrupt snapshot after owned policy cleanup',
+    () async {
+      final runner = _DnsScriptRunner();
+      await backupFile.parent.create(recursive: true);
+      await backupFile.writeAsString('{broken');
+      final manager = WindowsDnsManager(
+        isWindowsOverride: true,
+        backupFile: backupFile,
+        processRunner: runner.call,
+      );
+
+      final result = await manager.recover();
+
+      expect(result.success, isTrue);
+      expect(await backupFile.exists(), isFalse);
+      expect(result.logs, contains(contains('unusable DNS recovery snapshot')));
+      expect(
+        runner.scripts.any(
+          (script) =>
+              script.contains(r'$managedRules = @(') &&
+              !script.contains(r'$interfaces = ConvertFrom-Json'),
+        ),
+        isTrue,
+      );
+    },
+  );
 
   test('test validates 20 DNS queries and CDN HTTP 200', () async {
     final runner = _DnsScriptRunner();

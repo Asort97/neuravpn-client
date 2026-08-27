@@ -43,6 +43,12 @@ class _FakeTunGuard extends WindowsTunGuard {
   final List<List<String>> bulkCleanupCalls = <List<String>>[];
 
   @override
+  bool get isElevationConfirmed => true;
+
+  @override
+  bool? get elevationState => true;
+
+  @override
   Future<TunSessionPlan> prepare({bool detectExistingAdapters = false}) async {
     prepareCalls += 1;
     final interface = 'tun-in-session-$prepareCalls';
@@ -102,6 +108,7 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
   _FakeWindowsRouteManager({
     this.applyDelay = Duration.zero,
     this.actualTunName,
+    this.cleanupGate,
   }) : super(
          processRunner: (executable, arguments) async =>
              ProcessResult(1, 0, '', ''),
@@ -112,6 +119,7 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
   final List<String> cleanupCalls = <String>[];
   final Duration applyDelay;
   final String? actualTunName;
+  final Completer<void>? cleanupGate;
   bool applyShouldFail = false;
 
   @override
@@ -166,6 +174,7 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
     if (session != null) {
       cleanupCalls.add(session.tunInterfaceName);
     }
+    await cleanupGate?.future;
   }
 
   @override
@@ -176,13 +185,23 @@ class _FakeWindowsRouteManager extends WindowsRouteManager {
 }
 
 class _FakeWindowsDnsManager extends WindowsDnsManager {
-  _FakeWindowsDnsManager()
-    : super(
-        isWindowsOverride: false,
-        processRunner: (executable, arguments) async =>
-            ProcessResult(1, 0, '', ''),
-      );
+  _FakeWindowsDnsManager({
+    this.recoverResult = const WindowsDnsResult(success: true),
+    this.recoverGate,
+    this.prepareResult = const WindowsDnsResult(success: true),
+    this.applyResult = const WindowsDnsResult(success: true),
+    this.restoreResult = const WindowsDnsResult(success: true),
+  }) : super(
+         isWindowsOverride: false,
+         processRunner: (executable, arguments) async =>
+             ProcessResult(1, 0, '', ''),
+       );
 
+  final WindowsDnsResult recoverResult;
+  final Completer<void>? recoverGate;
+  final WindowsDnsResult prepareResult;
+  final WindowsDnsResult applyResult;
+  final WindowsDnsResult restoreResult;
   int recoverCalls = 0;
   int prepareCalls = 0;
   int applyCalls = 0;
@@ -194,14 +213,15 @@ class _FakeWindowsDnsManager extends WindowsDnsManager {
   @override
   Future<WindowsDnsResult> recover() async {
     recoverCalls += 1;
-    return const WindowsDnsResult(success: true);
+    await recoverGate?.future;
+    return recoverResult;
   }
 
   @override
   Future<WindowsDnsResult> prepare({required int uplinkInterfaceIndex}) async {
     prepareCalls += 1;
     preparedUplink = uplinkInterfaceIndex;
-    return const WindowsDnsResult(success: true);
+    return prepareResult;
   }
 
   @override
@@ -212,13 +232,13 @@ class _FakeWindowsDnsManager extends WindowsDnsManager {
     applyCalls += 1;
     appliedUplink = uplinkInterfaceIndex;
     appliedTun = tunInterfaceIndex;
-    return const WindowsDnsResult(success: true);
+    return applyResult;
   }
 
   @override
   Future<WindowsDnsResult> restore() async {
     restoreCalls += 1;
-    return const WindowsDnsResult(success: true);
+    return restoreResult;
   }
 }
 
@@ -321,6 +341,30 @@ Set<String> _existingConnectionLogPaths() {
 }
 
 void main() {
+  test(
+    'parallel Windows runtime preparation performs one DNS recovery',
+    () async {
+      final gate = Completer<void>();
+      final dnsManager = _FakeWindowsDnsManager(recoverGate: gate);
+      final controller = VpnCoreController(
+        tunGuard: _FakeTunGuard(waitForUp: const <bool>[]),
+        windowsRouteManager: _FakeWindowsRouteManager(),
+        windowsDnsManager: dnsManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+      );
+
+      final first = controller.prepareWindowsRuntime();
+      final second = controller.prepareWindowsRuntime();
+      await Future<void>.delayed(Duration.zero);
+
+      expect(dnsManager.recoverCalls, 1);
+      gate.complete();
+      await Future.wait(<Future<void>>[first, second]);
+      expect(dnsManager.recoverCalls, 1);
+    },
+  );
+
   test('full-tunnel applies and restores managed Windows DNS', () async {
     final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
     final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
@@ -355,6 +399,84 @@ void main() {
     expect(dnsManager.restoreCalls, greaterThanOrEqualTo(1));
   });
 
+  test(
+    'full-tunnel stays connected when managed Windows DNS is unavailable',
+    () async {
+      final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
+      final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
+      final dnsManager = _FakeWindowsDnsManager(
+        applyResult: const WindowsDnsResult(
+          success: false,
+          error: 'windows_doh_not_supported',
+        ),
+      );
+      final logs = <String>[];
+      final controller = VpnCoreController(
+        tunGuard: guard,
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: routeManager,
+        windowsDnsManager: dnsManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: _runnerWithXrayVersion,
+        processStarter: (executable, arguments, {environment}) async =>
+            _FakeProcess(pid: 9012),
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+        onLog: logs.add,
+      );
+
+      expect(result.success, isTrue);
+      expect(controller.isRunning, isTrue);
+      expect(dnsManager.applyCalls, 1);
+      expect(dnsManager.restoreCalls, 1);
+      expect(
+        logs,
+        contains(contains('continuing with the existing Windows resolver')),
+      );
+
+      await controller.disconnect();
+    },
+  );
+
+  test(
+    'full-tunnel uses system DNS when DNS preparation is unavailable',
+    () async {
+      final dnsManager = _FakeWindowsDnsManager(
+        prepareResult: const WindowsDnsResult(
+          success: false,
+          error: 'dns_backup_unavailable',
+        ),
+      );
+      final controller = VpnCoreController(
+        tunGuard: _FakeTunGuard(waitForUp: const <bool>[true]),
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: _FakeWindowsRouteManager(actualTunName: 'xray0'),
+        windowsDnsManager: dnsManager,
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: _runnerWithXrayVersion,
+        processStarter: (executable, arguments, {environment}) async =>
+            _FakeProcess(pid: 9013),
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+      );
+
+      expect(result.success, isTrue);
+      expect(controller.isRunning, isTrue);
+      expect(dnsManager.prepareCalls, 1);
+      expect(dnsManager.applyCalls, 0);
+
+      await controller.disconnect();
+    },
+  );
+
   test('whitelist mode does not replace global Windows DNS', () async {
     final guard = _FakeTunGuard(waitForUp: const <bool>[true]);
     final routeManager = _FakeWindowsRouteManager(actualTunName: 'xray0');
@@ -380,6 +502,95 @@ void main() {
     expect(dnsManager.recoverCalls, 1);
     expect(dnsManager.prepareCalls, 0);
     expect(dnsManager.applyCalls, 0);
+
+    await controller.disconnect();
+  });
+
+  test('failed DNS cleanup is retried before the next connection', () async {
+    final dnsManager = _FakeWindowsDnsManager(
+      restoreResult: const WindowsDnsResult(
+        success: false,
+        error: 'dns_restore_failed',
+      ),
+    );
+    var nextPid = 9020;
+    final controller = VpnCoreController(
+      tunGuard: _FakeTunGuard(waitForUp: const <bool>[true, true]),
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: _FakeWindowsRouteManager(actualTunName: 'xray0'),
+      windowsDnsManager: dnsManager,
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async =>
+          _FakeProcess(pid: nextPid++),
+    );
+
+    final first = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    expect(first.success, isTrue);
+
+    await controller.disconnect();
+    expect(dnsManager.restoreCalls, 1);
+
+    final second = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    expect(second.success, isTrue);
+    expect(dnsManager.recoverCalls, 2);
+
+    await controller.disconnect();
+  });
+
+  test('reconnect waits for cleanup of the previous Windows session', () async {
+    final cleanupGate = Completer<void>();
+    final routeManager = _FakeWindowsRouteManager(
+      actualTunName: 'xray0',
+      cleanupGate: cleanupGate,
+    );
+    final processes = <_FakeProcess>[];
+    final controller = VpnCoreController(
+      tunGuard: _FakeTunGuard(waitForUp: const <bool>[true, true]),
+      binaryManager: _FakeBinaryManager('fake-xray.exe'),
+      windowsRouteManager: routeManager,
+      windowsDnsManager: _FakeWindowsDnsManager(),
+      isWindowsOverride: true,
+      isAndroidOverride: false,
+      processRunner: _runnerWithXrayVersion,
+      processStarter: (executable, arguments, {environment}) async {
+        final process = _FakeProcess(pid: 9020 + processes.length);
+        processes.add(process);
+        return process;
+      },
+    );
+
+    final first = await controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    expect(first.success, isTrue);
+    expect(processes, hasLength(1));
+
+    processes.single.kill();
+    for (var i = 0; i < 50 && routeManager.cleanupCalls.isEmpty; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(routeManager.cleanupCalls, isNotEmpty);
+
+    final reconnect = controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 30));
+    expect(processes, hasLength(1));
+
+    cleanupGate.complete();
+    final second = await reconnect;
+    expect(second.success, isTrue);
+    expect(processes, hasLength(2));
 
     await controller.disconnect();
   });
@@ -466,6 +677,71 @@ void main() {
     expect(result.success, isFalse);
     expect(startCount, 1);
   });
+
+  test(
+    'access denied from Xray is not mislabeled after elevation is confirmed',
+    () async {
+      final statuses = <String>[];
+      final controller = VpnCoreController(
+        tunGuard: _FakeTunGuard(waitForUp: const <bool>[true]),
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: _FakeWindowsRouteManager(),
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: _runnerWithXrayVersion,
+        processStarter: (executable, arguments, {environment}) async =>
+            _FakeProcess(
+              pid: 2001,
+              autoExitCode: 1,
+              stderrLines: const <String>[
+                'driver open failed: Access is denied',
+              ],
+            ),
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+        onStatus: statuses.add,
+      );
+
+      expect(result.success, isFalse);
+      expect(result.requiresAdmin, isFalse);
+      expect(
+        statuses.any((status) => status.contains('администратора')),
+        isFalse,
+      );
+    },
+  );
+
+  test(
+    'DNS access denied is not mislabeled after elevation is confirmed',
+    () async {
+      final controller = VpnCoreController(
+        tunGuard: _FakeTunGuard(waitForUp: const <bool>[]),
+        binaryManager: _FakeBinaryManager('fake-xray.exe'),
+        windowsRouteManager: _FakeWindowsRouteManager(),
+        windowsDnsManager: _FakeWindowsDnsManager(
+          recoverResult: const WindowsDnsResult(
+            success: false,
+            error: 'Access is denied',
+          ),
+        ),
+        isWindowsOverride: true,
+        isAndroidOverride: false,
+        processRunner: _runnerWithXrayVersion,
+      );
+
+      final result = await controller.connect(
+        rawUri: _validUri,
+        splitConfig: SplitTunnelConfig(mode: 'all'),
+      );
+
+      expect(result.success, isFalse);
+      expect(result.requiresAdmin, isFalse);
+      expect(result.errorMessage, contains('Access is denied'));
+    },
+  );
 
   test('disconnect cancels an in-flight Windows connection', () async {
     final guard = _FakeTunGuard(waitForUp: const <bool>[true]);

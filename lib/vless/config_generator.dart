@@ -455,6 +455,195 @@ String generateXrayConfig(
   return const JsonEncoder.withIndent('  ').convert(config);
 }
 
+/// Xray transport backend for the Windows hybrid runtime.
+///
+/// sing-box owns the TUN adapter and forwards captured traffic to this local
+/// SOCKS inbound. Xray remains responsible for VLESS transports, smart domain
+/// routing, and runtime statistics.
+String generateWindowsXrayProxyConfig(
+  VlessLink link,
+  SplitTunnelConfig splitConfig, {
+  String inboundTag = 'socks-in',
+  int socksPort = 10808,
+  String forceInboundTag = 'socks-force-in',
+  int forceSocksPort = 10809,
+  String? outboundInterfaceName,
+  String? outboundBindAddress,
+  bool smartRouting = false,
+  List<String> smartDomains = const <String>[],
+  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  int apiPort = 10085,
+  String logLevel = 'info',
+  String? serverAddressOverride,
+}) {
+  final decoded =
+      jsonDecode(
+            generateXrayConfig(
+              link,
+              splitConfig,
+              inboundTag: inboundTag,
+              outboundInterfaceName: outboundInterfaceName,
+              outboundBindAddress: outboundBindAddress,
+              smartRouting: smartRouting,
+              smartDomains: smartDomains,
+              extraRouteRules: extraRouteRules,
+              apiPort: apiPort,
+              logLevel: logLevel,
+              serverAddressOverride: serverAddressOverride,
+              externalRouteManager: true,
+            ),
+          )
+          as Map<String, dynamic>;
+
+  final inbounds = (decoded['inbounds'] as List<dynamic>)
+      .cast<Map<String, dynamic>>();
+  inbounds[0] = <String, dynamic>{
+    'tag': inboundTag,
+    'listen': '127.0.0.1',
+    'port': socksPort,
+    'protocol': 'socks',
+    'settings': <String, dynamic>{'auth': 'noauth', 'udp': true},
+    'sniffing': <String, dynamic>{
+      'enabled': true,
+      'destOverride': <String>['http', 'tls', 'quic'],
+    },
+  };
+  inbounds.insert(1, <String, dynamic>{
+    'tag': forceInboundTag,
+    'listen': '127.0.0.1',
+    'port': forceSocksPort,
+    'protocol': 'socks',
+    'settings': <String, dynamic>{'auth': 'noauth', 'udp': true},
+    'sniffing': <String, dynamic>{
+      'enabled': true,
+      'destOverride': <String>['http', 'tls', 'quic'],
+    },
+  });
+  decoded['inbounds'] = inbounds;
+  final routing = decoded['routing'] as Map<String, dynamic>;
+  final routeRules = (routing['rules'] as List<dynamic>)
+      .cast<Map<String, dynamic>>();
+  routeRules.insert(1, <String, dynamic>{
+    'type': 'field',
+    'inboundTag': <String>[forceInboundTag],
+    'outboundTag': link.tag ?? 'proxy',
+  });
+  routing['rules'] = routeRules;
+  return const JsonEncoder.withIndent('  ').convert(decoded);
+}
+
+/// sing-box TUN frontend for the Windows hybrid runtime.
+///
+/// This intentionally mirrors the small, proven Happ-style topology: a
+/// strict mixed-stack TUN with automatic routes and a local SOCKS outbound.
+/// DNS is hijacked at the TUN boundary. The frontend deliberately follows the
+/// working Happ topology: sing-box owns DNS and route selection while Xray is
+/// used only as the VLESS transport backend.
+String generateWindowsHybridTunConfig(
+  SplitTunnelConfig splitConfig, {
+  required String inboundTag,
+  required String interfaceName,
+  required List<String> addresses,
+  int socksPort = 10808,
+  int forceSocksPort = 10809,
+  int mtu = 1500,
+  String logLevel = 'info',
+}) {
+  final applicationRules = _buildApplicationRules(splitConfig, 'proxy').map((
+    rule,
+  ) {
+    if (splitConfig.mode != 'whitelist' || rule['outbound'] != 'proxy') {
+      return rule;
+    }
+    return <String, dynamic>{...rule, 'outbound': 'proxy-force'};
+  }).toList();
+  final config = <String, dynamic>{
+    'log': <String, dynamic>{
+      'level': logLevel,
+      'timestamp': true,
+      'output': 'stderr',
+    },
+    'dns': <String, dynamic>{
+      'servers': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'type': 'https',
+          'tag': 'dns-vpn',
+          'server': '1.1.1.1',
+          'server_port': 443,
+          'path': '/dns-query',
+          'tls': <String, dynamic>{
+            'enabled': true,
+            'server_name': 'cloudflare-dns.com',
+          },
+          // DNS must follow the VPN path. Direct UDP DNS is filtered or
+          // delayed on some uplinks and previously stalled CDN lookups.
+          'detour': 'proxy',
+        },
+      ],
+      'final': 'dns-vpn',
+      'strategy': 'prefer_ipv4',
+      'disable_cache': false,
+    },
+    'inbounds': <Map<String, dynamic>>[
+      <String, dynamic>{
+        'type': 'tun',
+        'tag': inboundTag,
+        'interface_name': interfaceName,
+        'address': addresses,
+        'auto_route': true,
+        'strict_route': true,
+        'stack': 'mixed',
+        'mtu': mtu,
+      },
+    ],
+    'outbounds': <Map<String, dynamic>>[
+      <String, dynamic>{
+        'type': 'socks',
+        'tag': 'proxy',
+        'server': '127.0.0.1',
+        'server_port': socksPort,
+        'udp_fragment': true,
+      },
+      <String, dynamic>{
+        'type': 'socks',
+        'tag': 'proxy-force',
+        'server': '127.0.0.1',
+        'server_port': forceSocksPort,
+        'udp_fragment': true,
+      },
+      <String, dynamic>{
+        'type': 'direct',
+        'tag': 'direct',
+        'domain_resolver': <String, dynamic>{
+          'server': 'dns-vpn',
+          'strategy': 'prefer_ipv4',
+        },
+      },
+    ],
+    'route': <String, dynamic>{
+      'auto_detect_interface': true,
+      'final': 'proxy',
+      'rules': <Map<String, dynamic>>[
+        <String, dynamic>{
+          'process_name': <String>[
+            'xray.exe',
+            'sing-box.exe',
+            'antifilter.exe',
+            'xray',
+            'sing-box',
+            'antifilter',
+          ],
+          'outbound': 'direct',
+        },
+        <String, dynamic>{'action': 'sniff'},
+        <String, dynamic>{'protocol': 'dns', 'action': 'hijack-dns'},
+        ...applicationRules,
+      ],
+    },
+  };
+  return const JsonEncoder.withIndent('  ').convert(config);
+}
+
 /// Android-oriented Xray config generation.
 /// Package include/exclude split tunneling remains enforced by Android VpnService.
 String generateAndroidXrayConfig(

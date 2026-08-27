@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "utils.h"
+#include "windows_elevation.h"
 
 namespace {
 std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> g_channel;
@@ -542,20 +543,6 @@ flutter::EncodableMap ApplyRoutesNative(const flutter::EncodableMap& args) {
   return map;
 }
 
-bool IsElevatedNative() {
-  SID_IDENTIFIER_AUTHORITY nt_authority = SECURITY_NT_AUTHORITY;
-  PSID administrators_group = nullptr;
-  if (!AllocateAndInitializeSid(&nt_authority, 2, SECURITY_BUILTIN_DOMAIN_RID,
-                                DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0,
-                                &administrators_group)) {
-    return false;
-  }
-  BOOL is_member = FALSE;
-  const BOOL ok =
-      CheckTokenMembership(nullptr, administrators_group, &is_member);
-  FreeSid(administrators_group);
-  return ok && is_member;
-}
 }  // namespace
 
 void SetupWindowsRouteChannel(flutter::BinaryMessenger* messenger) {
@@ -593,7 +580,12 @@ void SetupWindowsRouteChannel(flutter::BinaryMessenger* messenger) {
         }
 
         if (method == "isElevated") {
-          result->Success(flutter::EncodableValue(IsElevatedNative()));
+          const auto elevated = QueryCurrentProcessElevation();
+          if (!elevated.has_value()) {
+            result->Success(flutter::EncodableValue());
+            return;
+          }
+          result->Success(flutter::EncodableValue(elevated.value()));
           return;
         }
 

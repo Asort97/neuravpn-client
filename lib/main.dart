@@ -889,6 +889,10 @@ class _VlessHomePageState extends State<VlessHomePage>
         await _handleDuplicateInstance();
         return;
       }
+      if (call.method == 'handleElevationReplacement') {
+        await _handleTrayExit();
+        return;
+      }
       if (call.method != 'handleLaunchUri') {
         return;
       }

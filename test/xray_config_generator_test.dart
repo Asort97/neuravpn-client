@@ -332,4 +332,139 @@ void main() {
     expect(processList.contains('C:\\Games\\Game\\game.exe'), isTrue);
     expect(processList.contains('game.exe'), isTrue);
   });
+
+  test('builds Windows hybrid Xray SOCKS transport backend', () {
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=reality&type=xhttp&sni=example.com&pbk=PUBKEY123&sid=abcd&path=%2Fedge#proxy',
+    );
+    final config =
+        jsonDecode(
+              generateWindowsXrayProxyConfig(
+                link,
+                SplitTunnelConfig(mode: 'all'),
+                outboundInterfaceName: 'Ethernet',
+                outboundBindAddress: '192.168.0.100',
+              ),
+            )
+            as Map<String, dynamic>;
+    final inbounds = (config['inbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    final socks = inbounds.firstWhere((item) => item['tag'] == 'socks-in');
+
+    expect(socks['protocol'], 'socks');
+    expect(socks['listen'], '127.0.0.1');
+    expect(socks['port'], 10808);
+    expect(socks['settings']['udp'], isTrue);
+    expect(inbounds.any((item) => item['protocol'] == 'tun'), isFalse);
+    expect(
+      inbounds.any(
+        (item) => item['tag'] == 'socks-force-in' && item['port'] == 10809,
+      ),
+      isTrue,
+    );
+    expect(config['api'], isNotNull);
+
+    final proxy = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>()
+        .firstWhere((item) => item['tag'] == 'proxy');
+    expect(proxy['sendThrough'], '192.168.0.100');
+    expect(proxy['streamSettings']['network'], 'xhttp');
+  });
+
+  test('builds strict mixed-stack Windows sing-box TUN frontend', () {
+    final config =
+        jsonDecode(
+              generateWindowsHybridTunConfig(
+                SplitTunnelConfig(
+                  mode: 'blacklist',
+                  applications: const <String>['game.exe'],
+                ),
+                inboundTag: 'tun-in-test',
+                interfaceName: 'tun-in-test',
+                addresses: const <String>['172.25.10.1/30'],
+              ),
+            )
+            as Map<String, dynamic>;
+    final tun =
+        (config['inbounds'] as List<dynamic>).single as Map<String, dynamic>;
+    final outbounds = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    final route = config['route'] as Map<String, dynamic>;
+    final rules = (route['rules'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+
+    expect(tun['type'], 'tun');
+    expect(tun['stack'], 'mixed');
+    expect(tun['auto_route'], isTrue);
+    expect(tun['strict_route'], isTrue);
+    expect(tun['mtu'], 1500);
+    expect(tun.containsKey('route_address'), isFalse);
+    expect(route['final'], 'proxy');
+    expect(outbounds.first['type'], 'socks');
+    expect(outbounds.first['server'], '127.0.0.1');
+    expect(
+      rules.any(
+        (rule) =>
+            rule['process_name'] == 'game.exe' && rule['outbound'] == 'direct',
+      ),
+      isTrue,
+    );
+
+    final dns = config['dns'] as Map<String, dynamic>;
+    final dnsServers = (dns['servers'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    expect(dnsServers, hasLength(1));
+    expect(dnsServers.single['type'], 'https');
+    expect(dnsServers.single['server'], '1.1.1.1');
+    expect(dnsServers.single['detour'], 'proxy');
+    expect(
+      (dnsServers.single['tls'] as Map<String, dynamic>)['server_name'],
+      'cloudflare-dns.com',
+    );
+    expect(dns['final'], 'dns-vpn');
+    expect(outbounds.first.containsKey('domain_resolver'), isFalse);
+    expect(outbounds[1].containsKey('domain_resolver'), isFalse);
+    expect(
+      (outbounds[2]['domain_resolver'] as Map<String, dynamic>)['server'],
+      'dns-vpn',
+    );
+  });
+
+  test('hybrid frontend preserves application whitelist semantics', () {
+    final config =
+        jsonDecode(
+              generateWindowsHybridTunConfig(
+                SplitTunnelConfig(
+                  mode: 'whitelist',
+                  applications: const <String>['game.exe'],
+                ),
+                inboundTag: 'tun-in-test',
+                interfaceName: 'tun-in-test',
+                addresses: const <String>['172.25.10.1/30'],
+              ),
+            )
+            as Map<String, dynamic>;
+    final route = config['route'] as Map<String, dynamic>;
+    final rules = (route['rules'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    final outbounds = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+
+    expect(
+      rules.any(
+        (rule) =>
+            rule['process_name'] == 'game.exe' &&
+            rule['outbound'] == 'proxy-force',
+      ),
+      isTrue,
+    );
+    expect(
+      outbounds.any(
+        (outbound) =>
+            outbound['tag'] == 'proxy-force' &&
+            outbound['server_port'] == 10809,
+      ),
+      isTrue,
+    );
+  });
 }

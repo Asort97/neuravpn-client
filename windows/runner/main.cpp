@@ -10,6 +10,7 @@
 #include "flutter_window.h"
 #include "launch_uri_channel.h"
 #include "utils.h"
+#include "windows_elevation.h"
 
 namespace {
 bool ContainsNonAscii(const std::wstring& value) {
@@ -79,9 +80,17 @@ std::wstring QueryProcessImagePath(DWORD process_id) {
 }
 
 struct ExistingWindowSearchContext {
-  std::wstring current_exe_path;
+  std::wstring current_exe_name;
   HWND found_window = nullptr;
 };
+
+std::wstring GetFileName(const std::wstring& path) {
+  const size_t last_separator = path.find_last_of(L"\\/");
+  if (last_separator == std::wstring::npos) {
+    return path;
+  }
+  return path.substr(last_separator + 1);
+}
 
 BOOL CALLBACK FindExistingWindowCallback(HWND hwnd, LPARAM lparam) {
   auto* context = reinterpret_cast<ExistingWindowSearchContext*>(lparam);
@@ -108,7 +117,8 @@ BOOL CALLBACK FindExistingWindowCallback(HWND hwnd, LPARAM lparam) {
     return TRUE;
   }
 
-  if (_wcsicmp(other_exe_path.c_str(), context->current_exe_path.c_str()) != 0) {
+  const std::wstring other_exe_name = GetFileName(other_exe_path);
+  if (_wcsicmp(other_exe_name.c_str(), context->current_exe_name.c_str()) != 0) {
     return TRUE;
   }
 
@@ -118,8 +128,8 @@ BOOL CALLBACK FindExistingWindowCallback(HWND hwnd, LPARAM lparam) {
 
 HWND FindExistingInstanceWindow() {
   ExistingWindowSearchContext context;
-  context.current_exe_path = GetExecutablePath();
-  if (context.current_exe_path.empty()) {
+  context.current_exe_name = GetFileName(GetExecutablePath());
+  if (context.current_exe_name.empty()) {
     return nullptr;
   }
 
@@ -215,12 +225,77 @@ bool AcquireInstanceSlot() {
   }
 
   const DWORD wait = ::WaitForSingleObject(handle, 0);
-  if (wait == WAIT_OBJECT_0) {
+  if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
     g_instance_mutex = handle;
     return true;
   }
 
   ::CloseHandle(handle);
+  return false;
+}
+
+bool ReplaceUnelevatedExistingInstance(HWND existing_window) {
+  if (existing_window == nullptr ||
+      QueryCurrentProcessElevation() != std::optional<bool>(true)) {
+    return false;
+  }
+
+  DWORD process_id = 0;
+  ::GetWindowThreadProcessId(existing_window, &process_id);
+  if (process_id == 0 ||
+      QueryProcessElevation(process_id) != std::optional<bool>(false)) {
+    return false;
+  }
+
+  HANDLE process =
+      ::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, process_id);
+  if (process == nullptr) {
+    return false;
+  }
+
+  bool graceful_shutdown_requested = false;
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    COPYDATASTRUCT copy_data = {};
+    copy_data.dwData = kElevationReplacementCopyDataId;
+    DWORD_PTR send_result = 0;
+    const auto delivered = ::SendMessageTimeoutW(
+        existing_window,
+        WM_COPYDATA,
+        0,
+        reinterpret_cast<LPARAM>(&copy_data),
+        SMTO_BLOCK | SMTO_ABORTIFHUNG,
+        1000,
+        &send_result);
+    if (delivered != 0 && send_result == 1) {
+      graceful_shutdown_requested = true;
+      break;
+    }
+    ::Sleep(200);
+  }
+
+  // Dart performs the same cleanup as the tray Exit command. Its TUN cleanup
+  // budget alone can reach 15 seconds, so allow the complete DNS/route/TUN
+  // shutdown to finish before using the legacy fallback.
+  DWORD wait_result = ::WaitForSingleObject(
+      process, graceful_shutdown_requested ? 30000 : 0);
+  if (wait_result != WAIT_OBJECT_0) {
+    // Builds released before the replacement IPC cannot acknowledge it. A
+    // forced exit is safe here because the new elevated process runs the
+    // persisted dirty-session recovery before the next connection.
+    ::TerminateProcess(process, ERROR_ELEVATION_REQUIRED);
+    wait_result = ::WaitForSingleObject(process, 5000);
+  }
+  ::CloseHandle(process);
+  if (wait_result != WAIT_OBJECT_0) {
+    return false;
+  }
+
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    if (AcquireInstanceSlot()) {
+      return true;
+    }
+    ::Sleep(50);
+  }
   return false;
 }
 
@@ -327,12 +402,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
       GetWideCommandLineArguments();
   const std::wstring launch_uri_argument =
       FindLaunchUriArgument(wide_command_line_arguments);
-  if (ForwardLaunchUriToExistingInstance(launch_uri_argument)) {
-    return EXIT_SUCCESS;
-  }
   if (!AcquireInstanceSlot()) {
     HWND existing = FindExistingInstanceWindow();
+    if (ReplaceUnelevatedExistingInstance(existing)) {
+      existing = nullptr;
+    }
     if (existing != nullptr) {
+      if (ForwardLaunchUriToExistingInstance(launch_uri_argument)) {
+        return EXIT_SUCCESS;
+      }
       COPYDATASTRUCT copy_data = {};
       copy_data.dwData = kDuplicateInstanceCopyDataId;
       copy_data.cbData = 0;
@@ -348,7 +426,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
           4000,
           &send_result);
     }
-    return EXIT_SUCCESS;
+    if (g_instance_mutex == nullptr) {
+      return EXIT_SUCCESS;
+    }
   }
 
   // Attach to console when present (e.g., 'flutter run') or create a

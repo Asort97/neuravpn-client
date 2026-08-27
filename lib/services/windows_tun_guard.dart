@@ -113,8 +113,12 @@ class WindowsTunGuard {
   final void Function(String category)? _processLaunchRecorder;
   int _sessionCounter = 0;
   bool _knownElevated = false;
+  bool? _lastElevationState;
+  Future<bool?>? _elevationCheckInFlight;
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
+  bool get isElevationConfirmed => _knownElevated;
+  bool? get elevationState => _knownElevated ? true : _lastElevationState;
 
   Future<TunSessionPlan> prepare({bool detectExistingAdapters = false}) async {
     if (!_isWindows) {
@@ -131,7 +135,8 @@ class WindowsTunGuard {
     }
 
     final logs = <String>[];
-    if (!await _isElevatedCached()) {
+    final elevated = await _isElevatedCached();
+    if (elevated == false) {
       logs.add('Administrator privileges are required to manage TUN adapters.');
       return TunSessionPlan(
         success: false,
@@ -143,6 +148,12 @@ class WindowsTunGuard {
         staleAdapters: const [],
         discoveredAdapters: const [],
         error: 'Run the application as Administrator',
+      );
+    }
+    if (elevated == null) {
+      logs.add(
+        'Elevation check unavailable; continuing until a privileged '
+        'operation returns a definitive result.',
       );
     }
 
@@ -185,7 +196,7 @@ class WindowsTunGuard {
     );
   }
 
-  Future<bool> warmupElevationCheck() => _isElevatedCached();
+  Future<bool?> warmupElevationCheck() => _isElevatedCached();
 
   Future<TunCleanupResult> cleanupAdapter(String? interfaceName) async {
     if (!_isWindows || interfaceName == null || interfaceName.isEmpty) {
@@ -496,7 +507,7 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     }
   }
 
-  Future<bool> _isElevated() async {
+  Future<bool?> _isElevated() async {
     if (_elevationChecker != null) {
       return _elevationChecker.call();
     }
@@ -508,13 +519,17 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
       _processLaunchRecorder?.call('powershell');
       final result = await _processRunner('powershell', [
         '-NoProfile',
+        '-NonInteractive',
         '-Command',
         '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)',
       ]);
-      if (result.stdout == null) return false;
-      return result.stdout.toString().toLowerCase().contains('true');
+      if (result.exitCode != 0 || result.stdout == null) return null;
+      final output = result.stdout.toString().trim().toLowerCase();
+      if (output == 'true') return true;
+      if (output == 'false') return false;
+      return null;
     } catch (_) {
-      return false;
+      return null;
     }
   }
 
@@ -531,15 +546,31 @@ ForEach-Object { "$($_.NetConnectionID)|$($_.NetEnabled)" }
     }
   }
 
-  Future<bool> _isElevatedCached() async {
+  Future<bool?> _isElevatedCached() async {
     if (_knownElevated) {
       return true;
     }
-    final elevated = await _isElevated();
-    if (elevated) {
-      _knownElevated = true;
+    final existing = _elevationCheckInFlight;
+    if (existing != null) {
+      return existing;
     }
-    return elevated;
+
+    late final Future<bool?> tracked;
+    tracked = _isElevated()
+        .then((elevated) {
+          _lastElevationState = elevated;
+          if (elevated == true) {
+            _knownElevated = true;
+          }
+          return elevated;
+        })
+        .whenComplete(() {
+          if (identical(_elevationCheckInFlight, tracked)) {
+            _elevationCheckInFlight = null;
+          }
+        });
+    _elevationCheckInFlight = tracked;
+    return tracked;
   }
 
   Future<ProcessResult> _runNetsh(List<String> args, List<String>? logs) async {

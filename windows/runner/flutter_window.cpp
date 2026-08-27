@@ -92,6 +92,10 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
         DispatchDuplicateInstanceSignal();
         return 1;
       }
+      if (copy_data != nullptr &&
+          copy_data->dwData == kElevationReplacementCopyDataId) {
+        return DispatchElevationReplacementSignal() ? 1 : 0;
+      }
       break;
     }
     case WM_FONTCHANGE:

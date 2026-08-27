@@ -1,9 +1,12 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:happycat_vpnclient/services/windows_tun_guard.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   ProcessResult okResult([String stdout = '']) =>
       ProcessResult(1, 0, stdout, '');
 
@@ -124,4 +127,64 @@ void main() {
     expect(second.success, isTrue);
     expect(elevationChecks, 1);
   });
+
+  test('concurrent elevation callers share one check', () async {
+    final gate = Completer<bool>();
+    var elevationChecks = 0;
+    final guard = WindowsTunGuard(
+      processRunner: (executable, arguments) async => okResult(),
+      isWindowsOverride: true,
+      elevationChecker: () {
+        elevationChecks += 1;
+        return gate.future;
+      },
+    );
+
+    final warmup = guard.warmupElevationCheck();
+    final prepare = guard.prepare();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(elevationChecks, 1);
+    gate.complete(true);
+    expect(await warmup, isTrue);
+    expect((await prepare).success, isTrue);
+  });
+
+  test('prepare rejects a definitive non-elevated process', () async {
+    final guard = WindowsTunGuard(
+      processRunner: (executable, arguments) async => okResult(),
+      isWindowsOverride: true,
+      elevationChecker: () async => false,
+    );
+
+    final plan = await guard.prepare();
+
+    expect(plan.success, isFalse);
+    expect(plan.requiresElevation, isTrue);
+    expect(guard.isElevationConfirmed, isFalse);
+    expect(guard.elevationState, isFalse);
+  });
+
+  test(
+    'prepare does not reject when elevation diagnostic is unavailable',
+    () async {
+      final guard = WindowsTunGuard(
+        processRunner: (executable, arguments) async =>
+            ProcessResult(1, 1, '', 'PowerShell unavailable'),
+        isWindowsOverride: true,
+      );
+
+      final plan = await guard.prepare();
+
+      expect(plan.success, isTrue);
+      expect(plan.requiresElevation, isFalse);
+      expect(guard.elevationState, isNull);
+      expect(
+        plan.logs,
+        contains(
+          'Elevation check unavailable; continuing until a privileged operation returns a definitive result.',
+        ),
+      );
+    },
+  );
 }

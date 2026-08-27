@@ -146,4 +146,82 @@ void main() {
       contains('Route batch applied natively through tun-in-native'),
     );
   });
+
+  test(
+    'inspectTunInterface resolves identity without changing routes',
+    () async {
+      final scripts = <String>[];
+      final manager = WindowsRouteManager(
+        isWindowsOverride: true,
+        processRunner: (executable, arguments) async {
+          final script = arguments.last;
+          scripts.add(script);
+          return ProcessResult(
+            1,
+            0,
+            '{"Name":"tun-in-hybrid","InterfaceIndex":91}',
+            '',
+          );
+        },
+      );
+
+      final info = await manager.inspectTunInterface(
+        preferredTunInterface: 'tun-in-hybrid',
+        tunAddressHint: '172.25.20.1/30',
+      );
+
+      expect(info?.name, 'tun-in-hybrid');
+      expect(info?.interfaceIndex, 91);
+      expect(info?.address, '172.25.20.1');
+      expect(scripts, hasLength(1));
+      expect(scripts.single, contains('Get-NetAdapter -IncludeHidden'));
+      expect(scripts.single, isNot(contains('New-NetRoute')));
+      expect(scripts.single, isNot(contains('Remove-NetRoute')));
+    },
+  );
+
+  test(
+    'cleanup accepts verified success after a nonzero removal command',
+    () async {
+      final scripts = <String>[];
+      final manager = WindowsRouteManager(
+        isWindowsOverride: true,
+        processRunner: (executable, arguments) async {
+          final script = arguments.last;
+          scripts.add(script);
+          if (script.contains(r'$remaining = @()')) {
+            return ProcessResult(1, 0, '', '');
+          }
+          return ProcessResult(1, 1, '', '');
+        },
+      );
+      final logs = <String>[];
+
+      await manager.cleanupSession(
+        const WindowsRouteSession(
+          tunInterfaceName: 'xray0',
+          tunInterfaceIndex: 77,
+          tunAddress: '172.25.1.1',
+          uplinkInterfaceName: 'Ethernet',
+          uplinkInterfaceIndex: 12,
+          uplinkGateway: '192.168.0.1',
+          uplinkAddress: '192.168.0.100',
+          protectedPrefixes: <String>['203.0.113.10'],
+        ),
+        logs: logs,
+      );
+
+      expect(scripts, hasLength(2));
+      expect(
+        logs,
+        contains(
+          contains('verification confirmed that all owned routes are gone'),
+        ),
+      );
+      expect(
+        logs.where((line) => line.contains('verification failed')),
+        isEmpty,
+      );
+    },
+  );
 }

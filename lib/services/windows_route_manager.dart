@@ -57,6 +57,18 @@ class WindowsRouteApplyResult {
   final List<String> logs;
 }
 
+class WindowsTunInterfaceInfo {
+  const WindowsTunInterfaceInfo({
+    required this.name,
+    required this.interfaceIndex,
+    required this.address,
+  });
+
+  final String name;
+  final int interfaceIndex;
+  final String address;
+}
+
 class WindowsRouteNativeApplyResult {
   const WindowsRouteNativeApplyResult({
     required this.supported,
@@ -366,6 +378,27 @@ class WindowsRouteManager {
     );
   }
 
+  /// Resolves the runtime TUN identity without changing any routes.
+  Future<WindowsTunInterfaceInfo?> inspectTunInterface({
+    required String preferredTunInterface,
+    String? tunAddressHint,
+    List<String>? logs,
+  }) async {
+    if (!_isWindows) return null;
+    final sink = logs ?? <String>[];
+    final tun = await _findTunInterface(preferredTunInterface, sink);
+    if (tun == null) return null;
+    final address =
+        _normalizeTunAddressHint(tunAddressHint) ??
+        await _findTunAddress(tun.interfaceIndex, sink);
+    if (address == null) return null;
+    return WindowsTunInterfaceInfo(
+      name: tun.name,
+      interfaceIndex: tun.interfaceIndex,
+      address: address,
+    );
+  }
+
   Future<WindowsRouteApplyResult> _applyRoutesLegacy({
     required String preferredTunInterface,
     required String? hintedTunAddress,
@@ -468,7 +501,13 @@ class WindowsRouteManager {
     for (var attempt = 1; attempt <= 2; attempt++) {
       final applied = await _cleanupSessionBatch(session, sink);
       final clean = await _verifySessionCleanup(session, sink);
-      if (applied && clean) {
+      if (clean) {
+        if (!applied) {
+          sink.add(
+            'Route cleanup command reported an error, but verification '
+            'confirmed that all owned routes are gone.',
+          );
+        }
         return;
       }
       sink.add('Route cleanup verification failed on attempt $attempt/2.');

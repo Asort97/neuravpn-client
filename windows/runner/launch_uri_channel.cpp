@@ -52,3 +52,15 @@ void DispatchDuplicateInstanceSignal() {
       "handleDuplicateInstance",
       std::make_unique<flutter::EncodableValue>(true));
 }
+
+bool DispatchElevationReplacementSignal() {
+  if (g_channel == nullptr) {
+    return false;
+  }
+
+  LogDebug("requesting graceful shutdown for elevated replacement");
+  g_channel->InvokeMethod(
+      "handleElevationReplacement",
+      std::make_unique<flutter::EncodableValue>(true));
+  return true;
+}

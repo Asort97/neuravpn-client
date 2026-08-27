@@ -64,6 +64,10 @@ class VpnCoreStartResult {
 
 class VpnCoreController {
   static const bool _androidXrayExperimental = true;
+  static const bool _windowsHybridTunExperimental = bool.fromEnvironment(
+    'NEURAVPN_HYBRID_TUN',
+    defaultValue: true,
+  );
   VpnCoreController({
     WintunManager? wintunManager,
     WindowsTunGuard? tunGuard,
@@ -121,6 +125,9 @@ class VpnCoreController {
   Process? _process;
   StreamSubscription<String>? _stdoutSub;
   StreamSubscription<String>? _stderrSub;
+  Process? _tunProcess;
+  StreamSubscription<String>? _tunStdoutSub;
+  StreamSubscription<String>? _tunStderrSub;
   bool _androidConnected = false;
   bool _windowsConnected = false;
   bool _accessDeniedDetected = false;
@@ -161,7 +168,7 @@ class VpnCoreController {
   int _sessionEpoch = 0;
   int? _activeConnectionToken;
   final Map<int, String> _sessionInterfaces = <int, String>{};
-  final Set<int> _cleanupInProgressTokens = <int>{};
+  final Map<int, Future<void>> _cleanupFutures = <int, Future<void>>{};
   String _activeWindowsOutboundTag = 'proxy';
   String _activeWindowsInboundTag = WindowsTunGuard.defaultInboundTag;
   String? _lastWindowsRuleHash;
@@ -171,7 +178,9 @@ class VpnCoreController {
   final Set<int> _sessionDnsTokens = <int>{};
   WindowsRouteUplink? _cachedWindowsUplink;
   String? _cachedWindowsExecutablePath;
+  String? _cachedWindowsSingBoxPath;
   Future<void>? _windowsPrewarmFuture;
+  Future<void>? _windowsRuntimePreparation;
   bool _windowsRuntimePrepared = false;
   bool _windowsDnsRecoveryChecked = false;
   String? _windowsDnsRecoveryError;
@@ -302,6 +311,11 @@ class VpnCoreController {
   }
 
   bool get _isWindows => _isWindowsOverride ?? Platform.isWindows;
+
+  bool get _useWindowsHybridTun =>
+      _windowsHybridTunExperimental &&
+      Platform.isWindows &&
+      _isWindowsOverride == null;
   bool get _isAndroid => _isAndroidOverride ?? Platform.isAndroid;
   bool get _useAndroidXrayRuntime => _isAndroid && _androidXrayExperimental;
   String get _androidRuntimeId => 'xray';
@@ -311,6 +325,31 @@ class VpnCoreController {
     bool force = false,
   }) async {
     if (!_isWindows) return;
+
+    while (_windowsRuntimePreparation != null) {
+      try {
+        await _windowsRuntimePreparation;
+      } catch (_) {
+        if (!force) rethrow;
+      }
+      if (!force) return;
+    }
+
+    late final Future<void> tracked;
+    tracked = _prepareWindowsRuntimeInternal(onLog: onLog, force: force)
+        .whenComplete(() {
+          if (identical(_windowsRuntimePreparation, tracked)) {
+            _windowsRuntimePreparation = null;
+          }
+        });
+    _windowsRuntimePreparation = tracked;
+    await tracked;
+  }
+
+  Future<void> _prepareWindowsRuntimeInternal({
+    void Function(String log)? onLog,
+    required bool force,
+  }) async {
     if (!_windowsDnsRecoveryChecked || force) {
       final dnsRecovery = await _windowsDnsManager.recover();
       _windowsDnsRecoveryChecked = true;
@@ -508,9 +547,12 @@ class VpnCoreController {
     _windowsConnected = false;
     _lastStartError = null;
     _recentLogs.clear();
-    _resetConnectionLogging(enableDiskLogging: developerMode);
-    if (developerMode) {
-      await _createConnectionLogFile();
+    final persistConnectionLog = developerMode || _useWindowsHybridTun;
+    _resetConnectionLogging(enableDiskLogging: persistConnectionLog);
+    if (persistConnectionLog) {
+      await _createConnectionLogFile(
+        reason: developerMode ? 'developer-mode' : 'windows-hybrid-runtime',
+      );
     }
     _beginConnectDiagnostics();
 
@@ -541,10 +583,13 @@ class VpnCoreController {
     if (_isWindows) {
       await prepareWindowsRuntime(onLog: onLog);
       if (_windowsDnsRecoveryError != null) {
+        final recoveryError = _windowsDnsRecoveryError!;
         return VpnCoreStartResult.failure(
           'Не удалось восстановить DNS после предыдущей сессии: '
-          '$_windowsDnsRecoveryError',
-          requiresAdmin: true,
+          '$recoveryError',
+          requiresAdmin:
+              _isAccessDeniedError(recoveryError) &&
+              _tunGuard.elevationState == false,
         );
       }
       if (!_isConnectionOperationCurrent(connectionOperation)) {
@@ -756,6 +801,41 @@ class VpnCoreController {
       return VpnCoreStartResult.failure(sanityError);
     }
 
+    var useHybridBackend = _useWindowsHybridTun;
+    String? singBoxExePath;
+    if (useHybridBackend) {
+      _notifyStatus('Подготовка TUN backend');
+      singBoxExePath = _cachedWindowsSingBoxPath;
+      if (singBoxExePath != null && !File(singBoxExePath).existsSync()) {
+        singBoxExePath = null;
+        _cachedWindowsSingBoxPath = null;
+      }
+      singBoxExePath ??= await _measureConnectPhase(
+        'singbox_resolve',
+        _binaryManager.resolveWindowsSingBoxExecutable,
+      );
+      if (singBoxExePath != null) {
+        _cachedWindowsSingBoxPath = singBoxExePath;
+      }
+      final wintunPath = await _measureConnectPhase(
+        'wintun_prepare',
+        _wintunManager.ensureWintunAvailable,
+      );
+      if (singBoxExePath == null) {
+        return VpnCoreStartResult.failure(
+          'Не удалось подготовить sing-box TUN backend',
+        );
+      }
+      if (wintunPath == null) {
+        return VpnCoreStartResult.failure(
+          'Не удалось подготовить Wintun для sing-box backend',
+        );
+      }
+      _appendConnectionLog(
+        '[hybrid] using sing-box TUN frontend with Xray SOCKS backend',
+      );
+    }
+
     if (_activeConnectionToken != null) {
       await _cleanupSessionToken(
         _activeConnectionToken!,
@@ -763,6 +843,7 @@ class VpnCoreController {
       );
     }
     if (_isWindows) {
+      await _stopTunProcess();
       final process = _process;
       if (process != null) {
         await _forceStopProcess(process);
@@ -783,13 +864,19 @@ class VpnCoreController {
       }
       final token = ++_sessionEpoch;
       _activeConnectionToken = token;
+      final hybridBackend = useHybridBackend && singBoxExePath != null;
+      final manageWindowsDns = useSecureWindowsDns && !hybridBackend;
+      var managedDnsPrepared = false;
       _notifyStatus(
         'Подключение... попытка $attempt/$_maxWindowsAutoRecoverAttempts',
       );
       _appendConnectionLog(
         '\n=== New Connection Attempt ===\n'
         'token=$token\n'
-        'attempt=$attempt/$_maxWindowsAutoRecoverAttempts\n',
+        'attempt=$attempt/$_maxWindowsAutoRecoverAttempts\n'
+        'routing_mode=${splitConfig.mode}\n'
+        'managed_dns=$manageWindowsDns\n'
+        'backend=${hybridBackend ? 'sing-box+xray' : 'xray-tun'}\n',
       );
 
       final plan = await _measureConnectPhase(
@@ -842,7 +929,7 @@ class VpnCoreController {
       }
 
       _activeInterfaceName = plan.interfaceName;
-      _activeWindowsInboundTag = plan.inboundTag;
+      _activeWindowsInboundTag = hybridBackend ? 'socks-in' : plan.inboundTag;
       _sessionInterfaces[token] = plan.interfaceName;
       await _sessionStore.markDirty(
         interfaceName: plan.interfaceName,
@@ -885,7 +972,7 @@ class VpnCoreController {
           '${endpoint.serverAddressOverride} for ${parsed.host}',
         );
       }
-      if (useSecureWindowsDns) {
+      if (manageWindowsDns) {
         final dnsPrepare = await _measureConnectPhase(
           'dns_backup',
           () => _windowsDnsManager.prepare(
@@ -894,33 +981,50 @@ class VpnCoreController {
         );
         _emitLogs(dnsPrepare.logs);
         if (!dnsPrepare.success) {
-          lastError =
-              'Не удалось сохранить исходные DNS-настройки Windows: '
-              '${dnsPrepare.error ?? 'unknown'}';
-          await _cleanupSessionToken(token, reason: 'dns-backup-failed');
-          return VpnCoreStartResult.failure(lastError, requiresAdmin: true);
+          _emitLogs(<String>[
+            '[token=$token] managed DNS preparation skipped: '
+                '${dnsPrepare.error ?? 'unknown'}',
+          ]);
+        } else {
+          managedDnsPrepared = true;
+          _sessionDnsTokens.add(token);
         }
-        _sessionDnsTokens.add(token);
       }
       _notifyStatus('Генерация конфига');
-      final jsonConfig = _buildConfigJson(
-        parsed: parsed,
-        splitConfig: splitConfig,
-        inboundTag: plan.inboundTag,
-        interfaceName: plan.interfaceName,
-        interfaceAddresses: plan.addresses,
-        outboundInterfaceName: uplink.interfaceName,
-        outboundBindAddress: uplink.localAddress,
-        useSmartEngineRules: useSmartEngineRules,
-        extraRouteRules: extraRouteRules,
-        extraOutbounds: extraOutbounds,
-        extraInbounds: extraInbounds,
-        dnsServers: dnsServers,
-        dnsFinalTag: dnsFinalTag,
-        dpiEvasionConfig: dpiEvasionConfig,
-        developerMode: developerMode,
-        serverAddressOverride: endpoint.serverAddressOverride,
-      );
+      final jsonConfig = hybridBackend
+          ? generateWindowsXrayProxyConfig(
+              parsed,
+              splitConfig,
+              inboundTag: _activeWindowsInboundTag,
+              outboundInterfaceName: uplink.interfaceName,
+              outboundBindAddress: uplink.localAddress,
+              smartRouting: splitConfig.smartRouting && !useSmartEngineRules,
+              smartDomains: splitConfig.smartRouting && !useSmartEngineRules
+                  ? splitConfig.smartDomains
+                  : const <String>[],
+              extraRouteRules: extraRouteRules,
+              apiPort: _xrayApiPort,
+              logLevel: developerMode ? 'debug' : 'info',
+              serverAddressOverride: endpoint.serverAddressOverride,
+            )
+          : _buildConfigJson(
+              parsed: parsed,
+              splitConfig: splitConfig,
+              inboundTag: plan.inboundTag,
+              interfaceName: plan.interfaceName,
+              interfaceAddresses: plan.addresses,
+              outboundInterfaceName: uplink.interfaceName,
+              outboundBindAddress: uplink.localAddress,
+              useSmartEngineRules: useSmartEngineRules,
+              extraRouteRules: extraRouteRules,
+              extraOutbounds: extraOutbounds,
+              extraInbounds: extraInbounds,
+              dnsServers: dnsServers,
+              dnsFinalTag: dnsFinalTag,
+              dpiEvasionConfig: dpiEvasionConfig,
+              developerMode: developerMode,
+              serverAddressOverride: endpoint.serverAddressOverride,
+            );
       _generatedConfig = jsonConfig;
 
       final tempDir = await _measureConnectPhase(
@@ -933,6 +1037,21 @@ class VpnCoreController {
         () => cfgFile.writeAsString(jsonConfig),
       );
       _configFile = cfgFile;
+      File? hybridTunConfigFile;
+      if (hybridBackend) {
+        hybridTunConfigFile = File('${tempDir.path}/sing-box.json');
+        final hybridTunConfig = generateWindowsHybridTunConfig(
+          splitConfig,
+          inboundTag: plan.inboundTag,
+          interfaceName: plan.interfaceName,
+          addresses: plan.addresses,
+          logLevel: developerMode ? 'debug' : 'info',
+        );
+        await _measureConnectPhase(
+          'singbox_config_write',
+          () => hybridTunConfigFile!.writeAsString(hybridTunConfig),
+        );
+      }
       if (!_isConnectionOperationCurrent(connectionOperation)) {
         return _cancelWindowsAttempt(token);
       }
@@ -948,6 +1067,23 @@ class VpnCoreController {
       if (configValidationError != null) {
         await _cleanupSessionToken(token, reason: 'config-validation-failed');
         return VpnCoreStartResult.failure(configValidationError);
+      }
+      if (hybridBackend && hybridTunConfigFile != null) {
+        final tunValidationError = await _measureConnectPhase(
+          'singbox_config_validate',
+          () => _validateSingBoxConfig(singBoxExePath!, hybridTunConfigFile!),
+        );
+        if (tunValidationError != null) {
+          _appendConnectionLog(
+            '[hybrid] validation failed: '
+            '$tunValidationError',
+          );
+          await _cleanupSessionToken(
+            token,
+            reason: 'hybrid-config-validation-failed',
+          );
+          return VpnCoreStartResult.failure(tunValidationError);
+        }
       }
 
       _notifyStatus('Запуск процесса');
@@ -976,10 +1112,110 @@ class VpnCoreController {
         }
         final startupError = await _measureConnectPhase(
           'startup_verify',
-          () => _verifyStartup(process, plan.interfaceName),
+          () => hybridBackend
+              ? _verifyXrayProxyStartup(process)
+              : _verifyStartup(process, plan.interfaceName),
         );
         if (!_isConnectionOperationCurrent(connectionOperation)) {
           return _cancelWindowsAttempt(token, process: process);
+        }
+        if (startupError == null && hybridBackend) {
+          _notifyStatus('Запуск TUN');
+          final tunStartupError = await _measureConnectPhase(
+            'singbox_startup',
+            () => _startHybridTunFrontend(
+              executablePath: singBoxExePath!,
+              configFile: hybridTunConfigFile!,
+              environment: environment,
+              interfaceName: plan.interfaceName,
+              token: token,
+            ),
+          );
+          if (!_isConnectionOperationCurrent(connectionOperation)) {
+            return _cancelWindowsAttempt(token, process: process);
+          }
+          if (tunStartupError != null) {
+            lastError = tunStartupError;
+            _appendConnectionLog(
+              '[hybrid] TUN frontend failed: '
+              '$tunStartupError',
+            );
+            await _stopTunProcess();
+            await _forceStopProcess(process);
+            await _teardownProcess();
+            _cachedWindowsUplink = null;
+            await _cleanupSessionToken(token, reason: 'hybrid-startup-failed');
+            if (attempt >= _maxWindowsAutoRecoverAttempts) {
+              return VpnCoreStartResult.failure(tunStartupError);
+            }
+            continue;
+          }
+
+          final interfaceLogs = <String>[];
+          final tunInfo = await _measureConnectPhase(
+            'tun_inspect',
+            () => _windowsRouteManager.inspectTunInterface(
+              preferredTunInterface: plan.interfaceName,
+              tunAddressHint: plan.addresses.isEmpty
+                  ? null
+                  : plan.addresses.first,
+              logs: interfaceLogs,
+            ),
+          );
+          _emitLogs(interfaceLogs);
+          if (tunInfo == null) {
+            lastError = 'sing-box TUN запущен, но интерфейс Windows не найден';
+            _appendConnectionLog('[hybrid] $lastError');
+            await _stopTunProcess();
+            await _forceStopProcess(process);
+            await _teardownProcess();
+            _cachedWindowsUplink = null;
+            await _cleanupSessionToken(token, reason: 'hybrid-tun-not-found');
+            if (attempt >= _maxWindowsAutoRecoverAttempts) {
+              return VpnCoreStartResult.failure(lastError);
+            }
+            continue;
+          }
+
+          if (managedDnsPrepared) {
+            final dnsApply = await _measureConnectPhase(
+              'dns_apply',
+              () => _windowsDnsManager.apply(
+                uplinkInterfaceIndex: uplink.interfaceIndex,
+                tunInterfaceIndex: tunInfo.interfaceIndex,
+              ),
+            );
+            _emitLogs(dnsApply.logs);
+            if (!dnsApply.success) {
+              _emitLogs(<String>[
+                '[token=$token] managed DNS unavailable; sing-box DNS '
+                    'hijack remains active: ${dnsApply.error ?? 'unknown'}',
+              ]);
+              final dnsRestore = await _windowsDnsManager.restore();
+              _emitLogs(dnsRestore.logs);
+              if (dnsRestore.success) {
+                _sessionDnsTokens.remove(token);
+              }
+            }
+          }
+
+          _activeInterfaceName = tunInfo.name;
+          _sessionInterfaces[token] = tunInfo.name;
+          await _sessionStore.markDirty(
+            interfaceName: tunInfo.name,
+            remoteHost: parsed.host,
+            pid: process.pid,
+          );
+          _cachedWindowsUplink = uplink;
+          _pendingAggressiveRecovery = false;
+          _windowsConnected = true;
+          _notifyStatus('Подключено (TUN: ${tunInfo.name})');
+          _lastWindowsRuleHash = _computeWindowsRuleHash(jsonConfig);
+          _appendConnectionLog(
+            '[token=$token] hybrid backend connected '
+            'interface=${tunInfo.name} ifIndex=${tunInfo.interfaceIndex}',
+          );
+          return VpnCoreStartResult.success();
         }
         if (startupError == null) {
           final routeResult = await _measureConnectPhase(
@@ -1018,7 +1254,7 @@ class VpnCoreController {
           }
           _activeWindowsRouteSession = routeResult.session;
           _sessionRoutePlans[token] = routeResult.session!;
-          if (useSecureWindowsDns) {
+          if (managedDnsPrepared) {
             final dnsApply = await _measureConnectPhase(
               'dns_apply',
               () => _windowsDnsManager.apply(
@@ -1028,17 +1264,21 @@ class VpnCoreController {
             );
             _emitLogs(dnsApply.logs);
             if (!dnsApply.success) {
-              final dnsError =
-                  'Не удалось включить защищённый DNS: '
-                  '${dnsApply.error ?? 'unknown'}';
-              _appendConnectionLog(
-                '[token=$token] secure DNS setup failed: $dnsError',
-              );
-              await _forceStopProcess(process);
-              await _teardownProcess();
-              _cachedWindowsUplink = null;
-              await _cleanupSessionToken(token, reason: 'dns-apply-failed');
-              return VpnCoreStartResult.failure(dnsError, requiresAdmin: true);
+              _emitLogs(<String>[
+                '[token=$token] managed DNS unavailable; continuing with '
+                    'the existing Windows resolver: '
+                    '${dnsApply.error ?? 'unknown'}',
+              ]);
+              final dnsRestore = await _windowsDnsManager.restore();
+              _emitLogs(dnsRestore.logs);
+              if (dnsRestore.success) {
+                _sessionDnsTokens.remove(token);
+              } else {
+                _appendConnectionLog(
+                  '[token=$token] managed DNS fallback restore failed: '
+                  '${dnsRestore.error ?? 'unknown'}',
+                );
+              }
             }
           }
           // Xray can choose a runtime adapter name (usually xray0) that is
@@ -1083,6 +1323,13 @@ class VpnCoreController {
           return VpnCoreStartResult.failure(startupError, requiresAdmin: true);
         }
 
+        if (hybridBackend) {
+          _appendConnectionLog(
+            '[hybrid] Xray SOCKS backend failed; retrying hybrid backend',
+          );
+          if (attempt < _maxWindowsAutoRecoverAttempts) continue;
+        }
+
         if (failureClass == _StartupFailureClass.fatal ||
             attempt >= _maxWindowsAutoRecoverAttempts) {
           return VpnCoreStartResult.failure(startupError);
@@ -1118,6 +1365,7 @@ class VpnCoreController {
     int token, {
     Process? process,
   }) async {
+    await _stopTunProcess();
     if (process != null && identical(_process, process)) {
       await _forceStopProcess(process);
       await _teardownProcess();
@@ -1326,6 +1574,27 @@ class VpnCoreController {
     }
   }
 
+  Future<String?> _validateSingBoxConfig(
+    String executablePath,
+    File configFile,
+  ) async {
+    try {
+      final result = await _runMeasuredProcess(executablePath, [
+        'check',
+        '-c',
+        configFile.path,
+      ]);
+      if (result.exitCode == 0) return null;
+      final details = '${result.stderr}\n${result.stdout}'.trim();
+      final compact = details.replaceAll(RegExp(r'\s+'), ' ');
+      return compact.isEmpty
+          ? 'Конфигурация sing-box не прошла проверку'
+          : 'Конфигурация sing-box не прошла проверку: $compact';
+    } catch (e) {
+      return 'Не удалось проверить конфигурацию sing-box: $e';
+    }
+  }
+
   String? _computeWindowsRuleHash(String jsonConfig) {
     if (!_isWindows) return null;
     return _windowsCoreAdapter.computeRuleHash(jsonConfig);
@@ -1451,6 +1720,7 @@ class VpnCoreController {
 
   Future<void> _terminateExistingProcesses() async {
     if (!_isWindows) return;
+    await _stopTunProcess();
     final process = _process;
     if (process != null) {
       await _forceStopProcess(process);
@@ -1498,19 +1768,20 @@ class VpnCoreController {
       return;
     }
 
+    final activeToken = _activeConnectionToken;
     final process = _process;
     _notifyStatus('Остановка...');
     _windowsConnected = false;
+    await _stopTunProcess();
     if (process != null) {
       await _forceStopProcess(process);
     }
     await _teardownProcess();
 
-    if (_isWindows) {
+    if (_isWindows && activeToken == null) {
       final dnsRestore = await _windowsDnsManager.restore();
       _emitLogs(dnsRestore.logs);
     }
-    final activeToken = _activeConnectionToken;
     if (activeToken != null) {
       await _cleanupSessionToken(activeToken, reason: 'manual-disconnect');
     } else if (_activeInterfaceName != null) {
@@ -1565,16 +1836,17 @@ class VpnCoreController {
       _windowsConnected = false;
     }
 
+    final token = _activeConnectionToken;
     final process = _process;
+    await _stopTunProcess();
     if (process != null) {
       await _forceStopProcess(process);
       await _teardownProcess();
     }
-    if (_isWindows) {
+    if (_isWindows && token == null) {
       final dnsRestore = await _windowsDnsManager.restore();
       _emitLogs(dnsRestore.logs);
     }
-    final token = _activeConnectionToken;
     if (token != null) {
       await _cleanupSessionToken(token, reason: 'force-terminate');
     } else if (_activeInterfaceName != null) {
@@ -1600,6 +1872,7 @@ class VpnCoreController {
 
   Future<void> dispose() async {
     await disconnect();
+    await _stopTunProcess();
     await _teardownProcess();
     await _sessionStore.clear();
     await _flushConnectionLog(force: true);
@@ -1609,16 +1882,14 @@ class VpnCoreController {
     _stdoutSub?.cancel();
     _stderrSub?.cancel();
 
-    _stdoutSub = process.stdout.transform(SystemEncoding().decoder).listen((
-      data,
-    ) {
-      _emitChunk(data, isError: false);
-    });
-    _stderrSub = process.stderr.transform(SystemEncoding().decoder).listen((
-      data,
-    ) {
-      _emitChunk(data, isError: true);
-    });
+    _stdoutSub = process.stdout
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen((line) => _emitChunk(line, isError: false));
+    _stderrSub = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen((line) => _emitChunk(line, isError: true));
 
     process.exitCode.then((code) async {
       if (_process != process) {
@@ -1640,7 +1911,61 @@ class VpnCoreController {
     });
   }
 
+  void _attachTunProcessHandlers(Process process, int token) {
+    _tunStdoutSub?.cancel();
+    _tunStderrSub?.cancel();
+
+    _tunStdoutSub = process.stdout
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen((line) => _emitChunk('[sing-box] $line', isError: false));
+    _tunStderrSub = process.stderr
+        .transform(const Utf8Decoder(allowMalformed: true))
+        .transform(const LineSplitter())
+        .listen((line) => _emitChunk('[sing-box] $line', isError: true));
+
+    process.exitCode.then((code) async {
+      if (_tunProcess != process) return;
+      final wasConnected = _windowsConnected;
+      _appendConnectionLog(
+        '[token=$token] sing-box TUN frontend exited code=$code',
+      );
+      await _teardownTunProcess();
+      if (!wasConnected) return;
+
+      _windowsConnected = false;
+      final xray = _process;
+      if (xray != null) {
+        await _forceStopProcess(xray);
+        await _teardownProcess();
+      }
+      _notifyStatus('TUN процесс завершён (код $code)');
+      await _cleanupSessionToken(token, reason: 'tun-process-exit');
+    });
+  }
+
+  Future<void> _teardownTunProcess() async {
+    await _tunStdoutSub?.cancel();
+    await _tunStderrSub?.cancel();
+    _tunStdoutSub = null;
+    _tunStderrSub = null;
+    _tunProcess = null;
+  }
+
+  Future<void> _stopTunProcess() async {
+    final process = _tunProcess;
+    _tunProcess = null;
+    await _tunStdoutSub?.cancel();
+    await _tunStderrSub?.cancel();
+    _tunStdoutSub = null;
+    _tunStderrSub = null;
+    if (process != null) {
+      await _forceStopProcess(process);
+    }
+  }
+
   Future<void> _teardownProcess() async {
+    await _stopTunProcess();
     await _stdoutSub?.cancel();
     await _stderrSub?.cancel();
     _stdoutSub = null;
@@ -2219,13 +2544,22 @@ if (-not \$s) { exit 0 }
       final line = raw.trim();
       if (line.isEmpty) continue;
       _rememberLogLine(line, isError: isError);
+      final normalizedLine = line.toLowerCase();
       if (isError &&
-          (line.contains('Access is denied') ||
-              line.toLowerCase().contains('permission denied'))) {
-        _accessDeniedDetected = true;
-        _notifyStatus(
-          '❌ Нужны права администратора! Запустите приложение от имени администратора',
-        );
+          (normalizedLine.contains('access is denied') ||
+              normalizedLine.contains('permission denied'))) {
+        if (_tunGuard.elevationState != false) {
+          _appendConnectionLog(
+            '[diag] access denied without a definitive non-elevated token; '
+            'likely driver, security policy, antivirus, or resource lock '
+            '(elevation=${_tunGuard.elevationState ?? 'unknown'})',
+          );
+        } else {
+          _accessDeniedDetected = true;
+          _notifyStatus(
+            '❌ Нужны права администратора! Запустите приложение от имени администратора',
+          );
+        }
       }
       final payload = isError ? '[ERR] $line' : line;
       _logSink?.call(payload);
@@ -2384,18 +2718,35 @@ if (-not \$s) { exit 0 }
     return _recentLogs.isNotEmpty ? _recentLogs.last : null;
   }
 
-  Future<void> _cleanupSessionToken(int token, {required String reason}) async {
-    if (!_cleanupInProgressTokens.add(token)) {
-      _appendConnectionLog('[token=$token] cleanup skipped (already running)');
-      return;
+  Future<void> _cleanupSessionToken(int token, {required String reason}) {
+    final existing = _cleanupFutures[token];
+    if (existing != null) {
+      _appendConnectionLog('[token=$token] waiting for active cleanup');
+      return existing;
     }
+
+    late final Future<void> cleanup;
+    cleanup = _performSessionCleanup(token, reason: reason).whenComplete(() {
+      if (identical(_cleanupFutures[token], cleanup)) {
+        _cleanupFutures.remove(token);
+      }
+    });
+    _cleanupFutures[token] = cleanup;
+    return cleanup;
+  }
+
+  Future<void> _performSessionCleanup(
+    int token, {
+    required String reason,
+  }) async {
+    final interfaceName =
+        _sessionInterfaces[token] ??
+        (_activeConnectionToken == token ? _activeInterfaceName : null);
+    final routeSession =
+        _sessionRoutePlans[token] ??
+        (_activeConnectionToken == token ? _activeWindowsRouteSession : null);
+    var cleanupFailed = false;
     try {
-      final interfaceName =
-          _sessionInterfaces[token] ??
-          (_activeConnectionToken == token ? _activeInterfaceName : null);
-      final routeSession =
-          _sessionRoutePlans[token] ??
-          (_activeConnectionToken == token ? _activeWindowsRouteSession : null);
       _appendConnectionLog(
         '[token=$token] cleanup started reason=$reason interface=${interfaceName ?? 'unknown'}',
       );
@@ -2407,6 +2758,8 @@ if (-not \$s) { exit 0 }
             '[token=$token] DNS restore failed: '
             '${dnsRestore.error ?? 'unknown'}',
           );
+          _windowsDnsRecoveryChecked = false;
+          cleanupFailed = true;
         }
       }
       if (_isWindows && routeSession != null) {
@@ -2428,6 +2781,14 @@ if (-not \$s) { exit 0 }
           '$interfaceName; Xray owns the adapter lifecycle',
         );
       }
+    } catch (error) {
+      cleanupFailed = true;
+      _pendingAggressiveRecovery = true;
+      _appendConnectionLog(
+        '[token=$token] cleanup failed reason=$reason error=$error',
+      );
+    } finally {
+      _sessionDnsTokens.remove(token);
       _sessionInterfaces.remove(token);
       _sessionRoutePlans.remove(token);
       if (_activeConnectionToken == token) {
@@ -2435,17 +2796,28 @@ if (-not \$s) { exit 0 }
         _activeInterfaceName = null;
         _activeWindowsRouteSession = null;
       }
-      _appendConnectionLog('[token=$token] cleanup completed reason=$reason');
-    } finally {
-      _cleanupInProgressTokens.remove(token);
+      _appendConnectionLog(
+        '[token=$token] cleanup ${cleanupFailed ? 'finished with recovery pending' : 'completed'} '
+        'reason=$reason',
+      );
     }
+  }
+
+  bool _isAccessDeniedError(String message) {
+    final normalized = message.toLowerCase();
+    return normalized.contains('access is denied') ||
+        normalized.contains('access_denied') ||
+        normalized.contains('отказано в доступе') ||
+        normalized.contains('permission denied');
   }
 
   _StartupFailureClass _classifyStartupFailure(String message) {
     final normalized = message.toLowerCase();
     if (_accessDeniedDetected ||
-        normalized.contains('access is denied') ||
-        normalized.contains('администратор')) {
+        normalized.contains('administrator privileges are required') ||
+        normalized.contains('run the application as administrator') ||
+        normalized.contains('нужны права администратора') ||
+        normalized.contains('запустите приложение от имени администратора')) {
       return _StartupFailureClass.requiresAdmin;
     }
     if (normalized.contains('already exists') ||
@@ -2476,6 +2848,60 @@ if (-not \$s) { exit 0 }
     } catch (_) {
       process.kill(ProcessSignal.sigkill);
     }
+  }
+
+  Future<String?> _verifyXrayProxyStartup(Process process) async {
+    _appendConnectionLog('Waiting for Xray SOCKS backend readiness...');
+    final deadline = DateTime.now().add(const Duration(seconds: 3));
+    while (DateTime.now().isBefore(deadline)) {
+      final exitCode = await _tryReadEarlyExitCode(process);
+      if (exitCode != null) {
+        final hint = _latestMeaningfulProcessLog();
+        final suffix = hint == null ? '' : ' ($hint)';
+        return 'xray-core exited early (code $exitCode)$suffix';
+      }
+      if (await _isWindowsCoreApiResponsive()) {
+        _appendConnectionLog('Xray SOCKS backend is ready via API');
+        return null;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+    }
+    return 'Xray SOCKS backend startup timed out';
+  }
+
+  Future<String?> _startHybridTunFrontend({
+    required String executablePath,
+    required File configFile,
+    required Map<String, String> environment,
+    required String interfaceName,
+    required int token,
+  }) async {
+    final process = await _startMeasuredProcess(executablePath, <String>[
+      'run',
+      '-c',
+      configFile.path,
+    ], environment: environment);
+    _tunProcess = process;
+    _attachTunProcessHandlers(process, token);
+
+    final adapterReady = await _tunGuard.waitForAdapterUp(
+      interfaceName,
+      timeout: const Duration(seconds: 4),
+    );
+    if (adapterReady && identical(_tunProcess, process)) {
+      _appendConnectionLog(
+        '[hybrid] sing-box TUN is ready interface=$interfaceName',
+      );
+      return null;
+    }
+
+    final exitCode = await _tryReadEarlyExitCode(process);
+    final hint = _latestMeaningfulProcessLog();
+    final suffix = hint == null ? '' : ' ($hint)';
+    if (exitCode != null) {
+      return 'sing-box exited early (code $exitCode)$suffix';
+    }
+    return 'sing-box TUN adapter did not come up$suffix';
   }
 
   Future<String?> _verifyStartup(Process process, String interfaceName) async {
