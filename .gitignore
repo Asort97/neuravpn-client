@@ -46,6 +46,8 @@ app.*.map.json
 
 # Additional platform outputs
 android/.gradle/
+android/.kotlin/
+java_pid*.hprof
 android/app/build/
 ios/Pods/
 macos/Pods/
