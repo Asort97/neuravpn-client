@@ -10,6 +10,8 @@ class _FakeAndroidVpnController extends AndroidVpnController {
     this.startError,
     this.startMarksRunning = true,
     this.stopSucceedsOnCall = 1,
+    this.startPhase,
+    this.readyAfterPolls,
   });
 
   bool running;
@@ -18,6 +20,10 @@ class _FakeAndroidVpnController extends AndroidVpnController {
   bool startMarksRunning;
   int? stopSucceedsOnCall;
   int stopCalls = 0;
+  final AndroidVpnPhase? startPhase;
+  final int? readyAfterPolls;
+  AndroidVpnPhase? phase;
+  int startupPolls = 0;
 
   @override
   Future<bool> prepareVpn() async => prepareGranted;
@@ -29,6 +35,7 @@ class _FakeAndroidVpnController extends AndroidVpnController {
     String? executablePath,
     List<String>? includePackages,
     List<String>? excludePackages,
+    String? routingMode,
   }) async {
     if (startError != null) {
       throw startError!;
@@ -36,6 +43,7 @@ class _FakeAndroidVpnController extends AndroidVpnController {
     if (startMarksRunning) {
       running = true;
     }
+    phase = startPhase;
   }
 
   @override
@@ -43,11 +51,25 @@ class _FakeAndroidVpnController extends AndroidVpnController {
     stopCalls += 1;
     if (stopSucceedsOnCall != null && stopCalls >= stopSucceedsOnCall!) {
       running = false;
+      phase = AndroidVpnPhase.stopped;
     }
   }
 
   @override
-  Future<bool> isRunning() async => running;
+  Future<AndroidVpnStatus> getStatus() async {
+    if (phase == AndroidVpnPhase.starting &&
+        readyAfterPolls != null &&
+        ++startupPolls >= readyAfterPolls!) {
+      phase = AndroidVpnPhase.running;
+      running = true;
+    }
+    return AndroidVpnStatus(
+      phase:
+          phase ??
+          (running ? AndroidVpnPhase.running : AndroidVpnPhase.stopped),
+      errorMessage: lastStartupError,
+    );
+  }
 
   @override
   Future<String?> getLastStartupError() async => lastStartupError;
@@ -59,6 +81,57 @@ const _validUri =
     'vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&type=tcp&sni=example.com#tag';
 
 void main() {
+  testWidgets('slow local startup can finish after six seconds', (
+    tester,
+  ) async {
+    final fake = _FakeAndroidVpnController(
+      startMarksRunning: false,
+      startPhase: AndroidVpnPhase.starting,
+      readyAfterPolls: 30,
+    );
+    final controller = VpnCoreController(
+      androidController: fake,
+      isWindowsOverride: false,
+      isAndroidOverride: true,
+    );
+    final result = controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    await tester.pump();
+    for (var i = 0; i < 35; i++) {
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+    expect((await result).success, isTrue);
+    expect(fake.stopCalls, 0);
+    await controller.disconnect();
+  });
+
+  testWidgets('timed-out startup is stopped instead of connecting later', (
+    tester,
+  ) async {
+    final fake = _FakeAndroidVpnController(
+      startMarksRunning: false,
+      startPhase: AndroidVpnPhase.starting,
+    );
+    final controller = VpnCoreController(
+      androidController: fake,
+      isWindowsOverride: false,
+      isAndroidOverride: true,
+    );
+    final result = controller.connect(
+      rawUri: _validUri,
+      splitConfig: SplitTunnelConfig(mode: 'all'),
+    );
+    await tester.pump();
+    for (var i = 0; i < 105; i++) {
+      await tester.pump(const Duration(milliseconds: 300));
+    }
+    expect((await result).success, isFalse);
+    expect(fake.stopCalls, 1);
+    expect(fake.phase, AndroidVpnPhase.stopped);
+  });
+
   test(
     'syncRuntimeState restores Android running state after app restart',
     () async {
@@ -209,4 +282,3 @@ void main() {
     },
   );
 }
-

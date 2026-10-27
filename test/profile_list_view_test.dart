@@ -5,12 +5,78 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:happycat_vpnclient/models/vpn_profile.dart';
 import 'package:happycat_vpnclient/models/vpn_subscription.dart';
+import 'package:happycat_vpnclient/services/subscription_repository.dart';
 import 'package:happycat_vpnclient/widgets/neura_ui.dart';
 import 'package:happycat_vpnclient/widgets/profile_list_view.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('mobile subscriptions have no search and can be renamed', (
+    tester,
+  ) async {
+    final subscription = VpnSubscription(
+      id: 'mobile-sub',
+      name: 'My subscription',
+      url: 'https://example.com/sub',
+      profiles: [
+        _vlessUri('Latvia', port: 443, type: 'xhttp'),
+        _vlessUri('Germany', port: 8443, type: 'tcp'),
+      ],
+    );
+    SharedPreferences.setMockInitialValues({
+      'vpn_subscriptions_list': [jsonEncode(subscription.toJson())],
+    });
+    tester.view.physicalSize = const Size(360, 720);
+    tester.view.devicePixelRatio = 1;
+    tester.platformDispatcher.textScaleFactorTestValue = 1.3;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    addTearDown(tester.view.resetViewInsets);
+    addTearDown(tester.platformDispatcher.clearTextScaleFactorTestValue);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: NeuraUi.buildTheme(),
+        home: Scaffold(
+          body: ProfileListView(
+            mobile: true,
+            profiles: const [],
+            selectedProfile: null,
+            onProfileSelected: (_) {},
+            onDeleteProfile: (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('profile-search')), findsNothing);
+    expect(find.byType(TextField), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Text && widget.data == 'Latvia',
+      ),
+      findsOneWidget,
+    );
+    expect(find.text('Germany'), findsOneWidget);
+    await tester.tap(find.byTooltip('Действия с подпиской'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Переименовать'));
+    await tester.pumpAndSettle();
+    tester.view.viewInsets = const FakeViewPadding(bottom: 240);
+    await tester.pumpAndSettle();
+    expect(find.byType(BottomSheet), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await tester.enterText(find.byType(TextField).last, 'Personal VPN');
+    await tester.ensureVisible(find.text('Сохранить'));
+    await tester.tap(find.text('Сохранить'));
+    await tester.pumpAndSettle();
+    final saved = await SubscriptionRepository().getAllSubscriptions();
+    expect(saved.single.name, 'Personal VPN');
+    expect(saved.single.profiles, subscription.profiles);
+    expect(find.byKey(const ValueKey('profile-search')), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('subscription list uses the compact selected layout', (
     tester,

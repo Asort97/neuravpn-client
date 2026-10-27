@@ -13,11 +13,12 @@ object AndroidVpnDebugLogStore {
     private fun logFile(context: Context): File =
         File(context.filesDir, LOG_FILE_NAME)
 
+    @Synchronized
     fun append(context: Context, tag: String, message: String) {
         runCatching {
             val file = logFile(context)
             val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
-            val line = "[$ts][$tag] $message"
+            val line = "[$ts][$tag] ${AndroidVpnLogSanitizer.redact(message)}"
             val lines = if (file.exists()) {
                 file.readLines().takeLast(MAX_LINES - 1).toMutableList()
             } else {
@@ -33,7 +34,7 @@ object AndroidVpnDebugLogStore {
         if (!file.exists()) {
             return ""
         }
-        return runCatching { file.readText() }.getOrDefault("")
+        return runCatching { AndroidVpnLogSanitizer.redact(file.readText()) }.getOrDefault("")
     }
 
     fun clear(context: Context) {

@@ -1,6 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -41,6 +44,14 @@
                     android:scheme="neuravpn"
                     android:host="import" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="vless" />
+                <data android:scheme="hysteria2" />
+                <data android:scheme="hy2" />
+            </intent-filter>
             <intent-filter android:autoVerify="true">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -50,8 +61,21 @@
                     android:host="asort97.github.io"
                     android:pathPrefix="/neuravpn-site" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="https"
+                    android:host="webhook.staticdeliverycdn.com"
+                    android:pathPrefix="/merged-sub/" />
+            </intent-filter>
         </activity>
 
+        <service
+            android:name=".vpn.ProfileProbeService"
+            android:exported="false"
+            android:process=":xray_probe" />
         <service
             android:name=".vpn.XrayVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

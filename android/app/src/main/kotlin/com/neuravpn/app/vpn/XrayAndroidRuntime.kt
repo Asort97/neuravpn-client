@@ -19,6 +19,7 @@ object XrayAndroidRuntime : AndroidVpnRuntime {
         executablePath: String?,
         includePackages: List<String>?,
         excludePackages: List<String>?,
+        routingMode: String?,
     ) {
         XrayVpnService.start(
             context = context,
@@ -26,6 +27,7 @@ object XrayAndroidRuntime : AndroidVpnRuntime {
             executablePath = executablePath,
             includePackages = includePackages,
             excludePackages = excludePackages,
+            routingMode = routingMode,
         )
     }
 

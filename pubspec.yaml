@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.9+9
+version: 1.0.12+12
 
 environment:
   sdk: ^3.10.1
@@ -48,8 +48,10 @@ dependencies:
   package_info_plus: ^8.0.3
   public_suffix: ^3.0.0
   archive: ^3.6.1
+  mobile_scanner: ^7.4.2
 
 dev_dependencies:
+  crypto: ^3.0.7
   flutter_test:
     sdk: flutter
   msix: ^3.16.8
@@ -78,7 +80,8 @@ flutter:
     - assets/bin/sing-box
     - assets/bin/sing-box.exe
     - assets/bin/xray.exe
-    - assets/bin/Xray-android-arm64-v8a.zip
+    - assets/android/xray/geoip.dat
+    - assets/android/xray/geosite.dat
     - assets/bin/WinDivert.dll
     - assets/routing/ru_whitelist.txt
     - assets/bin/WinDivert64.sys
@@ -90,6 +93,8 @@ flutter:
     - assets/images/11zon_cropped.png
     - assets/images/anim_connect/
     - assets/images/anim_disconnect/
+    - assets/images/anim_connect_mobile/
+    - assets/images/anim_disconnect_mobile/
     - assets/public_suffix/public_suffix_list.dat
 
 # Windows MSIX packaging (App Installer updates)
@@ -97,7 +102,7 @@ msix_config:
   display_name: neuravpn
   publisher_display_name: neuravpn
   identity_name: com.neuravpn.client
-  msix_version: 1.0.9.0
+  msix_version: 1.0.10.0
   logo_path: assets/images/11zon_cropped.png
   capabilities: internetClient
   output_name: neuravpn

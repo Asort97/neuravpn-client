@@ -14,6 +14,7 @@ interface AndroidVpnRuntime {
         executablePath: String?,
         includePackages: List<String>?,
         excludePackages: List<String>?,
+        routingMode: String?,
     )
 
     fun stop(context: Context)

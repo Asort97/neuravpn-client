@@ -15,7 +15,7 @@ import 'windows_route_manager.dart';
 import 'wintun_manager.dart';
 import '../services/smart_route_engine.dart';
 import '../vless/config_generator.dart';
-import '../vless/vless_parser.dart';
+import '../vless/proxy_parser.dart';
 import 'dpi_evasion_config.dart';
 
 enum TrafficSamplingMode { stopped, foreground, background }
@@ -129,6 +129,9 @@ class VpnCoreController {
   StreamSubscription<String>? _tunStdoutSub;
   StreamSubscription<String>? _tunStderrSub;
   bool _androidConnected = false;
+  AndroidVpnStatus _androidStatus = const AndroidVpnStatus(
+    phase: AndroidVpnPhase.stopped,
+  );
   bool _windowsConnected = false;
   bool _accessDeniedDetected = false;
   bool _startupCheckInProgress = false;
@@ -148,7 +151,7 @@ class VpnCoreController {
   String? _activeInterfaceName;
   File? _configFile;
   String? _generatedConfig;
-  VlessLink? _parsedLink;
+  ProxyLink? _parsedLink;
   String? _lastStartError;
   final List<String> _recentLogs = <String>[];
   final List<String> _memoryConnectionLogLines = <String>[];
@@ -204,7 +207,7 @@ class VpnCoreController {
   void Function(String status)? _statusSink;
   void Function(String log)? _logSink;
 
-  VlessLink? get parsedLink => _parsedLink;
+  ProxyLink? get parsedLink => _parsedLink;
   File? get configFile => _configFile;
   String? get generatedConfig => _generatedConfig;
   int get clashApiPort => _windowsCoreAdapter.apiPort;
@@ -228,6 +231,7 @@ class VpnCoreController {
   }
 
   bool get isRunning => _isAndroid ? _androidConnected : _windowsConnected;
+  AndroidVpnStatus get androidStatus => _androidStatus;
 
   Future<bool> isWintunAvailable() => _wintunManager.isWintunAvailable();
 
@@ -236,8 +240,10 @@ class VpnCoreController {
       return isRunning;
     }
     try {
-      _androidConnected = await _androidController.isRunning();
+      _androidStatus = await _androidController.getStatus();
+      _androidConnected = _androidStatus.isRunning;
     } catch (_) {
+      _androidStatus = const AndroidVpnStatus(phase: AndroidVpnPhase.stopped);
       _androidConnected = false;
     }
     return _androidConnected;
@@ -258,6 +264,11 @@ class VpnCoreController {
   Future<void> refreshAndroidNetwork() async {
     if (!_isAndroid) return;
     await _androidController.refreshNetwork();
+  }
+
+  Future<bool> openAndroidVpnSettings() async {
+    if (!_isAndroid) return false;
+    return _androidController.openVpnSettings();
   }
 
   void _startAndroidNativeLogPolling() {
@@ -558,19 +569,20 @@ class VpnCoreController {
 
     final trimmed = rawUri.trim();
     if (trimmed.isEmpty) {
-      return VpnCoreStartResult.failure('Ошибка: пустой VLESS URI');
+      return VpnCoreStartResult.failure('Ошибка: пустой URI профиля');
     }
 
-    final parsed = parseVlessUri(trimmed);
+    final parsed = parseProxyUri(trimmed);
     if (parsed == null) {
-      return VpnCoreStartResult.failure('Ошибка: неверный формат VLESS URI');
+      return VpnCoreStartResult.failure(proxyImportError(trimmed));
     }
-    if (!isSecureVlessLink(parsed)) {
-      return VpnCoreStartResult.failure(
-        'Небезопасный профиль: поддерживаются только TLS/Reality',
-      );
+    final validationError = proxyValidationError(parsed);
+    if (validationError != null) {
+      return VpnCoreStartResult.failure(validationError);
     }
-    final transportError = validateVlessTransportForXray(parsed);
+    final transportError = parsed is VlessLink
+        ? validateVlessTransportForXray(parsed)
+        : null;
     if (transportError != null) {
       return VpnCoreStartResult.failure(transportError);
     }
@@ -645,10 +657,8 @@ class VpnCoreController {
       );
       _generatedConfig = jsonConfig;
       _configFile = null;
-      // Log generated config for debugging (first 1000 chars)
       _appendConnectionLog(
-        '[android] generated xray config (${jsonConfig.length} chars): '
-        '${jsonConfig.length > 1000 ? '${jsonConfig.substring(0, 1000)}...' : jsonConfig}',
+        '[android] generated redacted xray config (${jsonConfig.length} chars)',
       );
       _notifyStatus('Запрос разрешения VPN');
       bool granted;
@@ -678,7 +688,7 @@ class VpnCoreController {
         );
         if (androidExecutablePath == null) {
           return VpnCoreStartResult.failure(
-            'Не найден Android xray-core binary. Добавьте Android Xray runtime в assets/bin.',
+            'Не удалось подготовить данные VPN. Переустановите приложение и повторите подключение.',
           );
         }
       }
@@ -691,19 +701,14 @@ class VpnCoreController {
           executablePath: androidExecutablePath,
           includePackages: includePackages.isEmpty ? null : includePackages,
           excludePackages: excludePackages.isEmpty ? null : excludePackages,
+          routingMode: splitConfig.smartRouting ? 'smart' : splitConfig.mode,
         );
       } catch (e) {
         return VpnCoreStartResult.failure(
           'Не удалось запустить Android VPN сервис: $e',
         );
       }
-      // Snapshot the current last-error BEFORE waiting.  A previous stop
-      // writes "stopped by request" which must not be mistaken for a new
-      // startup failure.
-      final preStartError = await _androidController.getLastStartupError();
-      final startup = await _waitForAndroidServiceStartup(
-        ignoreError: preStartError,
-      );
+      final startup = await _waitForAndroidServiceStartup();
       _androidConnected = startup.running;
       if (!startup.running) {
         final nativeLog = await getAndroidNativeDebugLog();
@@ -722,7 +727,6 @@ class VpnCoreController {
         );
       }
       _notifyStatus('Android Xray сервис запущен');
-      unawaited(_warmupConnection());
       return VpnCoreStartResult.success();
     }
 
@@ -750,7 +754,7 @@ class VpnCoreController {
   }
 
   Future<VpnCoreStartResult> _connectWindowsWithAutoRecover({
-    required VlessLink parsed,
+    required ProxyLink parsed,
     required SplitTunnelConfig splitConfig,
     required bool useSmartEngineRules,
     required List<Map<String, dynamic>> extraRouteRules,
@@ -1377,7 +1381,7 @@ class VpnCoreController {
   bool _isManagedTunPlanName(String name) => name.startsWith('tun-in-');
 
   String _buildConfigJson({
-    required VlessLink parsed,
+    required ProxyLink parsed,
     required SplitTunnelConfig splitConfig,
     required String inboundTag,
     required String interfaceName,
@@ -1419,8 +1423,10 @@ class VpnCoreController {
             ? splitConfig.smartDomains
             : const <String>[],
         extraRouteRules: extraRouteRules,
-        logLevel: developerMode ? 'debug' : 'info',
       );
+    }
+    if (parsed is! VlessLink) {
+      throw UnsupportedError('Hysteria 2 requires the Xray runtime');
     }
     return generateSingBoxConfig(
       parsed,
@@ -1452,34 +1458,43 @@ class VpnCoreController {
   String get tunStackFromPlatform => _isAndroid ? 'gvisor' : 'system';
   int get _xrayApiPort => _windowsCoreAdapter.apiPort;
 
-  Future<({bool running, String? error})> _waitForAndroidServiceStartup({
-    String? ignoreError,
-  }) async {
+  Future<({bool running, String? error})>
+  _waitForAndroidServiceStartup() async {
     if (!_isAndroid) return (running: true, error: null);
-    // The service runs in a separate process. Give it enough time to
-    // bootstrap libXray, start the Xray core, establish TUN, and launch
-    // tun2socks. 20 × 300ms = 6 seconds — enough for cold-start.
-    const attempts = 20;
+    // This is a local service-state deadline, not a network health check.
+    // Return immediately when ready; allow slower devices a cold-start budget.
+    const attempts = 100;
     for (var i = 0; i < attempts; i++) {
-      // Check for a startup error first — the service writes it BEFORE
-      // calling stopSelf(), so it may appear before isRunning flips.
-      // Ignore a stale error left over from a previous stop cycle.
-      final error = await _androidController.getLastStartupError();
-      if (error != null && error.isNotEmpty && error != ignoreError) {
-        return (running: false, error: error);
+      _androidStatus = await _androidController.getStatus();
+      if (_androidStatus.phase == AndroidVpnPhase.error) {
+        return (running: false, error: _androidStatus.errorMessage);
       }
-      final running = await _androidController.isRunning();
-      if (running) return (running: true, error: null);
+      if (_androidStatus.isRunning) return (running: true, error: null);
+      if (_androidStatus.phase == AndroidVpnPhase.stopped ||
+          _androidStatus.phase == AndroidVpnPhase.stopping) {
+        return (running: false, error: _androidStatus.errorMessage);
+      }
       await Future.delayed(const Duration(milliseconds: 300));
     }
-    return (running: false, error: null);
+    _androidStatus = await _androidController.getStatus();
+    if (_androidStatus.isRunning) return (running: true, error: null);
+    if (_androidStatus.phase == AndroidVpnPhase.starting) {
+      // Do not leave a timed-out startup connecting behind the error screen.
+      await _androidController.stopVpn();
+    }
+    return (
+      running: false,
+      error:
+          _androidStatus.errorMessage ??
+          'Превышено время запуска VPN. Повторите подключение.',
+    );
   }
 
   Future<bool> _waitForAndroidServiceStop({int attempts = 16}) async {
     if (!_isAndroid) return true;
     for (var i = 0; i < attempts; i++) {
-      final running = await _androidController.isRunning();
-      if (!running) return true;
+      _androidStatus = await _androidController.getStatus();
+      if (!_androidStatus.isActive) return true;
       await Future.delayed(const Duration(milliseconds: 250));
     }
     return false;

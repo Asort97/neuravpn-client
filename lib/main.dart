@@ -16,13 +16,15 @@ import 'package:tray_manager/tray_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:package_info_plus/package_info_plus.dart';
-import 'vless/vless_parser.dart';
+import 'vless/proxy_parser.dart';
 import 'models/split_tunnel_config.dart';
 import 'models/split_tunnel_preset.dart';
 import 'models/connectivity_test.dart';
 import 'models/vpn_subscription.dart';
 import 'services/connectivity_targets.dart';
 import 'services/connectivity_tester.dart';
+import 'services/android_play_update_service.dart';
+import 'services/profile_availability.dart';
 import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/domain_rule_normalizer.dart';
@@ -37,6 +39,7 @@ import 'services/windows_uri_protocol_registrar.dart';
 import 'models/vpn_profile.dart';
 import 'widgets/profile_list_view.dart';
 import 'widgets/add_profile_dialog.dart';
+import 'widgets/subscription_qr_scanner.dart';
 import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
@@ -210,7 +213,7 @@ bool isSupportedLaunchImportValue(String value) {
   if (trimmed.isEmpty) {
     return false;
   }
-  if (trimmed.startsWith('vless://')) {
+  if (isProxyUri(trimmed)) {
     return true;
   }
   final parsed = Uri.tryParse(trimmed);
@@ -242,7 +245,7 @@ String? decodeSupportedLaunchImportValue(String value) {
 }
 
 bool _isSecureProfileUri(String uri) {
-  return isSecureVlessUri(uri);
+  return isSecureProxyUri(uri);
 }
 
 @visibleForTesting
@@ -252,7 +255,7 @@ String? extractImportedVlessFromLaunchArgs(List<String> args) {
     if (candidate.isEmpty) {
       continue;
     }
-    if (candidate.startsWith('vless://')) {
+    if (isProxyUri(candidate)) {
       return candidate;
     }
 
@@ -277,12 +280,16 @@ String? extractImportedVlessFromLaunchArgs(List<String> args) {
     }
 
     final encodedValue = parsed.queryParameters['v'];
-    if (encodedValue == null || encodedValue.isEmpty) {
-      continue;
+    if (encodedValue != null && encodedValue.isNotEmpty) {
+      final decodedPayload = decodeSupportedLaunchImportValue(encodedValue);
+      if (decodedPayload != null) {
+        return decodedPayload;
+      }
     }
-    final decodedPayload = decodeSupportedLaunchImportValue(encodedValue);
-    if (decodedPayload != null) {
-      return decodedPayload;
+    if ((scheme == 'http' || scheme == 'https') &&
+        parsed.host.toLowerCase() == 'webhook.staticdeliverycdn.com' &&
+        parsed.path.startsWith('/merged-sub/')) {
+      return candidate;
     }
   }
   return null;
@@ -378,9 +385,16 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
 enum _WindowsView { connection, splitTunneling, settings }
 
 class VlessHomePage extends StatefulWidget {
-  const VlessHomePage({super.key, this.initialLaunchArgs = const <String>[]});
+  const VlessHomePage({
+    super.key,
+    this.initialLaunchArgs = const <String>[],
+    this.vpnCoreController,
+    this.androidPlayUpdateService,
+  });
 
   final List<String> initialLaunchArgs;
+  final VpnCoreController? vpnCoreController;
+  final AndroidPlayUpdateService? androidPlayUpdateService;
 
   @override
   State<VlessHomePage> createState() => _VlessHomePageState();
@@ -425,7 +439,13 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _presetDirty = false;
   List<VpnProfile> _profiles = [];
   VpnProfile? _selectedProfile;
-  final VpnCoreController _vpnCoreController = VpnCoreController();
+  late final VpnCoreController _vpnCoreController =
+      widget.vpnCoreController ?? VpnCoreController();
+  late final AndroidPlayUpdateService _androidPlayUpdateService =
+      widget.androidPlayUpdateService ?? AndroidPlayUpdateService();
+  StreamSubscription<int>? _playInstallSubscription;
+  int? _latestPlayInstallStatus;
+  final GlobalKey _connectQuickActionsKey = GlobalKey();
   final ScrollController _logScrollController = ScrollController();
   final List<NeuraSmoothScrollController> _windowsPageScrollControllers =
       List<NeuraSmoothScrollController>.generate(
@@ -445,6 +465,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _isExitingApp = false;
   bool _isConnecting = false;
   bool _isDisconnecting = false;
+  bool _isSwitchingProfile = false;
   int _connectionUiEpoch = 0;
   bool _connectButtonHovered = false;
   bool _connectButtonPressed = false;
@@ -460,6 +481,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   late final Animation<double> _connectGlowAnimation;
   late final AnimationController _frameAnimController;
   bool _frameAnimForward = false;
+  bool _mobileReduceMotion = false;
 
   static final List<String> _connectFrames = [
     for (int i = 35; i <= 60; i++)
@@ -469,6 +491,22 @@ class _VlessHomePageState extends State<VlessHomePage>
     for (int i = 35; i <= 60; i++)
       'assets/images/anim_disconnect/${i.toString().padLeft(4, '0')}.png',
   ];
+  static final List<String> _mobileConnectFrames = [
+    for (int i = 35; i <= 60; i++)
+      'assets/images/anim_connect_mobile/${i.toString().padLeft(4, '0')}.webp',
+  ];
+  static final List<String> _mobileDisconnectFrames = [
+    for (int i = 35; i <= 60; i++)
+      'assets/images/anim_disconnect_mobile/${i.toString().padLeft(4, '0')}.webp',
+  ];
+  List<String> get _activeConnectFrames =>
+      Platform.isAndroid || debugForceMobileShell
+      ? _mobileConnectFrames
+      : _connectFrames;
+  List<String> get _activeDisconnectFrames =>
+      Platform.isAndroid || debugForceMobileShell
+      ? _mobileDisconnectFrames
+      : _disconnectFrames;
   bool _androidAppsLoaded = false;
   bool _androidAppsLoading = false;
   String? _androidAppLoadError;
@@ -658,15 +696,16 @@ class _VlessHomePageState extends State<VlessHomePage>
   String _appVersion = '';
   UpdateCheckResult? _updateResult;
   bool _checkingUpdates = false;
+  AndroidPlayUpdateStatus? _androidPlayUpdateStatus;
   bool _isDownloadingUpdate = false;
   double _updateDownloadProgress = 0.0;
   String? _updateDownloadError;
   bool _initialLaunchArgsHandled = false;
   bool _initialAndroidLaunchUriHandled = false;
 
-  VlessLink? get _parsed => _vpnCoreController.parsedLink;
-  VlessLink? get _currentLink =>
-      _parsed ?? parseVlessUri(_controller.text.trim());
+  ProxyLink? get _parsed => _vpnCoreController.parsedLink;
+  ProxyLink? get _currentLink =>
+      _parsed ?? parseProxyUri(_controller.text.trim());
   File? get _configFile => _vpnCoreController.configFile;
   String? get _generatedConfig => _vpnCoreController.generatedConfig;
   bool get _isWindowsShellPlatform =>
@@ -836,8 +875,17 @@ class _VlessHomePageState extends State<VlessHomePage>
         });
       }
     }
-    if (Platform.isAndroid) {
-      unawaited(_loadAndroidApps());
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final reduceMotion =
+        !_isDesktopPlatform && MediaQuery.disableAnimationsOf(context);
+    if (_mobileReduceMotion != reduceMotion) {
+      _mobileReduceMotion = reduceMotion;
+      _updateConnectGlowTicker();
+      _updateFrameAnimation();
     }
   }
 
@@ -951,6 +999,12 @@ class _VlessHomePageState extends State<VlessHomePage>
   }
 
   Future<void> _initVersionAndUpdates() async {
+    if (debugForceMobileShell) {
+      if (widget.androidPlayUpdateService != null) {
+        await _maybeCheckForUpdates();
+      }
+      return;
+    }
     debugPrint('[UPDATE] _initVersionAndUpdates called');
     try {
       final info = await PackageInfo.fromPlatform();
@@ -962,14 +1016,15 @@ class _VlessHomePageState extends State<VlessHomePage>
     } catch (e) {
       debugPrint('[UPDATE] PackageInfo error: $e');
     }
-    if (!Platform.isAndroid) {
-      debugPrint('[UPDATE] Calling _maybeCheckForUpdates...');
-      await _maybeCheckForUpdates();
-    }
+    debugPrint('[UPDATE] Calling _maybeCheckForUpdates...');
+    await _maybeCheckForUpdates();
   }
 
   Future<void> _maybeCheckForUpdates({bool manual = false}) async {
-    if (Platform.isAndroid) return;
+    if (Platform.isAndroid || debugForceMobileShell) {
+      await _checkAndroidPlayUpdate();
+      return;
+    }
     if (_updateOwner == 'YOUR_GITHUB_OWNER' ||
         _updateRepo == 'YOUR_GITHUB_REPO') {
       debugPrint('[UPDATE] Skipped: owner/repo not configured');
@@ -1047,6 +1102,59 @@ class _VlessHomePageState extends State<VlessHomePage>
       } else {
         _checkingUpdates = false;
       }
+    }
+  }
+
+  Future<void> _checkAndroidPlayUpdate() async {
+    try {
+      _playInstallSubscription ??= _androidPlayUpdateService.installStatuses
+          .listen((installStatus) {
+            _latestPlayInstallStatus = installStatus;
+            if (!mounted || _androidPlayUpdateStatus == null) return;
+            setState(
+              () => _androidPlayUpdateStatus = _androidPlayUpdateStatus!
+                  .withInstallStatus(installStatus),
+            );
+          }, onError: (Object _) {});
+      final status = await _androidPlayUpdateService.checkAtLaunch();
+      if (!mounted) return;
+      setState(
+        () => _androidPlayUpdateStatus = _latestPlayInstallStatus == null
+            ? status
+            : status.withInstallStatus(_latestPlayInstallStatus!),
+      );
+    } catch (_) {
+      // Debug/sideloaded installs and an offline Play Store are not user errors.
+      // Never fall back to GitHub or block VPN startup.
+    }
+  }
+
+  Future<void> _startAndroidPlayUpdate() async {
+    if (_checkingUpdates) return;
+    setState(() => _checkingUpdates = true);
+    try {
+      final started = await _androidPlayUpdateService.startFlexibleUpdate();
+      if (!started && mounted) {
+        _showFastSnack('Google Play не смог запустить обновление');
+      }
+    } catch (_) {
+      if (!mounted) return;
+      _showFastSnack('Не удалось запустить обновление через Google Play');
+    } finally {
+      if (mounted) setState(() => _checkingUpdates = false);
+    }
+  }
+
+  Future<void> _completeAndroidPlayUpdate() async {
+    if (_checkingUpdates) return;
+    setState(() => _checkingUpdates = true);
+    try {
+      await _androidPlayUpdateService.completeFlexibleUpdate();
+    } catch (_) {
+      if (!mounted) return;
+      _showFastSnack('Не удалось завершить установку обновления');
+    } finally {
+      if (mounted) setState(() => _checkingUpdates = false);
     }
   }
 
@@ -1749,7 +1857,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _updateConnectGlowTicker() {
-    final shouldAnimate = _isConnecting || _isRunning;
+    final shouldAnimate = !_mobileReduceMotion && (_isConnecting || _isRunning);
     if (shouldAnimate) {
       if (!_connectGlowController.isAnimating) {
         _connectGlowController.repeat();
@@ -1763,6 +1871,11 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _updateFrameAnimation() {
+    if (_mobileReduceMotion) {
+      _frameAnimController.stop();
+      _frameAnimController.value = 0;
+      return;
+    }
     if (_isConnecting) {
       if (!_frameAnimForward || !_frameAnimController.isAnimating) {
         _frameAnimForward = true;
@@ -1782,6 +1895,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _precacheAnimationFrames(BuildContext context) {
+    if (Platform.isAndroid || debugForceMobileShell) return;
     for (final path in _connectFrames) {
       precacheImage(AssetImage(path), context);
     }
@@ -1915,12 +2029,16 @@ $regItems = foreach ($rp in $regPaths) {
     final metricsRaw = prefs.getString(_profileMetricsKey);
     final restoredPings = <String, int>{};
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? false;
-    _smartRouting = prefs.getBool(_smartRoutingKey) ?? false;
+    _smartRouting = prefs.containsKey(_smartRoutingKey)
+        ? (prefs.getBool(_smartRoutingKey) ?? false)
+        : Platform.isAndroid;
     unawaited(
       _smartRouteEngine.ensureBundledWhitelistLoaded().catchError((_) => 0),
     );
-    _developerMode = prefs.getBool('developer_mode') ?? false;
-    _autoConnectOnStartup = prefs.getBool(_autoConnectKey) ?? false;
+    _developerMode =
+        _isDesktopPlatform && (prefs.getBool('developer_mode') ?? false);
+    _autoConnectOnStartup =
+        _isDesktopPlatform && (prefs.getBool(_autoConnectKey) ?? false);
     _autoStartOnBoot = prefs.getBool(_autoStartKey) ?? false;
     final dpiAggressive = prefs.getBool(_dpiAggressiveKey) ?? false;
     final dpiBase = dpiAggressive
@@ -2200,11 +2318,11 @@ $regItems = foreach ($rp in $regPaths) {
     if (trimmedUri.isEmpty) {
       return;
     }
-    final parsedVless = parseVlessUri(trimmedUri);
+    final parsedVless = parseProxyUri(trimmedUri);
     if (parsedVless != null) {
-      if (!isSecureVlessLink(parsedVless)) {
-        _appendLogs(['[uri-import] Rejected insecure VLESS launch URI']);
-        _showDeferredSnack('Профиль отклонен: нужен TLS/Reality');
+      if (proxyValidationError(parsedVless) != null) {
+        _appendLogs(['[uri-import] Rejected unsupported or insecure profile']);
+        _showDeferredSnack(proxyImportError(trimmedUri));
         return;
       }
       for (final profile in _profiles) {
@@ -2212,7 +2330,7 @@ $regItems = foreach ($rp in $regPaths) {
           await _selectCurrentProfile(profile);
           await _saveUri();
           _appendLogs([
-            '[uri-import] Selected existing VLESS profile from launch URI',
+            '[uri-import] Selected existing profile from launch URI',
           ]);
           _showDeferredSnack('Ссылка neuravpn импортирована');
           return;
@@ -2225,7 +2343,7 @@ $regItems = foreach ($rp in $regPaths) {
         trimmedUri,
       );
       await _saveUri();
-      _appendLogs(['[uri-import] Imported VLESS profile from launch URI']);
+      _appendLogs(['[uri-import] Imported profile from launch URI']);
       _showDeferredSnack('Ссылка neuravpn импортирована');
       return;
     }
@@ -2258,8 +2376,9 @@ $regItems = foreach ($rp in $regPaths) {
 
   Future<void> _syncAndroidRuntimeState() async {
     if (!Platform.isAndroid) return;
+    if (_isSwitchingProfile) return;
     final running = await _vpnCoreController.syncRuntimeState();
-    if (!mounted) return;
+    if (!mounted || _isSwitchingProfile) return;
     setState(() {
       _status = running
           ? '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e'
@@ -2279,12 +2398,12 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _pollAndroidVpnState() async {
     if (!Platform.isAndroid || !mounted) return;
     if (_androidStatePollInProgress) return;
-    if (_isConnecting || _isDisconnecting) return;
+    if (_isConnecting || _isDisconnecting || _isSwitchingProfile) return;
     _androidStatePollInProgress = true;
     try {
       final wasRunning = _isRunning;
       final nowRunning = await _vpnCoreController.syncRuntimeState();
-      if (!mounted || wasRunning == nowRunning) return;
+      if (!mounted || _isSwitchingProfile || wasRunning == nowRunning) return;
       // State changed externally (e.g. Quick Settings Tile)
       setState(() {
         _status = nowRunning ? 'Подключено' : 'Остановлено';
@@ -2404,15 +2523,38 @@ $regItems = foreach ($rp in $regPaths) {
       if (!_requiresWindowsSessionResetForRuleChange(
         previousConfig,
         nextConfig,
-      ))
+      )) {
         return;
+      }
       _appendLogs([
-        '[android] Split tunnel rules changed, reconnecting to apply',
+        '[android] VPN restart is required to apply routing changes',
       ]);
-      if (mounted) {
-        _showFastSnack(
-          'Правила изменены. Переподключаем для применения новых маршрутов.',
-        );
+      if (!mounted) return;
+      final shouldReconnect =
+          await showNeuraDialog<bool>(
+            context: context,
+            builder: (ctx) => NeuraOverlayDialog(
+              title: const Text('Применить изменения'),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(false),
+                  child: const Text('Позже'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(true),
+                  child: const Text('Переподключить'),
+                ),
+              ],
+              child: Text(
+                'Android применит новые правила приложений после короткого переподключения.',
+                style: TextStyle(color: Colors.white.withValues(alpha: 0.72)),
+              ),
+            ),
+          ) ??
+          false;
+      if (!shouldReconnect) {
+        _showFastSnack('Изменения применятся при следующем подключении');
+        return;
       }
       await _stop();
       if (!mounted) return;
@@ -2587,8 +2729,15 @@ $regItems = foreach ($rp in $regPaths) {
     final link = _currentLink;
     if (link == null) {
       if (!silent) {
-        _showFastSnack('Select a profile with a valid VLESS URI first.');
+        _showFastSnack('Сначала выберите профиль VLESS или Hysteria 2.');
       }
+      return;
+    }
+    if (link is Hysteria2Link) {
+      // TCP connect timing says nothing about a QUIC-only endpoint.
+      setState(() => _pingMs = null);
+      if (!silent)
+        _showFastSnack('Hysteria 2 использует QUIC: TCP-пинг неприменим.');
       return;
     }
     setState(() {
@@ -3149,9 +3298,7 @@ $regItems = foreach ($rp in $regPaths) {
     final trimmedUri = uri.trim();
     if (trimmedUri.isEmpty) return;
     if (!_isSecureProfileUri(trimmedUri)) {
-      _showFastSnack(
-        'Небезопасный профиль. Разрешены только VLESS с TLS/Reality.',
-      );
+      _showFastSnack(proxyImportError(trimmedUri));
       return;
     }
     final autoName = _deriveProfileNameFromUri(trimmedUri);
@@ -3174,12 +3321,6 @@ $regItems = foreach ($rp in $regPaths) {
     await prefs.setBool(_hasEverAddedKeyKey, true);
     await _persistProfiles();
     await _persistSelectedProfile();
-
-    // UX: don't mix standalone keys with subscriptions.
-    final repository = SubscriptionRepository();
-    await repository.clearAllSubscriptions();
-    if (!mounted) return;
-    setState(() => _subscriptionsRefreshToken += 1);
   }
 
   Future<void> _removeProfileByName(String name) async {
@@ -3202,19 +3343,36 @@ $regItems = foreach ($rp in $regPaths) {
     }
   }
 
-  Future<void> _showProfileDialog() async {
+  Future<String?> _scanSubscriptionQr() {
+    return Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => const SubscriptionQrScanner(),
+      ),
+    );
+  }
+
+  Future<void> _showProfileQrDialog() async {
+    final input = await _scanSubscriptionQr();
+    if (!mounted || input == null) return;
+    await _showProfileDialog(initialInput: input);
+  }
+
+  Future<void> _showProfileDialog({String initialInput = ''}) async {
     final result = await showNeuraDialog<Map<String, dynamic>>(
       context: context,
-      builder: (ctx) => const AddProfileDialog(),
+      builder: (ctx) => AddProfileDialog(
+        initialInput: initialInput,
+        onScanQr: _isDesktopPlatform ? null : _scanSubscriptionQr,
+      ),
     );
 
-    if (result == null) return;
+    if (result == null || !mounted) return;
 
     final input = result['input'] as String;
-    final isVless = result['isVless'] as bool;
+    final isProfile = result['isProfile'] == true;
 
-    if (isVless) {
-      // Это прямой VLESS ключ
+    if (isProfile) {
       final autoName = _deriveProfileNameFromUri(input);
       final displayName = autoName.isEmpty ? _previewProfileName() : autoName;
       await _addProfile(displayName, input);
@@ -3233,7 +3391,7 @@ $regItems = foreach ($rp in $regPaths) {
       );
       return;
     }
-    if (raw.startsWith('vless://')) {
+    if (isProxyUri(raw)) {
       final autoName = _deriveProfileNameFromUri(raw);
       await _addProfile(
         autoName.isEmpty ? _previewProfileName() : autoName,
@@ -3249,7 +3407,7 @@ $regItems = foreach ($rp in $regPaths) {
       final manager = SubscriptionService();
       final profiles = await manager.fetchSubscription(url);
       if (profiles.isEmpty) {
-        throw 'Подписка не содержит поддерживаемых TLS/Reality профилей';
+        throw 'Подписка не содержит поддерживаемых VLESS/Hysteria 2 профилей';
       }
 
       final subscription = VpnSubscription(
@@ -3264,36 +3422,18 @@ $regItems = foreach ($rp in $regPaths) {
       if (added) {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setBool(_hasEverAddedKeyKey, true);
+        if (!mounted) return;
         setState(() => _hasEverAddedKey = true);
         showNeuraToast(
           context,
           'Подписка добавлена',
           tone: NeuraToastTone.success,
         );
-        // Remember current selection before clearing standalone profiles
-        final previousUri = _selectedProfile?.uri;
-        final previousName = _selectedProfile?.name;
-        await _clearAllProfilesForSubscriptionMode();
         await _reloadSubscriptions();
 
         if (!mounted) return;
-        // Restore previous selection if it's still valid in any subscription
-        if (previousUri != null &&
-            previousUri.isNotEmpty &&
-            _isSecureProfileUri(previousUri)) {
-          final allSubs = await repository.getAllSubscriptions();
-          final stillValid = allSubs.any(
-            (s) => s.profiles.contains(previousUri),
-          );
-          if (stillValid) {
-            final restored = VpnProfile(
-              name: previousName ?? _deriveProfileNameFromUri(previousUri),
-              uri: previousUri,
-            );
-            await _selectCurrentProfile(restored);
-            return;
-          }
-        }
+        // Import is additive and must not switch an existing connection.
+        if (_selectedProfile != null) return;
         // Default: select first profile from newly added subscription
         final uri = profiles.first;
         final autoName = _deriveProfileNameFromUri(uri);
@@ -3305,6 +3445,7 @@ $regItems = foreach ($rp in $regPaths) {
         );
         await _selectCurrentProfile(profile);
       } else {
+        if (!mounted) return;
         showNeuraToast(
           context,
           'Не удалось добавить: ссылка уже есть',
@@ -3313,6 +3454,7 @@ $regItems = foreach ($rp in $regPaths) {
       }
     } catch (e, stack) {
       unawaited(_writeCrashReport('subscription-import', e, stack));
+      if (!mounted) return;
       final message = e is FormatException
           ? 'Локальные настройки повреждены. Перезапустите приложение для восстановления.'
           : 'Ошибка: $e';
@@ -3409,23 +3551,6 @@ $regItems = foreach ($rp in $regPaths) {
     await _persistSelectedProfile();
   }
 
-  Future<void> _clearAllProfilesForSubscriptionMode() async {
-    if (!mounted) return;
-    setState(() {
-      _profiles = [];
-      _selectedProfile = null;
-      _profilePings.clear();
-      _pingMs = null;
-      _controller.text = '';
-      _syncMetricsFromProfile(null);
-    });
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('vless_uri');
-    await _persistProfiles();
-    await _persistSelectedProfile();
-    await _persistProfileMetrics();
-  }
-
   String _ensureUniqueProfileName(String base, {String? skipName}) {
     bool exists(String candidate) {
       for (final profile in _profiles) {
@@ -3494,7 +3619,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   String _deriveProfileNameFromUri(String uri) {
-    final parsed = parseVlessUri(uri);
+    final parsed = parseProxyUri(uri);
     if (parsed == null) return '';
     if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
     if (parsed.host.isNotEmpty) return parsed.host;
@@ -3530,6 +3655,49 @@ $regItems = foreach ($rp in $regPaths) {
     await _persistSubscriptionSelectedIndex(profile.uri);
   }
 
+  Future<void> _onProfileSelected(VpnProfile profile) async {
+    if (_isConnecting || _isDisconnecting || _isSwitchingProfile) return;
+    if (_selectedProfile?.uri == profile.uri) return;
+
+    // Keep the desktop release behavior unchanged in this Android update.
+    if (_isDesktopPlatform) {
+      if (!_isRunning) await _selectCurrentProfile(profile);
+      return;
+    }
+
+    setState(() => _isSwitchingProfile = true);
+    var expectedEpoch = _connectionUiEpoch;
+    try {
+      // Read our service, not the system's currently active VPN provider.
+      final reconnect = await _vpnCoreController.syncRuntimeState();
+      if (!mounted || expectedEpoch != _connectionUiEpoch) return;
+      if (_vpnCoreController.androidStatus.isActive && !reconnect) return;
+
+      if (reconnect) {
+        expectedEpoch++;
+        await _stop();
+        if (!mounted || expectedEpoch != _connectionUiEpoch) return;
+        if (_isRunning || _vpnCoreController.androidStatus.isActive) return;
+      }
+
+      if (_isExitingApp) return;
+      await _selectCurrentProfile(profile);
+      if (!mounted || _isExitingApp || expectedEpoch != _connectionUiEpoch) {
+        return;
+      }
+      if (reconnect) await _start(fromProfileSelection: true);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isDisconnecting = false;
+        _status = _isRunning ? 'Подключено' : 'Остановлено';
+      });
+      _showFastSnack('Не удалось сменить обход. Попробуйте ещё раз.');
+    } finally {
+      if (mounted) setState(() => _isSwitchingProfile = false);
+    }
+  }
+
   /// Находит подписку, содержащую [uri], и обновляет её selectedIndex.
   Future<void> _persistSubscriptionSelectedIndex(String uri) async {
     try {
@@ -3549,8 +3717,9 @@ $regItems = foreach ($rp in $regPaths) {
     }
   }
 
-  Future<void> _start() async {
+  Future<void> _start({bool fromProfileSelection = false}) async {
     if (_isConnecting || _isDisconnecting) return;
+    if (_isSwitchingProfile && !fromProfileSelection) return;
 
     var connectionEpoch = 0;
     try {
@@ -3672,6 +3841,7 @@ $regItems = foreach ($rp in $regPaths) {
     required bool isEnabled,
     required bool isRunning,
   }) {
+    if (_isSwitchingProfile && !_isConnecting) return;
     if (_connectQuickActionsOpen) {
       setState(() {
         _connectQuickActionsOpen = false;
@@ -3715,10 +3885,47 @@ $regItems = foreach ($rp in $regPaths) {
 
   void _openConnectQuickActions() {
     if (_connectQuickActionsOpen) return;
+    if (Platform.isAndroid) {
+      unawaited(HapticFeedback.mediumImpact());
+    }
     setState(() {
       _connectQuickActionsOpen = true;
       _connectButtonPressed = true;
     });
+  }
+
+  void _updateConnectQuickActionFromGlobalPosition(Offset globalPosition) {
+    final context = _connectQuickActionsKey.currentContext;
+    final renderObject = context?.findRenderObject();
+    String? nextAction;
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      final local = renderObject.globalToLocal(globalPosition);
+      if (local.dx >= 0 &&
+          local.dy >= 0 &&
+          local.dx <= renderObject.size.width &&
+          local.dy <= renderObject.size.height) {
+        nextAction = local.dx < renderObject.size.width / 2
+            ? 'routing'
+            : 'settings';
+      }
+    }
+    if (_connectQuickActionHover == nextAction) return;
+    setState(() => _connectQuickActionHover = nextAction);
+    if (Platform.isAndroid && nextAction != null) {
+      unawaited(HapticFeedback.selectionClick());
+    }
+  }
+
+  void _commitConnectQuickAction() {
+    final action = _connectQuickActionHover;
+    if (action == 'routing') {
+      unawaited(_setSmartRouting(!_smartRouting));
+      unawaited(HapticFeedback.lightImpact());
+    } else if (action == 'settings') {
+      _setWindowsView(_WindowsView.settings);
+      unawaited(HapticFeedback.lightImpact());
+    }
+    _closeConnectQuickActions();
   }
 
   void _closeConnectQuickActions() {
@@ -4031,8 +4238,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   @override
-  @override
   void dispose() {
+    _connectionUiEpoch++;
+    unawaited(_playInstallSubscription?.cancel());
     WidgetsBinding.instance.removeObserver(this);
     _androidStateSyncTimer?.cancel();
     _subscriptionRefreshTimer?.cancel();
@@ -4056,10 +4264,7 @@ $regItems = foreach ($rp in $regPaths) {
       _trayManager.removeListener(this);
       unawaited(_trayManager.destroy());
     }
-    // Убеждаемся что VPN отключен перед выходом
-    if (_isRunning) {
-      unawaited(_stop());
-    }
+    // Controller disposal stops the service without updating a disposed UI.
     unawaited(_stopTrafficMonitor());
     unawaited(_vpnCoreController.dispose());
     unawaited(_dpiEvasionManager.stopNativeInjector());
@@ -4076,12 +4281,15 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Widget _buildMobileNeuraShell(bool hasConnectable) {
+    final media = MediaQuery.of(context);
+    final compact = media.size.width < 360;
+    final horizontalPadding = compact ? 10.0 : 16.0;
     return Scaffold(
       backgroundColor: _neuraBlack,
       body: Stack(
         children: [
           const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
-          if (!kReleaseMode)
+          if (!kReleaseMode && !media.disableAnimations)
             const Positioned.fill(child: NeuralBackground())
           else
             const Positioned.fill(
@@ -4108,7 +4316,12 @@ $regItems = foreach ($rp in $regPaths) {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 6),
+                      padding: EdgeInsets.fromLTRB(
+                        horizontalPadding,
+                        8,
+                        horizontalPadding,
+                        6,
+                      ),
                       child: NeuraReveal(
                         child: NeuraGlassSurface(
                           expand: true,
@@ -4131,13 +4344,19 @@ $regItems = foreach ($rp in $regPaths) {
                               ),
                               const SizedBox(width: 10),
                               const Expanded(
-                                child: Text(
-                                  'neuravpn',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.2,
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: FittedBox(
+                                    fit: BoxFit.scaleDown,
+                                    child: Text(
+                                      'neuravpn',
+                                      maxLines: 1,
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -4168,11 +4387,18 @@ $regItems = foreach ($rp in $regPaths) {
                       child: hasConnectable
                           ? PageView(
                               controller: _windowsPageController,
-                              physics: const PageScrollPhysics(),
+                              physics: const PageScrollPhysics(
+                                parent: BouncingScrollPhysics(),
+                              ),
+                              allowImplicitScrolling: true,
                               onPageChanged: (index) {
                                 final view = _windowsViewAt(index);
                                 if (_windowsView != view) {
                                   setState(() => _windowsView = view);
+                                }
+                                if (Platform.isAndroid &&
+                                    view == _WindowsView.splitTunneling) {
+                                  unawaited(_loadAndroidApps());
                                 }
                               },
                               children: [
@@ -4199,8 +4425,11 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Widget _buildMobileNeuraPage(Widget child) {
+    final compact = MediaQuery.sizeOf(context).width < 360;
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      physics: const BouncingScrollPhysics(),
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+      padding: EdgeInsets.fromLTRB(compact ? 10 : 16, 8, compact ? 10 : 16, 16),
       child: SizedBox(
         width: double.infinity,
         child: Column(
@@ -4523,11 +4752,16 @@ $regItems = foreach ($rp in $regPaths) {
   void _setWindowsView(_WindowsView view) {
     if (_windowsView == view) return;
     setState(() => _windowsView = view);
+    if (Platform.isAndroid && view == _WindowsView.splitTunneling) {
+      unawaited(_loadAndroidApps());
+    }
     if (_windowsPageController.hasClients) {
       final index = _windowsViewIndex(view);
       _windowsPageController.animateToPage(
         index,
-        duration: const Duration(milliseconds: 280),
+        duration: MediaQuery.maybeOf(context)?.disableAnimations == true
+            ? Duration.zero
+            : const Duration(milliseconds: 280),
         curve: Curves.easeOutCubic,
       );
     }
@@ -4699,6 +4933,13 @@ $regItems = foreach ($rp in $regPaths) {
     await prefs.setBool(_autoConnectKey, value);
   }
 
+  Future<void> _openAndroidVpnSettings() async {
+    final opened = await _vpnCoreController.openAndroidVpnSettings();
+    if (!opened && mounted) {
+      _showFastSnack('Не удалось открыть системные настройки VPN');
+    }
+  }
+
   Future<void> _setAutoStartOnBoot(bool value) async {
     if (_autoStartUpdating) return;
     if (!Platform.isWindows) {
@@ -4745,7 +4986,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _syncAutoStartRegistration() async {
-    if (!Platform.isWindows) return;
+    if (!_isWindowsShellPlatform) return;
     try {
       final result = await _windowsAutoStartManager.reconcile(
         desiredEnabled: _autoStartOnBoot,
@@ -5153,6 +5394,14 @@ $regItems = foreach ($rp in $regPaths) {
             icon: const Icon(Icons.key_rounded),
             label: const Text('Ввести ключ'),
           ),
+          if (!_isDesktopPlatform) ...[
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: _showProfileQrDialog,
+              icon: const Icon(Icons.qr_code_scanner_rounded),
+              label: const Text('Сканировать QR'),
+            ),
+          ],
           const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: _pasteProfileFromClipboard,
@@ -5380,6 +5629,7 @@ $regItems = foreach ($rp in $regPaths) {
                         },
                         onShowFocusHighlight: _setConnectButtonFocus,
                         child: GestureDetector(
+                          key: const ValueKey('main-connect-button'),
                           behavior: HitTestBehavior.opaque,
                           onTapDown: canInteract
                               ? (_) =>
@@ -5399,15 +5649,16 @@ $regItems = foreach ($rp in $regPaths) {
                               canInteract && !_isConnecting && !isRunning
                               ? (_) => _openConnectQuickActions()
                               : null,
+                          onLongPressMoveUpdate:
+                              canInteract && !_isConnecting && !isRunning
+                              ? (details) =>
+                                    _updateConnectQuickActionFromGlobalPosition(
+                                      details.globalPosition,
+                                    )
+                              : null,
                           onLongPressEnd:
                               canInteract && !_isConnecting && !isRunning
-                              ? (_) {
-                                  if (_connectButtonPressed) {
-                                    setState(
-                                      () => _connectButtonPressed = false,
-                                    );
-                                  }
-                                }
+                              ? (_) => _commitConnectQuickAction()
                               : null,
                           onTap: canInteract
                               ? () => _onMainConnectButtonPressed(
@@ -5421,7 +5672,7 @@ $regItems = foreach ($rp in $regPaths) {
                               final rotation =
                                   _connectGlowAnimation.value * 2 * math.pi;
                               final interactionScale = _connectButtonPressed
-                                  ? 0.95
+                                  ? (Platform.isAndroid ? 0.96 : 0.95)
                                   : (_connectButtonHovered ||
                                         _connectButtonFocused)
                                   ? 1.04
@@ -5564,8 +5815,8 @@ $regItems = foreach ($rp in $regPaths) {
                                                   if (_isConnecting ||
                                                       _isDisconnecting) {
                                                     final frames = _isConnecting
-                                                        ? _connectFrames
-                                                        : _disconnectFrames;
+                                                        ? _activeConnectFrames
+                                                        : _activeDisconnectFrames;
                                                     final idx =
                                                         (_frameAnimController
                                                                     .value *
@@ -5579,15 +5830,21 @@ $regItems = foreach ($rp in $regPaths) {
                                                     framePath = frames[idx];
                                                   } else if (isRunning) {
                                                     framePath =
-                                                        _connectFrames.last;
+                                                        _activeConnectFrames
+                                                            .last;
                                                   } else {
                                                     framePath =
-                                                        _connectFrames.first;
+                                                        _activeConnectFrames
+                                                            .first;
                                                   }
                                                   return Image.asset(
                                                     framePath,
                                                     width: 48,
                                                     height: 48,
+                                                    cacheWidth:
+                                                        Platform.isAndroid
+                                                        ? 96
+                                                        : null,
                                                     filterQuality:
                                                         FilterQuality.high,
                                                     gaplessPlayback: true,
@@ -5720,6 +5977,7 @@ $regItems = foreach ($rp in $regPaths) {
 
   Widget _buildWindowsConnectQuickActions() {
     return DecoratedBox(
+      key: _connectQuickActionsKey,
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.34),
         borderRadius: BorderRadius.circular(14),
@@ -5777,6 +6035,7 @@ $regItems = foreach ($rp in $regPaths) {
         child: Tooltip(
           message: label,
           child: Material(
+            key: ValueKey('connect-quick-action-$id'),
             color: Colors.transparent,
             child: InkWell(
               borderRadius: BorderRadius.circular(10),
@@ -5905,6 +6164,15 @@ $regItems = foreach ($rp in $regPaths) {
                   ),
                 ),
               ),
+              if (!_isDesktopPlatform) ...[
+                IconButton(
+                  tooltip: 'Сканировать QR',
+                  onPressed: _showProfileQrDialog,
+                  color: _neuraRed,
+                  icon: const Icon(Icons.qr_code_scanner_rounded, size: 22),
+                ),
+                const SizedBox(width: 4),
+              ],
               SizedBox(
                 width: 36,
                 height: 36,
@@ -5928,6 +6196,10 @@ $regItems = foreach ($rp in $regPaths) {
           ConstrainedBox(
             constraints: const BoxConstraints(maxHeight: 420),
             child: ProfileListView(
+              mobile: !_isDesktopPlatform,
+              checkBackend: Platform.isAndroid
+                  ? AndroidProfileCheckBackend()
+                  : null,
               profiles: _profiles,
               selectedProfile: _selectedProfile,
               subscriptionsRefreshToken: _subscriptionsRefreshToken,
@@ -5935,11 +6207,7 @@ $regItems = foreach ($rp in $regPaths) {
                 if (!mounted) return;
                 setState(() => _hasSubscriptions = hasSubs);
               },
-              onProfileSelected: (profile) {
-                if (!_isRunning) {
-                  _selectCurrentProfile(profile);
-                }
-              },
+              onProfileSelected: _onProfileSelected,
               onDeleteProfile: (profile) {
                 _removeProfileByName(profile.name);
               },
@@ -7287,11 +7555,7 @@ $regItems = foreach ($rp in $regPaths) {
                   if (!mounted) return;
                   setState(() => _hasSubscriptions = hasSubs);
                 },
-                onProfileSelected: (profile) {
-                  if (!_isRunning) {
-                    _selectCurrentProfile(profile);
-                  }
-                },
+                onProfileSelected: _onProfileSelected,
                 onDeleteProfile: (profile) {
                   _removeProfileByName(profile.name);
                 },
@@ -7796,69 +8060,193 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Widget _buildMobileSettingsTab() {
+    final compact = MediaQuery.sizeOf(context).width < 360;
+    final update = _androidPlayUpdateStatus;
+    final updateDownloaded = update?.downloaded == true;
     return SingleChildScrollView(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      physics: const BouncingScrollPhysics(),
+      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+      padding: EdgeInsets.fromLTRB(compact ? 10 : 16, 8, compact ? 10 : 16, 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (updateDownloaded || update?.canStart == true) ...[
+            _neuraCard(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildMobileSettingsHeader(
+                    icon: Icons.system_update_alt_rounded,
+                    title: 'Обновление из Google Play',
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    updateDownloaded
+                        ? 'Обновление загружено и готово к установке'
+                        : 'В Google Play доступна новая версия',
+                    style: const TextStyle(
+                      color: _neuraRed,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: updateDownloaded
+                        ? FilledButton.icon(
+                            onPressed: _checkingUpdates
+                                ? null
+                                : _completeAndroidPlayUpdate,
+                            icon: const Icon(
+                              Icons.restart_alt_rounded,
+                              size: 18,
+                            ),
+                            label: const Text('Завершить обновление'),
+                          )
+                        : FilledButton.icon(
+                            onPressed: _checkingUpdates
+                                ? null
+                                : _startAndroidPlayUpdate,
+                            icon: const Icon(Icons.download_rounded, size: 18),
+                            label: const Text('Обновить через Google Play'),
+                          ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
           _neuraCard(
+            padding: const EdgeInsets.all(16),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
-                  children: [
-                    Container(
-                      width: 36,
-                      height: 36,
-                      decoration: BoxDecoration(
-                        color: _neuraSurface,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: Colors.white.withOpacity(0.08),
-                        ),
-                      ),
-                      child: const Icon(
-                        Icons.receipt_long,
-                        color: _neuraRed,
-                        size: 18,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    const Expanded(
-                      child: Text(
-                        'Конфигурация VPN core',
-                        style: TextStyle(
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white,
-                        ),
-                      ),
-                    ),
-                  ],
+                _buildMobileSettingsHeader(
+                  icon: Icons.settings_rounded,
+                  title: 'Общие',
                 ),
                 const SizedBox(height: 10),
-                Text(
-                  _generatedConfig == null
-                      ? 'Конфиг появится после подключения.'
-                      : 'Конфиг сгенерирован и готов к просмотру.',
-                  style: const TextStyle(color: Colors.white70),
+                _buildMobileSettingsSwitchRow(
+                  title: 'Умная маршрутизация',
+                  subtitle: 'Российские сервисы открывать напрямую',
+                  value: _smartRouting,
+                  onChanged: _setSmartRouting,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          _neuraCard(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _buildMobileSettingsHeader(
+                  icon: Icons.vpn_lock_rounded,
+                  title: 'Системный VPN',
                 ),
                 const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _generatedConfig == null
-                      ? null
-                      : () => _showConfigDialog(context),
-                  icon: const Icon(Icons.receipt_long),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: _neuraRed,
-                    foregroundColor: Colors.white,
+                Text(
+                  'Always-on VPN и блокировку трафика без VPN можно включить в настройках Android. Там же доступна системная информация о подключении.',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.58),
+                    height: 1.35,
+                    fontSize: 12,
                   ),
-                  label: const Text('Открыть конфиг'),
+                ),
+                const SizedBox(height: 14),
+                OutlinedButton.icon(
+                  onPressed: _openAndroidVpnSettings,
+                  icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                  label: const Text('Открыть настройки Android'),
                 ),
               ],
             ),
           ),
           const SizedBox(height: 16),
+          if (_appVersion.isNotEmpty)
+            Text(
+              'NeuraVPN $_appVersion',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
           _buildWindowsFooter(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMobileSettingsHeader({
+    required IconData icon,
+    required String title,
+  }) {
+    return Row(
+      children: [
+        Container(
+          width: 34,
+          height: 34,
+          decoration: BoxDecoration(
+            color: _neuraSurface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: Colors.white.withOpacity(0.08)),
+          ),
+          child: Icon(icon, color: _neuraRed, size: 18),
+        ),
+        const SizedBox(width: 11),
+        Expanded(
+          child: Text(
+            title,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMobileSettingsSwitchRow({
+    required String title,
+    required String subtitle,
+    required bool value,
+    required ValueChanged<bool> onChanged,
+  }) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minHeight: 64),
+      child: Row(
+        children: [
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.48),
+                      fontSize: 11,
+                      height: 1.25,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Switch.adaptive(
+            value: value,
+            activeThumbColor: _neuraRed,
+            onChanged: onChanged,
+          ),
         ],
       ),
     );

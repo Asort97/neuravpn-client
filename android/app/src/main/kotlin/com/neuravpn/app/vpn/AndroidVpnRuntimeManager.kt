@@ -20,6 +20,7 @@ object AndroidVpnRuntimeManager {
         executablePath: String?,
         includePackages: List<String>?,
         excludePackages: List<String>?,
+        routingMode: String?,
     ) {
         resolveRuntime(runtimeId).start(
             context = context,
@@ -27,6 +28,7 @@ object AndroidVpnRuntimeManager {
             executablePath = executablePath,
             includePackages = includePackages,
             excludePackages = excludePackages,
+            routingMode = routingMode,
         )
     }
 
@@ -47,6 +49,9 @@ object AndroidVpnRuntimeManager {
         }
         return AndroidVpnRuntimeStateStore.isMarkedRunning(context)
     }
+
+    fun status(context: Context): AndroidVpnRuntimeSnapshot =
+        AndroidVpnRuntimeStateStore.read(context)
 
     fun readDebugLog(context: Context, runtimeId: String?): String {
         val explicitRuntime = runtimeId?.let { runtimes[it] }

@@ -1,0 +1,2 @@
+# Xray geodata is protobuf, not text; preserve bytes on every platform.
+*.dat binary

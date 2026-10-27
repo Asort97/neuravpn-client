@@ -1,5 +1,5 @@
 import '../models/split_tunnel_config.dart';
-import '../vless/vless_parser.dart';
+import '../vless/proxy_parser.dart';
 import 'dpi_evasion_config.dart';
 
 typedef WindowsCoreProcessRunner =
@@ -10,7 +10,7 @@ abstract class WindowsVpnCoreAdapter {
   int get apiPort;
 
   String generateConfig({
-    required VlessLink parsed,
+    required ProxyLink parsed,
     required SplitTunnelConfig splitConfig,
     required String inboundTag,
     required String interfaceName,

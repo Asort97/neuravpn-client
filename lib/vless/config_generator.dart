@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:path/path.dart' as path;
-import 'vless_parser.dart';
+import 'proxy_parser.dart';
 
 import '../models/split_tunnel_config.dart';
 import '../services/dpi_evasion_config.dart';
@@ -231,23 +231,53 @@ String generateSingBoxConfig(
 }
 
 /// Генерация конфигурационного JSON для xray-core (Windows runtime).
-String generateXrayConfig(
-  VlessLink link,
-  SplitTunnelConfig splitConfig, {
-  String inboundTag = 'tun-in',
-  String interfaceName = 'wintun0',
-  List<String>? addresses,
-  String? outboundInterfaceName,
-  String? outboundBindAddress,
-  String tunStack = 'system',
-  bool smartRouting = false,
-  List<String> smartDomains = const <String>[],
-  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
-  int apiPort = 10085,
-  String logLevel = 'info',
+Map<String, dynamic> buildXrayProxyOutbound(
+  ProxyLink link, {
   String? serverAddressOverride,
-  bool externalRouteManager = false,
 }) {
+  final error = proxyValidationError(link);
+  if (error != null) throw FormatException(error);
+  final vpnTag = link.tag ?? 'proxy';
+  final outboundServerAddress = serverAddressOverride?.trim().isNotEmpty == true
+      ? serverAddressOverride!.trim()
+      : link.host;
+  if (link is Hysteria2Link) {
+    return {
+      'tag': vpnTag,
+      'protocol': 'hysteria',
+      'settings': {
+        'version': 2,
+        'address': outboundServerAddress,
+        'port': link.port,
+      },
+      'streamSettings': {
+        'network': 'hysteria',
+        'security': 'tls',
+        'tlsSettings': {
+          'serverName': (link.sni?.isNotEmpty ?? false) ? link.sni : link.host,
+          'alpn': ['h3'],
+          if (link.certificatePin != null)
+            'pinnedPeerCertSha256': link.certificatePin,
+        },
+        'hysteriaSettings': {'version': 2, 'auth': link.auth},
+        if (link.params['obfs'] == 'salamander' || link.hoppingPorts != null)
+          'finalmask': {
+            if (link.params['obfs'] == 'salamander')
+              'udp': [
+                {
+                  'type': 'salamander',
+                  'settings': {'password': link.params['obfs-password']},
+                },
+              ],
+            if (link.hoppingPorts != null)
+              'quicParams': {
+                'udpHop': {'ports': link.hoppingPorts},
+              },
+          },
+      },
+    };
+  }
+  if (link is! VlessLink) throw UnsupportedError('Unsupported proxy protocol');
   final p = link.params;
   final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
   final security = (p['security'] ?? '').trim().toLowerCase();
@@ -259,21 +289,13 @@ String generateXrayConfig(
   final path = p['path'];
   final realityPublicKey = p['pbk'];
   final realityShortId = p['sid'];
-  final vpnTag = link.tag ?? 'proxy';
-  final useSecureDnsProxy = splitConfig.mode != 'whitelist';
-  final trimmedInterfaceName = outboundInterfaceName?.trim();
-  final trimmedBindAddress = outboundBindAddress?.trim();
-  final outboundServerAddress = serverAddressOverride?.trim().isNotEmpty == true
-      ? serverAddressOverride!.trim()
-      : link.host;
-
   final user = <String, dynamic>{
     'id': link.uuid,
     'encryption': 'none',
     if (flow.isNotEmpty) 'flow': flow,
   };
 
-  final outbound = <String, dynamic>{
+  return <String, dynamic>{
     'tag': vpnTag,
     'protocol': 'vless',
     'settings': {
@@ -298,6 +320,33 @@ String generateXrayConfig(
       realityShortId: realityShortId,
     ),
   };
+}
+
+String generateXrayConfig(
+  ProxyLink link,
+  SplitTunnelConfig splitConfig, {
+  String inboundTag = 'tun-in',
+  String interfaceName = 'wintun0',
+  List<String>? addresses,
+  String? outboundInterfaceName,
+  String? outboundBindAddress,
+  String tunStack = 'system',
+  bool smartRouting = false,
+  List<String> smartDomains = const <String>[],
+  List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
+  int apiPort = 10085,
+  String logLevel = 'info',
+  String? serverAddressOverride,
+  bool externalRouteManager = false,
+}) {
+  final vpnTag = link.tag ?? 'proxy';
+  final useSecureDnsProxy = splitConfig.mode != 'whitelist';
+  final trimmedInterfaceName = outboundInterfaceName?.trim();
+  final trimmedBindAddress = outboundBindAddress?.trim();
+  final outbound = buildXrayProxyOutbound(
+    link,
+    serverAddressOverride: serverAddressOverride,
+  );
   _applyXrayOutboundBinding(
     outbound,
     interfaceName: trimmedInterfaceName,
@@ -461,7 +510,7 @@ String generateXrayConfig(
 /// SOCKS inbound. Xray remains responsible for VLESS transports, smart domain
 /// routing, and runtime statistics.
 String generateWindowsXrayProxyConfig(
-  VlessLink link,
+  ProxyLink link,
   SplitTunnelConfig splitConfig, {
   String inboundTag = 'socks-in',
   int socksPort = 10808,
@@ -647,47 +696,59 @@ String generateWindowsHybridTunConfig(
 /// Android-oriented Xray config generation.
 /// Package include/exclude split tunneling remains enforced by Android VpnService.
 String generateAndroidXrayConfig(
-  VlessLink link,
+  ProxyLink link,
   SplitTunnelConfig splitConfig, {
   String inboundTag = 'socks-in',
   bool smartRouting = false,
   List<String> smartDomains = const <String>[],
   List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
-  String logLevel = 'info',
 }) {
-  final p = link.params;
-  final transportType = (p['type'] ?? 'tcp').trim().toLowerCase();
-  final security = (p['security'] ?? '').trim().toLowerCase();
-  final isReality = security == 'reality';
-  final useTls = security == 'tls' || isReality;
-  final serverName = p['sni'] ?? p['host'] ?? link.host;
-  final flow = p['flow'] ?? '';
-  final fingerprint = p['fp'] ?? 'chrome';
-  final path = p['path'];
-  final realityPublicKey = p['pbk'];
-  final realityShortId = p['sid'];
   final vpnTag = link.tag ?? 'proxy';
-
-  final user = <String, dynamic>{
-    'id': link.uuid,
-    'encryption': 'none',
-    if (flow.isNotEmpty) 'flow': flow,
-  };
 
   final routeRules = <Map<String, dynamic>>[];
   if (smartRouting) {
-    routeRules.addAll(_buildSmartRulesXray(smartDomains, 'direct'));
+    routeRules.addAll(_buildAndroidSmartRulesXray(smartDomains, 'direct'));
   }
   routeRules.addAll(_buildRouteRulesXray(splitConfig, vpnTag));
   routeRules.addAll(
     extraRouteRules.map(_mapExtraRuleToXray).whereType<Map<String, dynamic>>(),
   );
 
+  final smartDnsDomains = smartRouting
+      ? _toXrayDomainRules(smartDomains)
+      : const <String>[];
+  final dnsServers = <dynamic>[
+    if (smartDnsDomains.isNotEmpty)
+      <String, dynamic>{
+        'address': 'localhost',
+        'domains': smartDnsDomains,
+        'skipFallback': true,
+        'finalQuery': true,
+        'queryStrategy': 'UseIP',
+      },
+    <String, dynamic>{
+      'address': 'https://9.9.9.9/dns-query',
+      'queryStrategy': 'UseIP',
+      'timeoutMs': 1500,
+    },
+    <String, dynamic>{
+      'address': 'https://1.1.1.1/dns-query',
+      'queryStrategy': 'UseIP',
+      'timeoutMs': 1500,
+    },
+  ];
+
   final config = <String, dynamic>{
-    'log': {'loglevel': logLevel},
+    // Native traffic logging can expose destinations and credentials to logcat.
+    'log': {'loglevel': 'none', 'access': 'none', 'dnsLog': false},
     'dns': {
-      'servers': ['1.1.1.1', '8.8.8.8'],
-      'queryStrategy': 'UseIPv4',
+      'servers': dnsServers,
+      'queryStrategy': 'UseIP',
+      'disableCache': false,
+      'serveStale': true,
+      'serveExpiredTTL': 3600,
+      'enableParallelQuery': true,
+      'tag': 'dns-query',
     },
     'inbounds': [
       {
@@ -703,35 +764,42 @@ String generateAndroidXrayConfig(
       },
     ],
     'outbounds': [
+      buildXrayProxyOutbound(link),
       {
-        'tag': vpnTag,
-        'protocol': 'vless',
-        'settings': {
-          'vnext': [
-            {
-              'address': link.host,
-              'port': link.port,
-              'users': [user],
-            },
-          ],
-        },
-        'streamSettings': _buildXrayStreamSettings(
-          transportType: transportType,
-          params: p,
-          path: path,
-          headerHost: p['host'] ?? link.host,
-          serverName: serverName,
-          useTls: useTls,
-          isReality: isReality,
-          fingerprint: fingerprint,
-          realityPublicKey: realityPublicKey,
-          realityShortId: realityShortId,
-        ),
+        'tag': 'direct',
+        'protocol': 'freedom',
+        'settings': {'domainStrategy': 'UseIP'},
       },
-      {'tag': 'direct', 'protocol': 'freedom'},
+      {
+        'tag': 'dns-out',
+        'protocol': 'dns',
+        'settings': {
+          // A/AAAA use built-in DoH; other query types get an immediate
+          // refusal instead of being forwarded to the virtual TUN peer.
+          'nonIPQuery': 'reject',
+        },
+      },
       {'tag': 'block', 'protocol': 'blackhole'},
     ],
-    'routing': {'domainStrategy': 'IPIfNonMatch', 'rules': routeRules},
+    'routing': {
+      'domainStrategy': routeRules.any((rule) => rule.containsKey('ip'))
+          ? 'IPIfNonMatch'
+          : 'AsIs',
+      'rules': <Map<String, dynamic>>[
+        {
+          'type': 'field',
+          'inboundTag': ['dns-query'],
+          'outboundTag': vpnTag,
+        },
+        {
+          'type': 'field',
+          'network': 'tcp,udp',
+          'port': '53',
+          'outboundTag': 'dns-out',
+        },
+        ...routeRules,
+      ],
+    },
   };
 
   return const JsonEncoder.withIndent('  ').convert(config);
@@ -1564,6 +1632,41 @@ List<Map<String, dynamic>> _buildSmartRulesXray(
   return <Map<String, dynamic>>[
     {'type': 'field', 'domain': domains, 'outboundTag': outboundTag},
   ];
+}
+
+List<String> _toXrayDomainRules(List<String> entries) {
+  final domains = <String>[];
+  for (final entry in entries) {
+    final value = entry.trim();
+    if (value.isEmpty) continue;
+    if (_hasXrayDomainPrefix(value)) {
+      domains.add(value);
+    } else if (value.startsWith('.')) {
+      domains.add('domain:${value.substring(1)}');
+    } else {
+      domains.add('domain:$value');
+    }
+  }
+  return domains;
+}
+
+List<Map<String, dynamic>> _buildAndroidSmartRulesXray(
+  List<String> smartDomains,
+  String outboundTag,
+) {
+  final domains = _toXrayDomainRules(smartDomains);
+  if (domains.isEmpty) return const <Map<String, dynamic>>[];
+  return <Map<String, dynamic>>[
+    {'type': 'field', 'domain': domains, 'outboundTag': outboundTag},
+  ];
+}
+
+bool _hasXrayDomainPrefix(String value) {
+  return value.startsWith('domain:') ||
+      value.startsWith('full:') ||
+      value.startsWith('keyword:') ||
+      value.startsWith('regexp:') ||
+      value.startsWith('geosite:');
 }
 
 Map<String, dynamic>? _mapExtraRuleToXray(Map<String, dynamic> rule) {

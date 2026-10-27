@@ -141,7 +141,9 @@ std::wstring FindLaunchUriArgument(
     const std::vector<std::wstring>& arguments) {
   for (const auto& argument : arguments) {
     if (argument.rfind(L"neuravpn://", 0) == 0 ||
-        argument.rfind(L"vless://", 0) == 0) {
+        argument.rfind(L"vless://", 0) == 0 ||
+        argument.rfind(L"hysteria2://", 0) == 0 ||
+        argument.rfind(L"hy2://", 0) == 0) {
       return argument;
     }
   }

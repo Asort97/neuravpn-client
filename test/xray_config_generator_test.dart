@@ -467,4 +467,120 @@ void main() {
       isTrue,
     );
   });
+
+  test('Android config intercepts DNS and resolves public domains over DoH', () {
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=reality&type=xhttp&sni=example.com&pbk=PUBKEY123&sid=abcd&path=%2Fedge#proxy',
+    );
+    final config =
+        jsonDecode(
+              generateAndroidXrayConfig(link, SplitTunnelConfig(mode: 'all')),
+            )
+            as Map<String, dynamic>;
+    final dns = config['dns'] as Map<String, dynamic>;
+    final servers = (dns['servers'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    final outbounds = (config['outbounds'] as List<dynamic>)
+        .cast<Map<String, dynamic>>();
+    final rules =
+        ((config['routing'] as Map<String, dynamic>)['rules'] as List<dynamic>)
+            .cast<Map<String, dynamic>>();
+
+    expect(servers.map((server) => server['address']), <String>[
+      'https://9.9.9.9/dns-query',
+      'https://1.1.1.1/dns-query',
+    ]);
+    expect(dns['disableCache'], isFalse);
+    expect(dns['serveStale'], isTrue);
+    expect(dns['enableParallelQuery'], isTrue);
+    expect(dns['queryStrategy'], 'UseIP');
+    expect(
+      servers.every((server) => !server.containsKey('tag')),
+      isTrue,
+      reason: 'DoH must inherit the protected dns-query routing tag',
+    );
+    expect(servers.every((server) => server['timeoutMs'] == 1500), isTrue);
+    expect((config['log'] as Map)['loglevel'], 'none');
+    expect(
+      (config['routing'] as Map)['domainStrategy'],
+      'AsIs',
+      reason: 'Domain-only rules must not trigger an extra DNS round trip',
+    );
+    expect(
+      outbounds.firstWhere((item) => item['tag'] == 'dns-out')['settings'],
+      {'nonIPQuery': 'reject'},
+    );
+    expect(
+      outbounds.any(
+        (outbound) =>
+            outbound['tag'] == 'dns-out' && outbound['protocol'] == 'dns',
+      ),
+      isTrue,
+    );
+    expect(
+      rules.any(
+        (rule) => rule['port'] == '53' && rule['outboundTag'] == 'dns-out',
+      ),
+      isTrue,
+    );
+    expect(
+      rules.any(
+        (rule) =>
+            rule['outboundTag'] == 'proxy' &&
+            (rule['inboundTag'] as List<dynamic>? ?? const <dynamic>[])
+                .contains('dns-query'),
+      ),
+      isTrue,
+    );
+    expect(
+      generateAndroidXrayConfig(link, SplitTunnelConfig(mode: 'all')),
+      isNot(contains('1.1.1.1:53')),
+    );
+    expect(
+      ((outbounds.firstWhere(
+            (item) => item['tag'] == 'proxy',
+          ))['streamSettings']
+          as Map<String, dynamic>)['network'],
+      'xhttp',
+    );
+  });
+
+  test('Android smart routing uses system DNS only for direct domains', () {
+    final link = _parse(
+      'vless://$_uuid@example.com:443?security=tls&type=tcp&sni=example.com#proxy',
+    );
+    final config =
+        jsonDecode(
+              generateAndroidXrayConfig(
+                link,
+                SplitTunnelConfig(mode: 'all'),
+                smartRouting: true,
+                smartDomains: const ['vk.com', 'yandex.ru'],
+              ),
+            )
+            as Map<String, dynamic>;
+    final servers =
+        ((config['dns'] as Map<String, dynamic>)['servers'] as List<dynamic>)
+            .cast<Map<String, dynamic>>();
+    final local = servers.firstWhere(
+      (server) => server['address'] == 'localhost',
+    );
+    final rules =
+        ((config['routing'] as Map<String, dynamic>)['rules'] as List<dynamic>)
+            .cast<Map<String, dynamic>>();
+
+    expect(local['skipFallback'], isTrue);
+    expect(local['finalQuery'], isTrue);
+    expect(local['domains'], contains('domain:vk.com'));
+    expect(
+      rules.any(
+        (rule) =>
+            rule['outboundTag'] == 'direct' &&
+            (rule['domain'] as List<dynamic>? ?? const <dynamic>[]).contains(
+              'domain:vk.com',
+            ),
+      ),
+      isTrue,
+    );
+  });
 }

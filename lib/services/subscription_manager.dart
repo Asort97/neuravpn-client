@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
-import '../vless/vless_parser.dart';
+import '../vless/proxy_parser.dart';
 
 class SubscriptionFetchException implements Exception {
   const SubscriptionFetchException(this.message);
@@ -23,7 +23,7 @@ class SubscriptionService {
     : _timeout = timeout ?? const Duration(seconds: 30);
 
   /// Загрузить подписку с URL
-  /// Возвращает список VLESS URI из подписки
+  /// Возвращает список VLESS/Hysteria 2 URI из подписки
   Future<List<String>> fetchSubscription(String url) async {
     try {
       // Добавляем проверку на валидный URL
@@ -40,14 +40,14 @@ class SubscriptionService {
 
       if (content == null) {
         throw const SubscriptionFetchException(
-          'Подписка должна быть в base64 или содержать VLESS ссылки',
+          'Подписка должна быть в base64 или содержать VLESS или Hysteria 2 ссылки',
         );
       }
 
       final profiles = _parseProfiles(content);
       if (profiles.isEmpty) {
         throw const SubscriptionFetchException(
-          'Подписка не содержит поддерживаемых TLS/Reality профилей',
+          'Подписка не содержит поддерживаемых VLESS/Hysteria 2 профилей',
         );
       }
 
@@ -128,7 +128,10 @@ class SubscriptionService {
   String? _decodeSubscriptionContent(String raw) {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) return null;
-    if (trimmed.contains('vless://')) {
+    if (RegExp(
+      r'(?:vless|hysteria2|hy2)://',
+      caseSensitive: false,
+    ).hasMatch(trimmed)) {
       return trimmed;
     }
 
@@ -146,16 +149,19 @@ class SubscriptionService {
     }
   }
 
-  /// Парсить VLESS URI из текста.
+  /// Парсить VLESS/Hysteria 2 URI из текста.
   List<String> _parseProfiles(String content) {
     final profiles = <String>[];
     final seen = <String>{};
 
-    final matches = RegExp(r'vless://[^\s]+').allMatches(content);
+    final matches = RegExp(
+      r'(?:vless|hysteria2|hy2)://[^\s]+',
+      caseSensitive: false,
+    ).allMatches(content);
     for (final match in matches) {
       final uri = match.group(0)?.trim().replaceFirst(RegExp("[\"',;]+\$"), '');
       if (uri == null || uri.isEmpty) continue;
-      if (isSecureVlessUri(uri) && seen.add(uri)) {
+      if (isSecureProxyUri(uri) && seen.add(uri)) {
         profiles.add(uri);
       }
     }
@@ -178,7 +184,8 @@ class SubscriptionService {
   bool isValidSubscriptionUrl(String url) {
     try {
       final uri = Uri.parse(url);
-      return uri.isAbsolute && uri.hasScheme;
+      return uri.host.isNotEmpty &&
+          (uri.scheme == 'https' || uri.scheme == 'http');
     } catch (_) {
       return false;
     }

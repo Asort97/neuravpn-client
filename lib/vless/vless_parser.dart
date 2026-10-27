@@ -1,7 +1,10 @@
 import 'dart:core';
+import 'proxy_link.dart';
 
 /// Модель разобранной VLESS ссылки
-class VlessLink {
+class VlessLink extends ProxyLink {
+  @override
+  String get protocolLabel => 'VLESS';
   final String uuid;
   final String host;
   final int port;

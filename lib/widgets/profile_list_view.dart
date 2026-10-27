@@ -6,8 +6,10 @@ import '../models/vpn_profile.dart';
 import '../models/vpn_subscription.dart';
 import '../services/subscription_manager.dart';
 import '../services/subscription_repository.dart';
-import '../vless/vless_parser.dart';
+import '../services/profile_availability.dart';
+import '../vless/proxy_parser.dart';
 import 'neura_ui.dart';
+import 'profile_availability_indicator.dart';
 
 class ProfileListView extends StatefulWidget {
   const ProfileListView({
@@ -18,6 +20,8 @@ class ProfileListView extends StatefulWidget {
     required this.onDeleteProfile,
     this.subscriptionsRefreshToken = 0,
     this.onSubscriptionsChanged,
+    this.mobile = false,
+    this.checkBackend,
   });
 
   final List<VpnProfile> profiles;
@@ -26,6 +30,8 @@ class ProfileListView extends StatefulWidget {
   final ValueChanged<VpnProfile> onDeleteProfile;
   final int subscriptionsRefreshToken;
   final ValueChanged<bool>? onSubscriptionsChanged;
+  final bool mobile;
+  final ProfileCheckBackend? checkBackend;
 
   @override
   State<ProfileListView> createState() => _ProfileListViewState();
@@ -37,8 +43,8 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   String _formatVlessSummary(String uri) {
-    final parsed = parseVlessUri(uri);
-    if (parsed == null) return uri;
+    final parsed = parseProxyUri(uri);
+    if (parsed == null) return 'Неподдерживаемый профиль';
     if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
     if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
     if (parsed.host.isNotEmpty) return parsed.host;
@@ -54,8 +60,8 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   String _vlessDisplayName(String uri) {
-    final parsed = parseVlessUri(uri);
-    if (parsed == null) return _safeDecode(uri);
+    final parsed = parseProxyUri(uri);
+    if (parsed == null) return 'Неподдерживаемый профиль';
     final tag = parsed.tag;
     if (tag != null && tag.trim().isNotEmpty) return _safeDecode(tag.trim());
     final sni = parsed.sni;
@@ -65,11 +71,11 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   String _vlessProtocolLine(String uri) {
-    final parsed = parseVlessUri(uri);
+    final parsed = parseProxyUri(uri);
     final transport = (parsed?.type?.trim().isNotEmpty ?? false)
         ? parsed!.type!.trim()
         : 'tcp';
-    return 'VLESS / ${transport.toUpperCase()}';
+    return '${parsed?.protocolLabel ?? 'VPN'} / ${transport.toUpperCase()}';
   }
 
   Widget _configTitleMarquee(String text, {required bool enabled}) {
@@ -115,6 +121,87 @@ class _ProfileListViewState extends State<ProfileListView> {
   final Set<String> _refreshingSubscriptions = <String>{};
   bool _isLoading = false;
   late int _lastRefreshToken;
+  ProfileAvailabilityController? _availability;
+  Timer? _availabilityRefresh;
+
+  void _checksChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _syncCheckProfiles() => _availability?.setProfiles([
+    ...widget.profiles.map((profile) => profile.uri),
+    ..._subscriptions.expand((subscription) => subscription.profiles),
+  ]);
+
+  Widget _availabilityIcon(String uri) =>
+      ProfileAvailabilityIndicator(result: _availability!.resultFor(uri));
+
+  Future<void> _showMobileActions(VpnSubscription subscription) async {
+    final action = await showNeuraBottomSheet<String>(
+      context: context,
+      builder: (context) => SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              title: Text(subscription.name),
+              subtitle: Text(_profileCountLabel(subscription.profileCount)),
+            ),
+            ListTile(
+              leading: const Icon(Icons.refresh_rounded),
+              title: const Text('Обновить'),
+              onTap: () => Navigator.pop(context, 'refresh'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Переименовать'),
+              onTap: () => Navigator.pop(context, 'rename'),
+            ),
+            ListTile(
+              leading: const Icon(
+                Icons.delete_outline_rounded,
+                color: NeuraUi.danger,
+              ),
+              title: const Text('Удалить'),
+              onTap: () => Navigator.pop(context, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    switch (action) {
+      case 'refresh':
+        await _refreshSubscription(subscription);
+      case 'rename':
+        await _renameSubscription(subscription);
+      case 'delete':
+        await _deleteSubscription(subscription);
+    }
+  }
+
+  Future<void> _renameSubscription(VpnSubscription subscription) async {
+    final name = await showNeuraBottomSheet<String>(
+      context: context,
+      builder: (context) =>
+          _SubscriptionNameEditor(initialName: subscription.name),
+    );
+    if (!mounted || name == null || name.trim().isEmpty) return;
+    // Refresh may have completed while the editor was open. Keep its profiles.
+    final current = _subscriptions
+        .where((item) => item.id == subscription.id)
+        .firstOrNull;
+    if (current == null) return;
+    final saved = await _repository.updateSubscription(
+      current.copyWith(name: name.trim()),
+    );
+    if (!mounted) return;
+    if (saved) {
+      await _loadSubscriptions();
+    } else {
+      _toast('Не удалось сохранить название.', tone: NeuraToastTone.error);
+    }
+  }
 
   static const Color _borderColor = Color(0x14FFFFFF);
   static const Color _accentColor = Color(0xFFEF4444);
@@ -123,6 +210,15 @@ class _ProfileListViewState extends State<ProfileListView> {
   void initState() {
     super.initState();
     _repository = SubscriptionRepository();
+    if (widget.checkBackend != null) {
+      _availability = ProfileAvailabilityController(widget.checkBackend!)
+        ..addListener(_checksChanged);
+      _syncCheckProfiles();
+      _availabilityRefresh = Timer.periodic(
+        const Duration(minutes: 1),
+        (_) => _checksChanged(),
+      );
+    }
     _lastRefreshToken = widget.subscriptionsRefreshToken;
     unawaited(_loadSubscriptions());
   }
@@ -130,6 +226,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   @override
   void didUpdateWidget(covariant ProfileListView oldWidget) {
     super.didUpdateWidget(oldWidget);
+    _syncCheckProfiles();
     if (widget.subscriptionsRefreshToken != _lastRefreshToken) {
       _lastRefreshToken = widget.subscriptionsRefreshToken;
       unawaited(_loadSubscriptions());
@@ -139,6 +236,9 @@ class _ProfileListViewState extends State<ProfileListView> {
   @override
   void dispose() {
     _scrollController.dispose();
+    _availabilityRefresh?.cancel();
+    _availability?.removeListener(_checksChanged);
+    _availability?.dispose();
     super.dispose();
   }
 
@@ -150,6 +250,7 @@ class _ProfileListViewState extends State<ProfileListView> {
       if (!mounted) return;
       setState(() {
         _subscriptions = subs;
+        _syncCheckProfiles();
         for (final sub in subs) {
           _expandedSubscriptions.putIfAbsent(sub.id, () => true);
         }
@@ -181,7 +282,9 @@ class _ProfileListViewState extends State<ProfileListView> {
       await _loadSubscriptions();
 
       // Re-select the same index profile after refresh so selection is not lost.
-      if (widget.selectedProfile != null) {
+      if (widget.selectedProfile != null &&
+          (!widget.mobile ||
+              subscription.profiles.contains(widget.selectedProfile!.uri))) {
         final oldUri = widget.selectedProfile!.uri;
         // If old URI is still in the new list, keep it; otherwise pick same index.
         final oldIndex = subscription.profiles.indexOf(oldUri);
@@ -191,7 +294,9 @@ class _ProfileListViewState extends State<ProfileListView> {
                   ? subscription.selectedIndex
                   : 0);
         if (newIndex < profiles.length) {
-          final newUri = profiles[newIndex];
+          final newUri = widget.mobile && profiles.contains(oldUri)
+              ? oldUri
+              : profiles[newIndex];
           final profile = VpnProfile(
             name: _formatVlessSummary(newUri),
             uri: newUri,
@@ -252,6 +357,14 @@ class _ProfileListViewState extends State<ProfileListView> {
     }
 
     final children = <Widget>[];
+    if (widget.mobile && _availability != null) {
+      children.add(
+        Padding(
+          padding: const EdgeInsets.fromLTRB(4, 0, 4, 12),
+          child: _buildCheckButton(),
+        ),
+      );
+    }
 
     final selectedProfile = widget.selectedProfile;
     if (selectedProfile != null) {
@@ -269,15 +382,108 @@ class _ProfileListViewState extends State<ProfileListView> {
       children.addAll(_buildSubscriptions());
     }
 
+    if (widget.mobile && widget.profiles.isEmpty && _subscriptions.isEmpty) {
+      children.add(
+        const Padding(padding: EdgeInsets.all(16), child: Text('Профилей нет')),
+      );
+    }
     if (children.isEmpty) {
       return const Center(child: Text('Профилей нет'));
     }
 
     return ListView(
       controller: _scrollController,
+      physics: widget.mobile ? const BouncingScrollPhysics() : null,
+      keyboardDismissBehavior: widget.mobile
+          ? ScrollViewKeyboardDismissBehavior.onDrag
+          : ScrollViewKeyboardDismissBehavior.manual,
       shrinkWrap: true,
       padding: const EdgeInsets.only(bottom: 8),
       children: children,
+    );
+  }
+
+  Widget _buildCheckButton() {
+    final checks = _availability!;
+    final hasProfiles =
+        widget.profiles.isNotEmpty ||
+        _subscriptions.any((sub) => sub.profiles.isNotEmpty);
+    return Tooltip(
+      message: checks.cancelling
+          ? 'Отмена проверки'
+          : checks.running
+          ? 'Остановить проверку'
+          : 'Проверить все конфигурации через HTTPS',
+      child: OutlinedButton(
+        key: const ValueKey('check-all-profiles'),
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size(double.infinity, 64),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          foregroundColor: Colors.white,
+          backgroundColor: _accentColor.withValues(alpha: 0.10),
+          side: BorderSide(color: _accentColor.withValues(alpha: 0.35)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+        onPressed: !hasProfiles || checks.cancelling
+            ? null
+            : () {
+                if (checks.running) {
+                  unawaited(checks.cancel());
+                } else {
+                  _syncCheckProfiles();
+                  unawaited(checks.checkAll());
+                }
+              },
+        child: Row(
+          children: [
+            Icon(
+              checks.running
+                  ? Icons.stop_circle_outlined
+                  : Icons.fact_check_outlined,
+              color: hasProfiles ? _accentColor : Colors.white38,
+              size: 24,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: DefaultTextStyle.merge(
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+                child: IndexedStack(
+                  index: checks.cancelling
+                      ? 2
+                      : checks.running
+                      ? 1
+                      : 0,
+                  alignment: Alignment.centerLeft,
+                  children: const [
+                    Text('Проверить доступность'),
+                    Text('Остановить проверку'),
+                    Text('Остановка проверки'),
+                  ],
+                ),
+              ),
+            ),
+            // Reserve the progress width so starting a scan never moves the label.
+            SizedBox(
+              width: 52,
+              child: checks.running
+                  ? FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        '${checks.completed}/${checks.total}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    )
+                  : null,
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -329,34 +535,46 @@ class _ProfileListViewState extends State<ProfileListView> {
               _formatVlessSummary(profile.uri),
               enabled: true,
             ),
-            trailing: IconButton(
-              tooltip: 'Удалить профиль',
-              icon: const Icon(Icons.delete, size: 18, color: NeuraUi.danger),
-              onPressed: () async {
-                final confirm = await showNeuraDialog<bool>(
-                  context: context,
-                  builder: (context) => NeuraOverlayDialog(
-                    title: const Text('Удалить профиль?'),
-                    child: Text(
-                      'Удалить "${profile.name}" с этого устройства?',
-                      style: TextStyle(color: Colors.white.withOpacity(0.78)),
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.pop(context, false),
-                        child: const Text('Отмена'),
-                      ),
-                      FilledButton(
-                        onPressed: () => Navigator.pop(context, true),
-                        child: const Text('Удалить'),
-                      ),
-                    ],
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (_availability != null) _availabilityIcon(profile.uri),
+                IconButton(
+                  tooltip: 'Удалить профиль',
+                  icon: const Icon(
+                    Icons.delete,
+                    size: 18,
+                    color: NeuraUi.danger,
                   ),
-                );
-                if (confirm == true) {
-                  widget.onDeleteProfile(profile);
-                }
-              },
+                  onPressed: () async {
+                    final confirm = await showNeuraDialog<bool>(
+                      context: context,
+                      builder: (context) => NeuraOverlayDialog(
+                        title: const Text('Удалить профиль?'),
+                        child: Text(
+                          'Удалить "${profile.name}" с этого устройства?',
+                          style: TextStyle(
+                            color: Colors.white.withOpacity(0.78),
+                          ),
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Отмена'),
+                          ),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Удалить'),
+                          ),
+                        ],
+                      ),
+                    );
+                    if (confirm == true) {
+                      widget.onDeleteProfile(profile);
+                    }
+                  },
+                ),
+              ],
             ),
             onTap: () => widget.onProfileSelected(profile),
           ),
@@ -382,11 +600,13 @@ class _ProfileListViewState extends State<ProfileListView> {
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
       child: Container(
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.018),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: _borderColor),
-        ),
+        decoration: widget.mobile
+            ? const BoxDecoration()
+            : BoxDecoration(
+                color: Colors.white.withOpacity(0.018),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: _borderColor),
+              ),
         clipBehavior: Clip.antiAlias,
         child: Column(
           children: [
@@ -450,31 +670,39 @@ class _ProfileListViewState extends State<ProfileListView> {
                           ),
                         ),
                       ),
-                      _subscriptionAction(
-                        tooltip: 'Обновить подписку',
-                        onPressed: isRefreshing
-                            ? null
-                            : () => _refreshSubscription(subscription),
-                        child: isRefreshing
-                            ? const SizedBox(
-                                width: 15,
-                                height: 15,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 1.8,
-                                  color: Colors.white54,
-                                ),
-                              )
-                            : const Icon(Icons.refresh_rounded, size: 18),
-                      ),
-                      _subscriptionAction(
-                        tooltip: 'Удалить подписку',
-                        onPressed: () => _deleteSubscription(subscription),
-                        hoverColor: NeuraUi.danger.withOpacity(0.12),
-                        child: const Icon(
-                          Icons.delete_outline_rounded,
-                          size: 18,
+                      if (widget.mobile)
+                        _subscriptionAction(
+                          tooltip: 'Действия с подпиской',
+                          onPressed: () => _showMobileActions(subscription),
+                          child: const Icon(Icons.more_horiz_rounded),
                         ),
-                      ),
+                      if (!widget.mobile)
+                        _subscriptionAction(
+                          tooltip: 'Обновить подписку',
+                          onPressed: isRefreshing
+                              ? null
+                              : () => _refreshSubscription(subscription),
+                          child: isRefreshing
+                              ? const SizedBox(
+                                  width: 15,
+                                  height: 15,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 1.8,
+                                    color: Colors.white54,
+                                  ),
+                                )
+                              : const Icon(Icons.refresh_rounded, size: 18),
+                        ),
+                      if (!widget.mobile)
+                        _subscriptionAction(
+                          tooltip: 'Удалить подписку',
+                          onPressed: () => _deleteSubscription(subscription),
+                          hoverColor: NeuraUi.danger.withOpacity(0.12),
+                          child: const Icon(
+                            Icons.delete_outline_rounded,
+                            size: 18,
+                          ),
+                        ),
                       _subscriptionAction(
                         tooltip: isExpanded ? 'Свернуть' : 'Развернуть',
                         onPressed: () {
@@ -575,28 +803,34 @@ class _ProfileListViewState extends State<ProfileListView> {
                     vlessUri,
                     selected: isSelected,
                   ),
-                  trailing: AnimatedSwitcher(
-                    duration: NeuraUi.fast,
-                    child: isSelected
-                        ? Container(
-                            key: const ValueKey('selected'),
-                            width: 24,
-                            height: 24,
-                            decoration: BoxDecoration(
-                              color: _accentColor.withOpacity(0.16),
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(
-                              Icons.check_rounded,
-                              color: _accentColor,
-                              size: 16,
-                            ),
-                          )
-                        : const SizedBox(
-                            key: ValueKey('not-selected'),
-                            width: 24,
-                            height: 24,
-                          ),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_availability != null) _availabilityIcon(vlessUri),
+                      AnimatedSwitcher(
+                        duration: NeuraUi.fast,
+                        child: isSelected
+                            ? Container(
+                                key: const ValueKey('selected'),
+                                width: 24,
+                                height: 24,
+                                decoration: BoxDecoration(
+                                  color: _accentColor.withOpacity(0.16),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.check_rounded,
+                                  color: _accentColor,
+                                  size: 16,
+                                ),
+                              )
+                            : const SizedBox(
+                                key: ValueKey('not-selected'),
+                                width: 24,
+                                height: 24,
+                              ),
+                      ),
+                    ],
                   ),
                 ),
               ],
@@ -698,8 +932,8 @@ class _ProfileListViewState extends State<ProfileListView> {
     Color? hoverColor,
   }) {
     return SizedBox(
-      width: 34,
-      height: 34,
+      width: widget.mobile ? 44 : 34,
+      height: widget.mobile ? 44 : 34,
       child: IconButton(
         tooltip: tooltip,
         onPressed: onPressed,
@@ -794,4 +1028,59 @@ class _ProfileListViewState extends State<ProfileListView> {
     final month = value.month.toString().padLeft(2, '0');
     return 'обновлено $day.$month.${value.year}';
   }
+}
+
+class _SubscriptionNameEditor extends StatefulWidget {
+  const _SubscriptionNameEditor({required this.initialName});
+  final String initialName;
+
+  @override
+  State<_SubscriptionNameEditor> createState() =>
+      _SubscriptionNameEditorState();
+}
+
+class _SubscriptionNameEditorState extends State<_SubscriptionNameEditor> {
+  late final TextEditingController _name = TextEditingController(
+    text: widget.initialName,
+  );
+
+  @override
+  void dispose() {
+    _name.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => SingleChildScrollView(
+    padding: const EdgeInsets.all(16),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          'Название подписки',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 16),
+        TextField(
+          controller: _name,
+          autofocus: true,
+          maxLength: 80,
+          textInputAction: TextInputAction.done,
+          onSubmitted: (value) {
+            if (value.trim().isNotEmpty) Navigator.pop(context, value);
+          },
+        ),
+        const SizedBox(height: 12),
+        FilledButton(
+          onPressed: () {
+            if (_name.text.trim().isNotEmpty) {
+              Navigator.pop(context, _name.text);
+            }
+          },
+          child: const Text('Сохранить'),
+        ),
+      ],
+    ),
+  );
 }

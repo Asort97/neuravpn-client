@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import '../models/split_tunnel_config.dart';
 import '../vless/config_generator.dart';
-import '../vless/vless_parser.dart';
+import '../vless/proxy_parser.dart';
 import 'dpi_evasion_config.dart';
 import 'windows_vpn_core.dart';
 
@@ -17,7 +17,7 @@ class WindowsXrayCoreAdapter implements WindowsVpnCoreAdapter {
 
   @override
   String generateConfig({
-    required VlessLink parsed,
+    required ProxyLink parsed,
     required SplitTunnelConfig splitConfig,
     required String inboundTag,
     required String interfaceName,

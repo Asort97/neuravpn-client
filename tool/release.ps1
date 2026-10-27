@@ -41,14 +41,17 @@ function Assert-PlatformAndVersion {
   }
 }
 
-function Update-Pubspec([string]$buildName, [int]$buildNumber) {
+function Update-Pubspec([string]$platform, [string]$buildName, [int]$buildNumber) {
   $pubspecPath = Join-Path $repoRoot 'pubspec.yaml'
   $content = [System.IO.File]::ReadAllText($pubspecPath)
-  $content = $content -replace '(?m)^version:\s*\S+', "version: $buildName+$buildNumber"
-  $content = $content -replace '(?m)^(\s+msix_version:\s*)\S+', "`${1}$buildName.0"
+  if ($platform -eq 'android') {
+    $content = $content -replace '(?m)^version:\s*\S+', "version: $buildName+$buildNumber"
+  } else {
+    $content = $content -replace '(?m)^(\s+msix_version:\s*)\S+', "`${1}$buildName.0"
+  }
   $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($pubspecPath, $content, $utf8NoBom)
-  Write-Host "Updated pubspec.yaml: version=$buildName+$buildNumber, msix_version=$buildName.0" -ForegroundColor Green
+  Write-Host "Updated pubspec.yaml metadata for $platform" -ForegroundColor Green
 }
 
 function Show-Config([object]$config) {
@@ -59,12 +62,12 @@ function Show-Config([object]$config) {
 
 function Build-Android([object]$config) {
   $args = @(
-    "build", "apk", "--release",
+    "build", "appbundle", "--release",
     "--build-name", "$($config.android.buildName)",
     "--build-number", "$($config.android.buildNumber)"
   )
   if ($SplitPerAbi) {
-    $args += "--split-per-abi"
+    Write-Warning "-SplitPerAbi is ignored for AAB; Google Play creates ABI splits automatically."
   }
 
   Push-Location $repoRoot
@@ -184,7 +187,7 @@ switch ($Action) {
     $config.$Platform.buildName = $BuildName
     $config.$Platform.buildNumber = $BuildNumber
     Save-Config $config
-    Update-Pubspec $BuildName $BuildNumber
+    Update-Pubspec $Platform $BuildName $BuildNumber
     Show-Config $config
     break
   }

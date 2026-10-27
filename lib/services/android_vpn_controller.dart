@@ -1,6 +1,66 @@
 import 'dart:io' show Platform;
 import 'package:flutter/services.dart';
 
+enum AndroidVpnPhase { starting, running, stopping, stopped, error }
+
+class AndroidVpnStatus {
+  const AndroidVpnStatus({
+    required this.phase,
+    this.sessionId,
+    this.updatedAt,
+    this.errorCode,
+    this.errorMessage,
+    this.routingMode,
+    this.tx = 0,
+    this.rx = 0,
+  });
+
+  final AndroidVpnPhase phase;
+  final String? sessionId;
+  final DateTime? updatedAt;
+  final String? errorCode;
+  final String? errorMessage;
+  final String? routingMode;
+  final int tx;
+  final int rx;
+
+  bool get isRunning => phase == AndroidVpnPhase.running;
+  bool get isActive =>
+      phase == AndroidVpnPhase.starting ||
+      phase == AndroidVpnPhase.running ||
+      phase == AndroidVpnPhase.stopping;
+
+  factory AndroidVpnStatus.fromMap(Map<Object?, Object?> map) {
+    final state = map['state']?.toString();
+    final updatedAtMs = map['updatedAt'];
+    return AndroidVpnStatus(
+      phase: AndroidVpnPhase.values.firstWhere(
+        (value) => value.name == state,
+        orElse: () => AndroidVpnPhase.stopped,
+      ),
+      sessionId: map['sessionId']?.toString(),
+      updatedAt: updatedAtMs is num
+          ? DateTime.fromMillisecondsSinceEpoch(updatedAtMs.toInt())
+          : null,
+      errorCode: map['errorCode']?.toString(),
+      errorMessage: map['errorMessage']?.toString(),
+      routingMode: map['routingMode']?.toString(),
+      tx: (map['tx'] as num?)?.toInt() ?? 0,
+      rx: (map['rx'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+class AndroidVpnException implements Exception {
+  const AndroidVpnException(this.code, this.message);
+
+  final String code;
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
 /// Bridges Flutter with the native Android VPN runtime via a method channel.
 class AndroidVpnController {
   AndroidVpnController();
@@ -25,6 +85,7 @@ class AndroidVpnController {
     String? executablePath,
     List<String>? includePackages,
     List<String>? excludePackages,
+    String? routingMode,
   }) async {
     if (!isSupported) return;
     try {
@@ -37,9 +98,11 @@ class AndroidVpnController {
           'includePackages': includePackages,
         if (excludePackages != null && excludePackages.isNotEmpty)
           'excludePackages': excludePackages,
+        if (routingMode != null && routingMode.isNotEmpty)
+          'routingMode': routingMode,
       });
     } on PlatformException catch (e) {
-      throw StateError(e.message ?? e.code);
+      throw AndroidVpnException(e.code, e.message ?? e.code);
     }
   }
 
@@ -52,15 +115,24 @@ class AndroidVpnController {
     }
   }
 
-  Future<bool> isRunning() async {
-    if (!isSupported) return false;
+  Future<AndroidVpnStatus> getStatus() async {
+    if (!isSupported) {
+      return const AndroidVpnStatus(phase: AndroidVpnPhase.stopped);
+    }
     try {
-      final running = await _channel.invokeMethod<bool>('getVpnStatus');
-      return running ?? false;
+      final result = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'getVpnStatus',
+      );
+      if (result == null) {
+        return const AndroidVpnStatus(phase: AndroidVpnPhase.stopped);
+      }
+      return AndroidVpnStatus.fromMap(result);
     } on PlatformException {
-      return false;
+      return const AndroidVpnStatus(phase: AndroidVpnPhase.stopped);
     }
   }
+
+  Future<bool> isRunning() async => (await getStatus()).isRunning;
 
   Future<String> getNativeDebugLog({String? runtime}) async {
     if (!isSupported) return '';
@@ -89,8 +161,7 @@ class AndroidVpnController {
   Future<String?> getLastStartupError() async {
     if (!isSupported) return null;
     try {
-      final error =
-          await _channel.invokeMethod<String>('getLastStartupError');
+      final error = await _channel.invokeMethod<String>('getLastStartupError');
       return (error != null && error.isNotEmpty) ? error : null;
     } on PlatformException {
       return null;
@@ -107,12 +178,22 @@ class AndroidVpnController {
     }
   }
 
+  Future<bool> openVpnSettings() async {
+    if (!isSupported) return false;
+    try {
+      return await _channel.invokeMethod<bool>('openVpnSettings') ?? false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   /// Returns traffic stats {tx, rx} in bytes from the VPN service, or null.
   Future<({int tx, int rx})?> getTrafficStats() async {
     if (!isSupported) return null;
     try {
-      final result =
-          await _channel.invokeMethod<Map<Object?, Object?>>('getTrafficStats');
+      final result = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'getTrafficStats',
+      );
       if (result == null) return null;
       final tx = result['tx'];
       final rx = result['rx'];
