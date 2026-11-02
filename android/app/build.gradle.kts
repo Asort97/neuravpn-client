@@ -24,6 +24,10 @@ val hasReleaseSigning = hasReleaseKeystore || hasEnvReleaseKeystore
 val releaseRequested = gradle.startParameter.taskNames.any {
     it.contains("release", ignoreCase = true)
 }
+val sideBySideQa = System.getenv("NEURAVPN_ANDROID_QA") == "true"
+if (sideBySideQa && releaseRequested) {
+    throw GradleException("Side-by-side QA is debug-only. Clear NEURAVPN_ANDROID_QA for releases.")
+}
 
 if (releaseRequested && !hasReleaseSigning) {
     throw GradleException(
@@ -68,6 +72,7 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["applicationLabel"] = if (sideBySideQa) "NeuraVPN Test" else "@string/app_name"
     }
 
     signingConfigs {
@@ -89,6 +94,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            if (sideBySideQa) applicationIdSuffix = ".qa"
+        }
         release {
             if (hasReleaseSigning) {
                 signingConfig = signingConfigs.getByName("release")

@@ -697,11 +697,15 @@ class _VlessHomePageState extends State<VlessHomePage>
   UpdateCheckResult? _updateResult;
   bool _checkingUpdates = false;
   AndroidPlayUpdateStatus? _androidPlayUpdateStatus;
+  bool _androidPlayLaunchPromptHandled = false;
+  bool _androidPlayDownloadPromptShown = false;
+  bool _androidPlayPromptScheduled = false;
   bool _isDownloadingUpdate = false;
   double _updateDownloadProgress = 0.0;
   String? _updateDownloadError;
   bool _initialLaunchArgsHandled = false;
   bool _initialAndroidLaunchUriHandled = false;
+  final Set<String> _reportedSubscriptionDeviceLimits = {};
 
   ProxyLink? get _parsed => _vpnCoreController.parsedLink;
   ProxyLink? get _currentLink =>
@@ -891,6 +895,10 @@ class _VlessHomePageState extends State<VlessHomePage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        (Platform.isAndroid || debugForceMobileShell)) {
+      _scheduleAndroidPlayUpdatePrompt();
+    }
     if (state == AppLifecycleState.resumed && Platform.isAndroid) {
       unawaited(_pollAndroidVpnState());
       if (_isRunning) {
@@ -1115,6 +1123,7 @@ class _VlessHomePageState extends State<VlessHomePage>
               () => _androidPlayUpdateStatus = _androidPlayUpdateStatus!
                   .withInstallStatus(installStatus),
             );
+            _scheduleAndroidPlayUpdatePrompt();
           }, onError: (Object _) {});
       final status = await _androidPlayUpdateService.checkAtLaunch();
       if (!mounted) return;
@@ -1123,30 +1132,94 @@ class _VlessHomePageState extends State<VlessHomePage>
             ? status
             : status.withInstallStatus(_latestPlayInstallStatus!),
       );
+      _scheduleAndroidPlayUpdatePrompt();
     } catch (_) {
       // Debug/sideloaded installs and an offline Play Store are not user errors.
       // Never fall back to GitHub or block VPN startup.
     }
   }
 
-  Future<void> _startAndroidPlayUpdate() async {
-    if (_checkingUpdates) return;
+  void _scheduleAndroidPlayUpdatePrompt() {
+    if (!mounted ||
+        _checkingUpdates ||
+        _androidPlayPromptScheduled ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    final update = _androidPlayUpdateStatus;
+    if (!(update?.canStart == true && !_androidPlayLaunchPromptHandled) &&
+        !(update?.downloaded == true && !_androidPlayDownloadPromptShown)) {
+      return;
+    }
+    _androidPlayPromptScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _androidPlayPromptScheduled = false;
+      if (!mounted ||
+          _checkingUpdates ||
+          WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+        return;
+      }
+      // Re-read after the frame: Play may have started/completed a download.
+      final current = _androidPlayUpdateStatus;
+      if (current?.downloaded == true && !_androidPlayDownloadPromptShown) {
+        _androidPlayDownloadPromptShown = true;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              'Обновление готово. Установка перезапустит приложение.',
+              style: TextStyle(color: Colors.white),
+            ),
+            backgroundColor: NeuraUi.card,
+            behavior: SnackBarBehavior.fixed,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            duration: const Duration(seconds: 20),
+            persist: false,
+            action: SnackBarAction(
+              label: 'Обновить',
+              textColor: NeuraUi.redSoft,
+              onPressed: () => unawaited(_completeAndroidPlayUpdate()),
+            ),
+          ),
+        );
+      } else if (current?.canStart == true &&
+          !_androidPlayLaunchPromptHandled) {
+        unawaited(_startAndroidPlayUpdate(automatic: true));
+      }
+    });
+    WidgetsBinding.instance.ensureVisualUpdate();
+  }
+
+  Future<void> _startAndroidPlayUpdate({bool automatic = false}) async {
+    if (!mounted || _checkingUpdates) return;
+    // Claim before awaiting Play so dismiss/resume cannot open a second sheet.
+    _androidPlayLaunchPromptHandled = true;
     setState(() => _checkingUpdates = true);
+    var waitForResume = false;
     try {
       final started = await _androidPlayUpdateService.startFlexibleUpdate();
-      if (!started && mounted) {
+      if (!started && mounted && !automatic) {
         _showFastSnack('Google Play не смог запустить обновление');
       }
-    } catch (_) {
+    } catch (error) {
       if (!mounted) return;
-      _showFastSnack('Не удалось запустить обновление через Google Play');
+      if (automatic &&
+          error is AndroidPlayUpdateException &&
+          error.code == 'PLAY_UPDATE_NOT_FOREGROUND') {
+        _androidPlayLaunchPromptHandled = false;
+        waitForResume = true;
+      } else if (!automatic) {
+        _showFastSnack('Не удалось запустить обновление через Google Play');
+      }
     } finally {
-      if (mounted) setState(() => _checkingUpdates = false);
+      if (mounted) {
+        setState(() => _checkingUpdates = false);
+        if (!waitForResume) _scheduleAndroidPlayUpdatePrompt();
+      }
     }
   }
 
   Future<void> _completeAndroidPlayUpdate() async {
-    if (_checkingUpdates) return;
+    if (!mounted || _checkingUpdates) return;
     setState(() => _checkingUpdates = true);
     try {
       await _androidPlayUpdateService.completeFlexibleUpdate();
@@ -3452,6 +3525,9 @@ $regItems = foreach ($rp in $regPaths) {
           tone: NeuraToastTone.warning,
         );
       }
+    } on SubscriptionDeviceLimitException catch (error) {
+      if (!mounted) return;
+      showNeuraToast(context, error.message, tone: NeuraToastTone.error);
     } catch (e, stack) {
       unawaited(_writeCrashReport('subscription-import', e, stack));
       if (!mounted) return;
@@ -3487,6 +3563,11 @@ $regItems = foreach ($rp in $regPaths) {
             lastUpdated: DateTime.now(),
           );
           await repository.updateSubscription(updated);
+          _reportedSubscriptionDeviceLimits.remove(sub.url);
+        } on SubscriptionDeviceLimitException catch (error) {
+          if (mounted && _reportedSubscriptionDeviceLimits.add(sub.url)) {
+            showNeuraToast(context, error.message, tone: NeuraToastTone.error);
+          }
         } catch (_) {
           // skip failed subscription silently
         }

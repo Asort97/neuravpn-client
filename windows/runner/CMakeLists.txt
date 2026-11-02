@@ -18,6 +18,7 @@ add_executable(${BINARY_NAME} WIN32
   "utils.cpp"
   "win32_window.cpp"
   "dpi_evasion_channel.cpp"
+  "device_info_channel.cpp"
   "launch_uri_channel.cpp"
   "ttl_phantom_injector.cpp"
   "windows_elevation.cpp"

@@ -5,6 +5,8 @@ import android.app.NotificationChannel
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -15,6 +17,7 @@ import android.os.ParcelFileDescriptor
 import android.os.Build
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import android.system.Os
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -57,6 +60,26 @@ class XrayVpnService : VpnService(), DialerController {
     private val stopWatchdog = AndroidVpnStopWatchdog()
     private var diagnostics: AndroidXrayDiagnostics? = null
     private val xrayApi = AndroidXrayApi()
+    private var runtimeConfig: String? = null
+    private var runtimeDataDir: String? = null
+    private var powerReceiver: BroadcastReceiver? = null
+    private val blockedNetworks = mutableSetOf<Network>()
+    @Volatile private var lastTrafficAt = 0L
+    private val recovery = AndroidVpnRecoveryController(
+        now = SystemClock::elapsedRealtime,
+        schedule = { delay, task ->
+            val pending = runtimeExecutor.schedule(task, delay, TimeUnit.MILLISECONDS)
+            val cancel: () -> Unit = { pending.cancel(false); Unit }
+            cancel
+        },
+        recover = ::recoverTransport,
+        exhausted = {
+            stopRuntime(
+                errorCode = "VPN_RECOVERY_FAILED",
+                errorMessage = "Could not restore the VPN connection. Connect again.",
+            )
+        },
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -183,7 +206,7 @@ class XrayVpnService : VpnService(), DialerController {
             // all DNS queries route into the tunnel but there is no proxy yet.
             try {
                 LibXray.touch()
-                LibXray.registerDialerController(this)
+                socketProtector.activate(this, ::protectFd)
                 currentUnderlyingNetwork = selectBestUnderlyingNetwork()
                 updateSystemDns()
                 val versionText = xrayApi.version()
@@ -195,12 +218,14 @@ class XrayVpnService : VpnService(), DialerController {
             }
 
             runCatching {
-                val runtimeConfig = AndroidXrayDiagnostics(applicationContext).let {
+                val preparedConfig = AndroidXrayDiagnostics(applicationContext).let {
                     diagnostics = it
                     it.configure(config)
                 }
                 debugLog("calling runXrayFromJson...")
-                xrayApi.start(runtimeConfig, datDir)
+                runtimeConfig = preparedConfig
+                runtimeDataDir = datDir
+                xrayApi.start(preparedConfig, datDir)
                 xrayCoreStarted = true
             }.getOrElse { t ->
                 failStartup("XRAY_CONFIG_REJECTED", "Xray rejected the generated configuration: ${t.message}")
@@ -262,6 +287,7 @@ class XrayVpnService : VpnService(), DialerController {
                 routingMode,
             )
             acquireWakeLock()
+            startRecoveryMonitor()
             startStatsWriter()
             updateNotification("Connected")
             } catch (_: Throwable) {
@@ -356,12 +382,14 @@ class XrayVpnService : VpnService(), DialerController {
         // onDestroy may arrive after a new Service instance owns the native core.
         // A second cleanup from the old instance must not stop that session.
         if (runtimeOwner === this) {
+            stopRecoveryMonitor()
             releaseWakeLock()
             stopStatsWriter()
             stopUnderlyingNetworkMonitor()
             stopTun2Socks()
             stopXrayCore()
             closeTun()
+            socketProtector.deactivate(this)
             runningState.set(false)
             runtimeOwner = null
         }
@@ -397,6 +425,8 @@ class XrayVpnService : VpnService(), DialerController {
         stopWatchdog.cancel()
         activeSessionId = null
         activeRoutingMode = null
+        runtimeConfig = null
+        runtimeDataDir = null
     }
 
     private fun stopXrayCore() {
@@ -426,7 +456,9 @@ class XrayVpnService : VpnService(), DialerController {
         stopStatsWriter()
         val ctx = applicationContext
         val sessionId = activeSessionId ?: return
+        lastTrafficAt = SystemClock.elapsedRealtime()
         statsScheduler = Executors.newSingleThreadScheduledExecutor().also { sched ->
+            var previousRx = 0L
             sched.scheduleAtFixedRate({
                 runCatching {
                     val raw = AndroidTun2SocksBridge.getStats()
@@ -434,6 +466,8 @@ class XrayVpnService : VpnService(), DialerController {
                         // native array: [tx_packets, tx_bytes, rx_packets, rx_bytes]
                         val tx = raw[1]
                         val rx = raw[3]
+                        if (rx > previousRx) lastTrafficAt = SystemClock.elapsedRealtime()
+                        previousRx = rx
                         val json = JSONObject().apply {
                             put("sessionId", sessionId)
                             put("tx", tx)
@@ -571,9 +605,13 @@ class XrayVpnService : VpnService(), DialerController {
             return
         }
         val callback = object : ConnectivityManager.NetworkCallback() {
-            private fun refresh() {
+            private fun refresh(before: () -> Unit = {}) {
                 if (!executor.isShutdown) {
-                    runCatching { executor.execute { refreshPreferredUnderlyingNetwork() } }
+                    runCatching { executor.execute {
+                        if (defaultNetworkCallback !== this) return@execute
+                        before()
+                        refreshPreferredUnderlyingNetwork()
+                    } }
                 }
             }
             override fun onAvailable(network: Network) {
@@ -590,10 +628,16 @@ class XrayVpnService : VpnService(), DialerController {
             }
 
             override fun onLost(network: Network) {
-                refresh()
+                refresh { blockedNetworks.remove(network) }
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = refresh()
+
+            override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+                refresh {
+                    if (blocked) blockedNetworks.add(network) else blockedNetworks.remove(network)
+                }
+            }
         }
         runCatching {
             connectivity.registerNetworkCallback(
@@ -618,6 +662,7 @@ class XrayVpnService : VpnService(), DialerController {
             Log.w(TAG, "Failed to unregister underlying network callback", it)
         }
         defaultNetworkCallback = null
+        blockedNetworks.clear()
         currentUnderlyingNetwork = null
         runCatching { setUnderlyingNetworks(null) }
     }
@@ -629,14 +674,15 @@ class XrayVpnService : VpnService(), DialerController {
             currentUnderlyingNetwork = preferred
             runCatching { setUnderlyingNetworks(preferred?.let { arrayOf(it) } ?: emptyArray()) }
         }
-        if (preferred != null && xrayCoreStarted) {
+        if (preferred != null) {
             runCatching { updateSystemDns() }
         }
+        recovery.networkChanged(networkTransportKey(preferred))
     }
 
     private fun selectBestUnderlyingNetwork(): Network? {
         val active = connectivity.activeNetwork
-        if (active != null) {
+        if (active != null && active !in blockedNetworks) {
             val caps = connectivity.getNetworkCapabilities(active)
             if (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -644,6 +690,7 @@ class XrayVpnService : VpnService(), DialerController {
         }
         return connectivity.allNetworks
             .mapNotNull { network ->
+                if (network in blockedNetworks) return@mapNotNull null
                 val caps = connectivity.getNetworkCapabilities(network) ?: return@mapNotNull null
                 if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
                     !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -681,8 +728,85 @@ class XrayVpnService : VpnService(), DialerController {
     }
 
     private fun refreshUnderlyingNetwork() {
+        if (startupCancelled() || runtimeOwner !== this) return
         startUnderlyingNetworkMonitor()
         refreshPreferredUnderlyingNetwork()
+        refreshPowerState()
+    }
+
+    // DNS servers are deliberately excluded: a resolver update is not a transport handoff.
+    private fun networkTransportKey(network: Network?): String? {
+        network ?: return null
+        val link = connectivity.getLinkProperties(network)
+        return listOf(
+            network.toString(), link?.interfaceName.orEmpty(),
+            link?.linkAddresses?.map { it.toString() }?.sorted()?.joinToString().orEmpty(),
+            link?.routes?.map { it.toString() }?.sorted()?.joinToString().orEmpty(),
+        ).joinToString("|")
+    }
+
+    private fun startRecoveryMonitor() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        recovery.start(networkTransportKey(currentUnderlyingNetwork), pm.isDeviceIdleMode, pm.isInteractive)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                // Capture the event before queueing; a quick screen-off/on must not be lost.
+                val interactive = when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> false
+                    Intent.ACTION_SCREEN_ON -> true
+                    else -> pm.isInteractive
+                }
+                val idle = pm.isDeviceIdleMode
+                executor.execute {
+                    if (powerReceiver !== this || startupCancelled()) return@execute
+                    refreshPreferredUnderlyingNetwork()
+                    recovery.idleChanged(idle)
+                    recovery.interactiveChanged(interactive, lastTrafficAt)
+                }
+            }
+        }
+        ContextCompat.registerReceiver(this, receiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        }, ContextCompat.RECEIVER_NOT_EXPORTED)
+        powerReceiver = receiver
+    }
+
+    private fun refreshPowerState() {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        recovery.idleChanged(pm.isDeviceIdleMode)
+        recovery.interactiveChanged(pm.isInteractive, lastTrafficAt)
+    }
+
+    private fun stopRecoveryMonitor() {
+        recovery.stop()
+        powerReceiver?.let { runCatching { unregisterReceiver(it) } }
+        powerReceiver = null
+    }
+
+    private fun recoverTransport(reason: String): Boolean {
+        if (startupCancelled() || runtimeOwner !== this) return true
+        if (tunDescriptor == null) return true
+        val config = runtimeConfig ?: return false
+        val datDir = runtimeDataDir ?: return false
+        val started = SystemClock.elapsedRealtime()
+        debugLog("transport recovery started: $reason")
+        return runCatching {
+            // Drop transport pools bound to the old physical network. Keep Android's
+            // TUN, DNS/routes and session intact while the local core restarts.
+            if (xrayCoreStarted) xrayApi.stop()
+            xrayCoreStarted = false
+            if (startupCancelled()) return true
+            xrayApi.start(config, datDir)
+            xrayCoreStarted = true
+            check(xrayApi.isRunning())
+            debugLog("transport recovery completed in ${SystemClock.elapsedRealtime() - started}ms")
+            true
+        }.getOrElse {
+            debugLog("transport recovery failed: ${it.javaClass.simpleName}")
+            false
+        }
     }
 
     private fun acquireWakeLock() {
@@ -705,7 +829,12 @@ class XrayVpnService : VpnService(), DialerController {
 
     companion object {
         // One queue across Service recreation: libXray is process-global.
-        private val runtimeExecutor = Executors.newSingleThreadExecutor()
+        private val runtimeExecutor = Executors.newSingleThreadScheduledExecutor()
+        private val socketProtector = AndroidXraySocketProtector { callback ->
+            LibXray.registerDialerController(object : DialerController {
+                override fun protectFd(fd: Long) = callback(fd)
+            })
+        }
         @Volatile
         private var runtimeOwner: XrayVpnService? = null
         private const val TAG = "XrayVpnService"

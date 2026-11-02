@@ -83,6 +83,8 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       } else {
         throw 'Не удалось добавить подписку';
       }
+    } on SubscriptionDeviceLimitException catch (error) {
+      if (mounted) _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
       _toast('Ошибка: $e', tone: NeuraToastTone.error);
     } finally {
@@ -110,6 +112,8 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         await _loadSubscriptions();
         _toast('Подписка обновлена', tone: NeuraToastTone.success);
       }
+    } on SubscriptionDeviceLimitException catch (error) {
+      if (mounted) _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
       _toast('Ошибка обновления: $e', tone: NeuraToastTone.error);
     } finally {

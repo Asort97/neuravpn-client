@@ -1,16 +1,19 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import 'package:happycat_vpnclient/main.dart';
 import 'package:happycat_vpnclient/models/split_tunnel_config.dart';
 import 'package:happycat_vpnclient/models/vpn_profile.dart';
 import 'package:happycat_vpnclient/models/vpn_subscription.dart';
 import 'package:happycat_vpnclient/services/subscription_repository.dart';
+import 'package:happycat_vpnclient/services/subscription_request_identity.dart';
 import 'package:happycat_vpnclient/services/android_vpn_controller.dart';
 import 'package:happycat_vpnclient/services/dpi_evasion_config.dart';
 import 'package:happycat_vpnclient/services/smart_route_engine.dart';
@@ -144,6 +147,40 @@ Future<void> pumpApp(
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  late Directory identityDirectory;
+  setUpAll(() async {
+    identityDirectory = await Directory.systemTemp.createTemp(
+      'neura_widget_identity_',
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('neuravpn/device_info'),
+          (call) async => {
+            'os': 'Android',
+            'model': 'Test phone',
+            'noBackupDirectory': identityDirectory.path,
+          },
+        );
+    PackageInfo.setMockInitialValues(
+      appName: 'neuravpn',
+      packageName: 'com.neuravpn.app',
+      version: '1.0.14',
+      buildNumber: '14',
+      buildSignature: '',
+    );
+    // Preload real file IO outside the widget fake-async zone.
+    await SubscriptionRequestIdentity.instance.headers();
+  });
+  tearDownAll(() async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          const MethodChannel('neuravpn/device_info'),
+          null,
+        );
+    await identityDirectory.delete(recursive: true);
+  });
+
   setUp(() {
     debugForceMobileShell = true;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -270,6 +307,112 @@ void main() {
           );
         }, overrides);
       } finally {
+        await tester.pumpWidget(const SizedBox());
+        for (final client in overrides.clients) {
+          client.close(force: true);
+        }
+        await tester.runAsync(() => server.close(force: true));
+        await tester.pump(const Duration(seconds: 31));
+        await tester.pumpAndSettle();
+      }
+    },
+  );
+
+  testWidgets(
+    'device-limit import and refresh show server message without changing saved profiles',
+    (tester) async {
+      var message = 'Device limit reached. Remove an unused device.';
+      var requests = 0;
+      var importRequested = false;
+      final server = (await tester.runAsync(
+        () => HttpServer.bind(InternetAddress.loopbackIPv4, 0),
+      ))!;
+      server.listen((request) {
+        requests++;
+        if (request.uri.queryParameters['new'] == '1') importRequested = true;
+        request.response.headers.set('X-Neura-Device-Limit', 'true');
+        request.response.headers.set(
+          'Profile-Title',
+          'base64:${base64.encode(utf8.encode(message))}',
+        );
+        request.response.write('hy2://dummy@example.net:443#DoNotImport');
+        request.response.close();
+      });
+      final overrides = _LocalHttpOverrides();
+      final url = 'http://127.0.0.1:${server.port}/sub';
+      final repository = SubscriptionRepository();
+      await repository.addSubscription(
+        VpnSubscription(
+          name: 'Existing subscription',
+          url: url,
+          profiles: [profiles[1].uri],
+        ),
+      );
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getStringList('vpn_subscriptions_list')!.toList();
+      final manual = prefs.getString('vpn_profiles');
+      Future<void> waitForMessage() async {
+        for (var i = 0; i < 40 && find.text(message).evaluate().isEmpty; i++) {
+          await tester.runAsync(
+            () => Future<void>.delayed(const Duration(milliseconds: 25)),
+          );
+          await tester.pump(const Duration(milliseconds: 25));
+        }
+        expect(find.text(message), findsWidgets);
+        expect(prefs.getStringList('vpn_subscriptions_list'), saved);
+        expect(prefs.getString('vpn_profiles'), manual);
+        expect(profileList(tester).selectedProfile?.uri, profiles.first.uri);
+        expect(find.textContaining('DoNotImport'), findsNothing);
+      }
+
+      try {
+        await HttpOverrides.runWithHttpOverrides(() async {
+          final core = FakeVpnCore();
+          await pumpApp(tester, core);
+          await waitForMessage(); // Automatic refresh at startup.
+          expect(requests, greaterThan(0));
+          await tester.pump(const Duration(seconds: 6));
+          await tester.pumpAndSettle();
+          final before = requests;
+          message = 'Device limit reached during manual refresh.';
+          await tester.ensureVisible(
+            find.byTooltip('Действия с подпиской').first,
+          );
+          await tester.pumpAndSettle();
+          await tester.tap(find.byTooltip('Действия с подпиской').first);
+          await tester.pumpAndSettle();
+          await tester.tap(find.text('Обновить'));
+          await tester.pumpAndSettle();
+          await waitForMessage(); // Explicit refresh in the subscription menu.
+          expect(requests, greaterThan(before));
+          await tester.pumpAndSettle();
+          await tester.pump(const Duration(seconds: 3));
+          await tester.pumpAndSettle();
+          await tester.pumpWidget(const SizedBox());
+          await tester.pumpAndSettle();
+          message = 'Device limit reached during import.';
+          await pumpApp(
+            tester,
+            core,
+            launchArgs: [
+              'neuravpn://import?v=${Uri.encodeComponent('$url?new=1')}',
+            ],
+          );
+          await waitForMessage(); // Import of another URL must not add a dummy.
+          for (var i = 0; i < 40 && !importRequested; i++) {
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 25)),
+            );
+            await tester.pump(const Duration(milliseconds: 25));
+          }
+          expect(importRequested, isTrue);
+          expect((await repository.getAllSubscriptions()), hasLength(1));
+          expect(core.startedUris, isEmpty);
+        }, overrides);
+      } finally {
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(seconds: 3));
+        await tester.pumpAndSettle();
         await tester.pumpWidget(const SizedBox());
         for (final client in overrides.clients) {
           client.close(force: true);

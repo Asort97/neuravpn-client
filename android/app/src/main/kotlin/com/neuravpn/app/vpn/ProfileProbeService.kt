@@ -107,7 +107,7 @@ class ProfileProbeService : VpnService(), DialerController {
             val config = ProfileProbeConfig.build(source, port)
             bindFailed.set(false)
             LibXray.touch()
-            LibXray.registerDialerController(this)
+            socketProtector.activate(this, ::protectFd)
             val dns = connectivity.getLinkProperties(selected)?.dnsServers?.firstOrNull()?.hostAddress
             if (dns == null) {
                 code = "NO_NETWORK_DNS"
@@ -160,6 +160,7 @@ class ProfileProbeService : VpnService(), DialerController {
         } finally {
             if (startAttempted) runCatching { api.stop() }
             runCatching { LibXray.resetDNS() }
+            socketProtector.deactivate(this)
             network = null
             main.post {
                 busy = false
@@ -188,6 +189,11 @@ class ProfileProbeService : VpnService(), DialerController {
     companion object {
         // LibXray is process-global, including across service recreation.
         private val executor = Executors.newSingleThreadExecutor()
+        private val socketProtector = AndroidXraySocketProtector { callback ->
+            LibXray.registerDialerController(object : DialerController {
+                override fun protectFd(fd: Long) = callback(fd)
+            })
+        }
         const val CHECK = 1
         const val CANCEL = 2
         private val ENDPOINTS = listOf(

@@ -7,7 +7,8 @@ param(
 
   [string]$BuildName,
   [int]$BuildNumber,
-  [switch]$SplitPerAbi
+  [switch]$SplitPerAbi,
+  [switch]$SkipClean
 )
 
 Set-StrictMode -Version Latest
@@ -113,8 +114,11 @@ function Build-Windows([object]$config) {
 
   Push-Location $repoRoot
   try {
-    Write-Host "Running flutter clean..." -ForegroundColor Cyan
-    & flutter clean | Out-Host
+    if (-not $SkipClean) {
+      Write-Host "Running flutter clean..." -ForegroundColor Cyan
+      & flutter clean | Out-Host
+      if ($LASTEXITCODE -ne 0) { throw "flutter clean failed" }
+    }
     & flutter pub get | Out-Host
     & flutter @flutterArgs
     if ($LASTEXITCODE -ne 0) {

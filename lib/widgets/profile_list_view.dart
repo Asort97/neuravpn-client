@@ -307,6 +307,9 @@ class _ProfileListViewState extends State<ProfileListView> {
 
       if (!mounted) return;
       _toast('Подписка обновлена.', tone: NeuraToastTone.success);
+    } on SubscriptionDeviceLimitException catch (error) {
+      if (!mounted) return;
+      _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
       if (!mounted) return;
       _toast('Не удалось обновить подписку: $e', tone: NeuraToastTone.error);

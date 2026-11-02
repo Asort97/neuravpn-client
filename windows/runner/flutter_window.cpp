@@ -4,6 +4,7 @@
 
 #include "flutter/generated_plugin_registrant.h"
 #include "dpi_evasion_channel.h"
+#include "device_info_channel.h"
 #include "launch_uri_channel.h"
 #include "utils.h"
 #include "windows_route_channel.h"
@@ -29,6 +30,7 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  SetupDeviceInfoChannel(flutter_controller_->engine()->messenger());
   SetupDpiEvasionChannel(flutter_controller_->engine()->messenger());
   SetupLaunchUriChannel(flutter_controller_->engine()->messenger());
   SetupWindowsRouteChannel(flutter_controller_->engine()->messenger());
@@ -48,6 +50,7 @@ bool FlutterWindow::OnCreate() {
 
 void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
+    TeardownDeviceInfoChannel();
     TeardownWindowsRouteChannel();
     TeardownDpiEvasionChannel();
     TeardownLaunchUriChannel();

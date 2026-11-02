@@ -7,6 +7,7 @@ import android.net.VpnService
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.lifecycle.Lifecycle
 import com.google.android.play.core.appupdate.AppUpdateManager
 import com.google.android.play.core.appupdate.AppUpdateManagerFactory
 import com.google.android.play.core.install.model.AppUpdateType
@@ -38,6 +39,18 @@ class MainActivity : FlutterActivity() {
 
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "neuravpn/device_info")
+			.setMethodCallHandler { call, result ->
+				if (call.method == "getDeviceInfo") {
+					result.success(mapOf(
+						"os" to "Android",
+						"model" to "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+						"noBackupDirectory" to noBackupFilesDir.absolutePath,
+					))
+				} else {
+					result.notImplemented()
+				}
+			}
 		profileProbeChannel?.close()
 		profileProbeChannel = ProfileProbeChannel(applicationContext, flutterEngine.dartExecutor.binaryMessenger)
 		appUpdateManager = AppUpdateManagerFactory.create(applicationContext)
@@ -245,13 +258,24 @@ class MainActivity : FlutterActivity() {
 			.addOnSuccessListener { info ->
 				val canStart =
 					info.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE &&
-						info.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)
+						info.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE) &&
+						info.installStatus() !in listOf(
+							InstallStatus.PENDING, InstallStatus.DOWNLOADING,
+							InstallStatus.INSTALLING, InstallStatus.INSTALLED,
+							InstallStatus.DOWNLOADED,
+						)
 				if (!canStart) {
 					result.error(
 						"PLAY_UPDATE_NOT_AVAILABLE",
 						"Google Play does not currently offer an update for this installation.",
 						null,
 					)
+					return@addOnSuccessListener
+				}
+				// Play's async reply can arrive after the user leaves the activity.
+				if (isFinishing || isDestroyed ||
+					!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+					result.error("PLAY_UPDATE_NOT_FOREGROUND", "Return to the app to update.", null)
 					return@addOnSuccessListener
 				}
 				try {

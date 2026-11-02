@@ -8,6 +8,8 @@ import 'package:happycat_vpnclient/services/subscription_manager.dart';
 import 'package:happycat_vpnclient/vless/config_generator.dart';
 import 'package:happycat_vpnclient/vless/proxy_parser.dart';
 
+import 'support/subscription_identity.dart';
+
 const hy2 =
     'hysteria2://user%3Ap%40ss%2Bword@example.com/?sni=cdn.example.com#My%20server';
 const vless =
@@ -137,6 +139,10 @@ void main() {
   test(
     'plain and base64 subscriptions preserve mixed protocols and deduplicate',
     () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'neura_hy2_identity_',
+      );
+      addTearDown(() => directory.delete(recursive: true));
       for (final encoded in [false, true]) {
         final body = '$vless\n$hy2\nhy2://pass@example.net:8443\n$hy2';
         final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -147,9 +153,9 @@ void main() {
           request.response.close();
         });
         try {
-          final result = await SubscriptionService().fetchSubscription(
-            'http://127.0.0.1:${server.port}/sub',
-          );
+          final result = await SubscriptionService(
+            identity: testSubscriptionIdentity(directory),
+          ).fetchSubscription('http://127.0.0.1:${server.port}/sub');
           expect(result, [vless, hy2, 'hy2://pass@example.net:8443']);
         } finally {
           await server.close(force: true);

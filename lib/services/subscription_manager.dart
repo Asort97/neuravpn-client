@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import '../vless/proxy_parser.dart';
+import 'subscription_request_identity.dart';
 
 class SubscriptionFetchException implements Exception {
   const SubscriptionFetchException(this.message);
@@ -13,14 +14,28 @@ class SubscriptionFetchException implements Exception {
   String toString() => message;
 }
 
-class SubscriptionService {
-  final http.Client _client = http.Client();
-  final Duration _timeout;
-  static const String _userAgent =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+class SubscriptionDeviceLimitException extends SubscriptionFetchException {
+  const SubscriptionDeviceLimitException(super.message);
+}
 
-  SubscriptionService({Duration? timeout})
-    : _timeout = timeout ?? const Duration(seconds: 30);
+class SubscriptionService {
+  final http.Client _client;
+  final Duration _timeout;
+  final SubscriptionRequestIdentity _identity;
+  final bool _isWindows;
+  final Future<ProcessResult> Function(String, List<String>) _runProcess;
+
+  SubscriptionService({
+    Duration? timeout,
+    http.Client? client,
+    SubscriptionRequestIdentity? identity,
+    bool? isWindowsOverride,
+    Future<ProcessResult> Function(String, List<String>)? runProcess,
+  }) : _timeout = timeout ?? const Duration(seconds: 30),
+       _client = client ?? http.Client(),
+       _identity = identity ?? SubscriptionRequestIdentity.instance,
+       _isWindows = isWindowsOverride ?? Platform.isWindows,
+       _runProcess = runProcess ?? _runCurl;
 
   /// Загрузить подписку с URL
   /// Возвращает список VLESS/Hysteria 2 URI из подписки
@@ -35,8 +50,28 @@ class SubscriptionService {
         throw const SubscriptionFetchException('Неверный формат URL');
       }
 
-      final body = await _fetchBody(uri);
-      final content = _decodeSubscriptionContent(body);
+      Map<String, String> headers;
+      try {
+        headers = await _identity.headers();
+      } catch (_) {
+        throw const SubscriptionFetchException(
+          'Не удалось прочитать или сохранить ID установки. '
+          'Проверьте доступ к данным приложения и попробуйте снова.',
+        );
+      }
+      final response = await _fetchResponse(uri, headers);
+      // A limit response may deliberately contain a syntactically valid dummy URI.
+      // Check the headers before HTTP status, decoding or updating saved profiles.
+      if (_header(response, 'x-neura-device-limit')?.trim().toLowerCase() ==
+          'true') {
+        throw SubscriptionDeviceLimitException(
+          _deviceLimitMessage(_header(response, 'profile-title')),
+        );
+      }
+      if (response.statusCode != 200) {
+        throw SubscriptionFetchException('Ошибка HTTP ${response.statusCode}');
+      }
+      final content = _decodeSubscriptionContent(response.body);
 
       if (content == null) {
         throw const SubscriptionFetchException(
@@ -74,55 +109,158 @@ class SubscriptionService {
     }
   }
 
-  Future<String> _fetchBody(Uri uri) async {
+  Future<http.Response> _fetchResponse(
+    Uri uri,
+    Map<String, String> headers,
+  ) async {
     try {
-      final response = await _client
-          .get(uri, headers: {'User-Agent': _userAgent, 'Accept': '*/*'})
-          .timeout(_timeout);
-
-      if (response.statusCode != 200) {
-        throw SubscriptionFetchException('Ошибка HTTP ${response.statusCode}');
-      }
-      return response.body;
+      return await _getWithRedirects(uri, headers).timeout(_timeout);
     } on HandshakeException {
-      final fallback = await _fetchBodyWithCurl(uri);
+      final fallback = await _fetchWithCurl(uri, headers);
       if (fallback != null) return fallback;
       rethrow;
     } on SocketException {
-      final fallback = await _fetchBodyWithCurl(uri);
+      final fallback = await _fetchWithCurl(uri, headers);
       if (fallback != null) return fallback;
       rethrow;
     } on http.ClientException {
-      final fallback = await _fetchBodyWithCurl(uri);
+      final fallback = await _fetchWithCurl(uri, headers);
       if (fallback != null) return fallback;
       rethrow;
     }
   }
 
-  Future<String?> _fetchBodyWithCurl(Uri uri) async {
-    if (!Platform.isWindows) return null;
+  Future<http.Response> _getWithRedirects(
+    Uri uri,
+    Map<String, String> headers,
+  ) async {
+    var current = uri;
+    for (var redirects = 0; ; redirects++) {
+      // dart:io may replace User-Agent when following redirects automatically.
+      final request = http.Request('GET', current)
+        ..followRedirects = false
+        ..headers.addAll(headers);
+      final response = await _client.send(request);
+      final location = response.headers['location'];
+      if (location == null ||
+          !const [301, 302, 303, 307, 308].contains(response.statusCode)) {
+        return http.Response.fromStream(response);
+      }
+      await response.stream.drain<void>();
+      final next = current.resolve(location);
+      if (redirects >= 5 ||
+          next.host.isEmpty ||
+          (next.scheme != 'https' && next.scheme != 'http')) {
+        throw const SubscriptionFetchException(
+          'Сервер подписки вернул недопустимое перенаправление',
+        );
+      }
+      current = next;
+    }
+  }
+
+  static Future<ProcessResult> _runCurl(String executable, List<String> args) =>
+      Process.run(executable, args, stdoutEncoding: null, stderrEncoding: utf8);
+
+  Future<http.Response?> _fetchWithCurl(
+    Uri uri,
+    Map<String, String> headers,
+  ) async {
+    if (!_isWindows) return null;
+    Directory? temp;
     try {
-      final result = await Process.run('curl.exe', <String>[
+      temp = await Directory.systemTemp.createTemp('neuravpn_subscription_');
+      final headerFile = File('${temp.path}/headers');
+      final result = await _runProcess('curl.exe', <String>[
+        '--disable',
         '--location',
-        '--fail',
+        '--max-redirs',
+        '5',
+        '--proto',
+        '=http,https',
+        '--proto-redir',
+        '=http,https',
         '--silent',
         '--show-error',
         '--connect-timeout',
         '10',
         '--max-time',
         '${_timeout.inSeconds}',
-        '--user-agent',
-        _userAgent,
+        '--dump-header',
+        headerFile.path,
+        for (final entry in headers.entries) ...[
+          '--header',
+          '${entry.key}: ${entry.value}',
+        ],
         uri.toString(),
       ]).timeout(_timeout + const Duration(seconds: 2));
       if (result.exitCode == 0) {
-        final body = result.stdout?.toString() ?? '';
-        if (body.trim().isNotEmpty) return body;
+        final rawHeaders = await headerFile.readAsString(encoding: latin1);
+        return _curlResponse(rawHeaders, result.stdout as List<int>);
       }
     } catch (_) {
       // The original transport error is more useful to the caller.
+    } finally {
+      if (temp != null) {
+        try {
+          await temp.delete(recursive: true);
+        } catch (_) {}
+      }
     }
     return null;
+  }
+
+  http.Response? _curlResponse(String rawHeaders, List<int> body) {
+    int? status;
+    final headers = <String, String>{};
+    // curl emits headers for CONNECT, redirects and the final response.
+    for (final block in rawHeaders.split(RegExp(r'\r?\n\r?\n'))) {
+      final lines = const LineSplitter().convert(block);
+      if (lines.isEmpty) continue;
+      final match = RegExp(
+        r'^HTTP/\S+\s+(\d{3})(?:\s|$)',
+      ).firstMatch(lines.first);
+      if (match == null) continue;
+      status = int.parse(match.group(1)!);
+      headers.clear();
+      for (final line in lines.skip(1)) {
+        final separator = line.indexOf(':');
+        if (separator <= 0) continue;
+        headers[line.substring(0, separator).trim().toLowerCase()] = line
+            .substring(separator + 1)
+            .trim();
+      }
+    }
+    return status == null
+        ? null
+        : http.Response.bytes(body, status, headers: headers);
+  }
+
+  String? _header(http.Response response, String name) {
+    for (final entry in response.headers.entries) {
+      if (entry.key.toLowerCase() == name) return entry.value;
+    }
+    return null;
+  }
+
+  String _deviceLimitMessage(String? title) {
+    const fallback =
+        'Достигнут лимит устройств для этой подписки. '
+        'Удалите ненужное устройство в личном кабинете или обратитесь в поддержку.';
+    var text = title?.trim() ?? '';
+    if (text.toLowerCase().startsWith('base64:')) {
+      try {
+        text = utf8.decode(
+          base64.decode(base64.normalize(text.substring(7).trim())),
+        );
+      } on FormatException {
+        return fallback;
+      }
+    }
+    text = text
+        .replaceAll(RegExp(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]'), '')
+        .trim();
+    return text.isEmpty ? fallback : text;
   }
 
   String? _decodeSubscriptionContent(String raw) {
