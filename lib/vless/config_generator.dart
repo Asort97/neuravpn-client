@@ -1056,7 +1056,7 @@ List<_ApplicationRule> _parseApplicationRules(String entry) {
 
   final normalized = entry.trim();
   if (_looksLikePath(normalized)) {
-    final exeName = path.basename(normalized);
+    final exeName = _executableName(normalized);
     final rules = <_ApplicationRule>[
       _ApplicationRule('process_path', normalized),
     ];
@@ -1068,7 +1068,7 @@ List<_ApplicationRule> _parseApplicationRules(String entry) {
     // include descendant executables from the app directory so child processes
     // spawned by launchers/updaters are routed too.
     for (final childExe in _collectDescendantExecutables(normalized)) {
-      final childName = path.basename(childExe);
+      final childName = _executableName(childExe);
       if (childName.isEmpty) continue;
       rules.add(_ApplicationRule('process_path', childExe));
       rules.add(_ApplicationRule('process_name', childName));
@@ -1077,6 +1077,14 @@ List<_ApplicationRule> _parseApplicationRules(String entry) {
   }
 
   return <_ApplicationRule>[_ApplicationRule('process_name', normalized)];
+}
+
+// Application entries are Windows paths; parse them as such on every host
+// (on macOS/Linux, path.basename would keep the backslashes).
+String _executableName(String value) {
+  final windowsPath =
+      value.contains(r'\') || RegExp(r'^[A-Za-z]:').hasMatch(value);
+  return windowsPath ? path.windows.basename(value) : path.basename(value);
 }
 
 bool _looksLikePath(String value) {
