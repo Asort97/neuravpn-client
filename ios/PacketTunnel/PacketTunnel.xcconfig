@@ -19,8 +19,7 @@ CURRENT_PROJECT_VERSION = $(FLUTTER_BUILD_NUMBER)
 MARKETING_VERSION = $(FLUTTER_BUILD_NAME)
 LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks @executable_path/../../Frameworks
 OTHER_LDFLAGS = $(inherited) -lresolv -framework NetworkExtension -framework Network -framework Security -framework SystemConfiguration
-// Both release XCFrameworks contain static libraries, with Clang module maps.
-// Explicit paths also support Xcode versions that do not propagate library
-// XCFramework header directories into Swift's Clang importer automatically.
-HEADER_SEARCH_PATHS[sdk=iphoneos*] = $(inherited) "$(SRCROOT)/Frameworks/LibXray.xcframework/ios-arm64/Headers" "$(SRCROOT)/Frameworks/HevSocks5Tunnel.xcframework/ios-arm64/Headers/HevSocks5Tunnel"
-HEADER_SEARCH_PATHS[sdk=iphonesimulator*] = $(inherited) "$(SRCROOT)/Frameworks/LibXray.xcframework/ios-arm64_x86_64-simulator/Headers" "$(SRCROOT)/Frameworks/HevSocks5Tunnel.xcframework/ios-arm64_x86_64-simulator/Headers/HevSocks5Tunnel"
+// Both XCFrameworks are static libraries whose module maps live in
+// Headers/<Module>/. Xcode copies them into $(BUILT_PRODUCTS_DIR)/include and
+// imports them from there. Do not add the XCFramework Headers paths here too:
+// the same module found twice fails with "Redefinition of module".

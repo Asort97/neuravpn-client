@@ -23,6 +23,16 @@ download "https://github.com/XTLS/libXray/releases/download/$LIBXRAY_VERSION/lib
 unzip -q "$work/libxray.zip" -d "$work/xray"
 framework="$(find "$work/xray" -type d -name LibXray.xcframework -prune)"
 [[ -d "$framework" ]] || { echo "Expected one LibXray.xcframework" >&2; exit 1; }
+# Xcode copies every static XCFramework's Headers/ into one shared
+# build/<config>/include/. Upstream ships module.modulemap at the top of
+# Headers/, where it collides with other libraries' maps; nest each slice's
+# headers under Headers/LibXray/ (module maps use relative paths).
+for headers in "$framework"/*/Headers; do
+  [[ -f "$headers/module.modulemap" ]] || continue
+  nested="$(mktemp -d "$work/headers.XXXXXX")"
+  find "$headers" -mindepth 1 -maxdepth 1 -exec mv {} "$nested/" \;
+  mv "$nested" "$headers/LibXray"
+done
 ditto "$framework" "$ios_dir/Frameworks/LibXray.xcframework"
 
 # Upstream publishes an Apple build script, not an Apple binary release asset.
