@@ -61,13 +61,21 @@ class AndroidVpnException implements Exception {
   String toString() => message;
 }
 
-/// Bridges Flutter with the native Android VPN runtime via a method channel.
+/// Bridges Flutter with the Android/iOS native VPN runtime.
+/// The historical class/channel names remain stable for existing callers.
 class AndroidVpnController {
-  AndroidVpnController();
+  AndroidVpnController({bool? isAndroidOverride, bool? isIOSOverride})
+    : _isAndroidOverride = isAndroidOverride,
+      _isIOSOverride = isIOSOverride;
+
+  final bool? _isAndroidOverride;
+  final bool? _isIOSOverride;
 
   static const MethodChannel _channel = MethodChannel('happycat.vpn/native');
 
-  bool get isSupported => Platform.isAndroid;
+  bool get isSupported =>
+      (_isAndroidOverride ?? Platform.isAndroid) ||
+      (_isIOSOverride ?? Platform.isIOS);
 
   Future<bool> prepareVpn() async {
     if (!isSupported) return false;

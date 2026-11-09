@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart' show defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart' show ScrollDirection;
+
+import 'neura_motion.dart';
 
 class NeuraUi {
   static const Color black = Color(0xFF0A0A0A);
@@ -20,8 +23,10 @@ class NeuraUi {
   static const Duration normal = Duration(milliseconds: 320);
   static const Duration slow = Duration(milliseconds: 520);
 
-  static const Curve curve = Curves.easeOutCubic;
-  static const Curve emphasized = Curves.easeOutQuart;
+  static const Curve curve = NeuraMotion.smoothCurve;
+  static const Curve emphasized = NeuraMotion.smoothCurve;
+
+  static bool get isIOS => defaultTargetPlatform == TargetPlatform.iOS;
 
   static ThemeData buildTheme() {
     final baseScheme = ColorScheme.fromSeed(
@@ -42,7 +47,9 @@ class NeuraUi {
       colorScheme: scheme,
       useMaterial3: true,
       scaffoldBackgroundColor: const Color(0xFF050608),
-      splashFactory: InkSparkle.splashFactory,
+      // iOS controls highlight instead of rippling.
+      splashFactory: isIOS ? NoSplash.splashFactory : InkSparkle.splashFactory,
+      highlightColor: isIOS ? Colors.white.withOpacity(0.06) : null,
       dialogTheme: const DialogThemeData(backgroundColor: Colors.transparent),
       bottomSheetTheme: const BottomSheetThemeData(
         backgroundColor: Colors.transparent,
@@ -403,12 +410,19 @@ class NeuraReveal extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (NeuraMotion.reduceMotion(context)) return child;
     return TweenAnimationBuilder<double>(
       tween: Tween<double>(begin: 0, end: 1),
-      duration: NeuraUi.slow + delay,
-      curve: NeuraUi.emphasized,
-      builder: (context, value, _) {
-        final t = Curves.easeOutCubic.transform(value.clamp(0.0, 1.0));
+      duration: NeuraMotion.curveDuration(NeuraUi.slow) + delay,
+      curve: Interval(
+        delay.inMicroseconds /
+            (NeuraMotion.curveDuration(NeuraUi.slow) + delay).inMicroseconds,
+        1,
+        curve: NeuraMotion.smoothCurve,
+      ),
+      child: child,
+      builder: (context, value, child) {
+        final t = value.clamp(0.0, 1.0);
         return Opacity(
           opacity: t,
           child: Transform.translate(
@@ -489,34 +503,43 @@ Future<T?> showNeuraDialog<T>({
   required WidgetBuilder builder,
   bool barrierDismissible = true,
 }) {
-  return showGeneralDialog<T>(
-    context: context,
-    barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
-    barrierDismissible: barrierDismissible,
-    barrierColor: Colors.black.withOpacity(0.58),
-    transitionDuration: NeuraUi.normal,
-    pageBuilder: (context, _, __) =>
-        Material(type: MaterialType.transparency, child: builder(context)),
-    transitionBuilder: (context, animation, _, child) {
-      final curved = CurvedAnimation(
-        parent: animation,
-        curve: NeuraUi.emphasized,
-        reverseCurve: Curves.easeInCubic,
-      );
-      return FadeTransition(
-        opacity: curved,
-        child: SlideTransition(
-          position: Tween<Offset>(
-            begin: const Offset(0, 0.04),
-            end: Offset.zero,
-          ).animate(curved),
+  // UIAlertController motion: grows in from 1.12 on a spring, fades out fast.
+  return Navigator.of(context, rootNavigator: true).push<T>(
+    PageRouteBuilder<T>(
+      opaque: false,
+      barrierDismissible: barrierDismissible,
+      barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+      barrierColor: Colors.black.withOpacity(0.58),
+      transitionDuration: NeuraMotion.curveDuration(
+        const Duration(milliseconds: 380),
+      ),
+      reverseTransitionDuration: const Duration(milliseconds: 200),
+      pageBuilder: (context, _, __) =>
+          Material(type: MaterialType.transparency, child: builder(context)),
+      transitionsBuilder: (context, animation, _, child) {
+        final reverse = animation.status == AnimationStatus.reverse;
+        final scale = CurvedAnimation(
+          parent: animation,
+          curve: NeuraMotion.smoothCurve,
+          reverseCurve: Curves.easeIn,
+        );
+        final fade = CurvedAnimation(
+          parent: animation,
+          curve: const Interval(0, 0.45, curve: Curves.easeOut),
+          reverseCurve: Curves.easeIn,
+        );
+        return FadeTransition(
+          opacity: fade,
           child: ScaleTransition(
-            scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
+            scale: Tween<double>(
+              begin: reverse ? 0.96 : 1.12,
+              end: 1.0,
+            ).animate(scale),
             child: child,
           ),
-        ),
-      );
-    },
+        );
+      },
+    ),
   );
 }
 
@@ -532,13 +555,19 @@ Future<T?> showNeuraBottomSheet<T>({
     useSafeArea: useSafeArea,
     backgroundColor: Colors.transparent,
     barrierColor: Colors.black.withOpacity(0.58),
+    // UIKit sheet timing (the modal sheet ignores custom curves); the
+    // drag-to-dismiss fling keeps the finger's velocity.
+    sheetAnimationStyle: const AnimationStyle(
+      duration: Duration(milliseconds: 450),
+      reverseDuration: Duration(milliseconds: 280),
+    ),
     builder: (ctx) => Padding(
       padding: EdgeInsets.only(
         left: 12,
         right: 12,
         bottom: MediaQuery.of(ctx).viewInsets.bottom + 12,
       ),
-      child: NeuraReveal(
+      child: RepaintBoundary(
         child: NeuraGlassSurface(
           borderRadius: 30,
           blur: 28,
@@ -642,15 +671,30 @@ Future<void> _showNeuraToastInternal(
 
   await _dismissActiveNeuraToast();
 
+  NeuraHaptics.play(switch (tone) {
+    NeuraToastTone.neutral => NeuraHaptic.none,
+    NeuraToastTone.success => NeuraHaptic.success,
+    NeuraToastTone.warning => NeuraHaptic.warning,
+    NeuraToastTone.error => NeuraHaptic.error,
+  });
+
+  // iOS banners drop in from the top on a spring; elsewhere they rise from
+  // the bottom edge.
+  final fromTop = NeuraUi.isIOS;
   final controller = AnimationController(
     vsync: overlay,
-    duration: const Duration(milliseconds: 280),
-    reverseDuration: const Duration(milliseconds: 240),
+    duration: NeuraMotion.curveDuration(const Duration(milliseconds: 420)),
+    reverseDuration: const Duration(milliseconds: 220),
   );
   final animation = CurvedAnimation(
     parent: controller,
-    curve: Curves.easeOutCubic,
+    curve: NeuraMotion.snappyCurve,
     reverseCurve: Curves.easeInCubic,
+  );
+  final fade = CurvedAnimation(
+    parent: controller,
+    curve: const Interval(0, 0.4, curve: Curves.easeOut),
+    reverseCurve: Curves.easeIn,
   );
 
   late final OverlayEntry entry;
@@ -660,19 +704,21 @@ Future<void> _showNeuraToastInternal(
         ignoring: true,
         child: SafeArea(
           child: Align(
-            alignment: Alignment.bottomCenter,
+            alignment: fromTop ? Alignment.topCenter : Alignment.bottomCenter,
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              padding: fromTop
+                  ? const EdgeInsets.fromLTRB(16, 8, 16, 0)
+                  : const EdgeInsets.fromLTRB(16, 0, 16, 16),
               child: FadeTransition(
-                opacity: animation,
+                opacity: fade,
                 child: SlideTransition(
                   position: Tween<Offset>(
-                    begin: const Offset(0, 0.18),
+                    begin: Offset(0, fromTop ? -0.9 : 0.18),
                     end: Offset.zero,
                   ).animate(animation),
                   child: ScaleTransition(
                     scale: Tween<double>(
-                      begin: 0.97,
+                      begin: 0.94,
                       end: 1.0,
                     ).animate(animation),
                     child: ConstrainedBox(

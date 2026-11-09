@@ -1,0 +1,85 @@
+name: iOS unsigned build
+
+on:
+  push:
+    branches: [feature/ios-client, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      LIBXRAY_VERSION: v26.7.28
+      # GitHub release asset digest, verified against the pinned release API.
+      LIBXRAY_SHA256: 07f7ed7697277930e1c517755855950f594f41435b0dfc5917a66eea6278aeb9
+      HEV_VERSION: 2.19.3
+      # Official source distribution, including its third-party sources.
+      HEV_SHA256: 8aaa33b344cab03a5cfc3675b9aaae55c6ee6088d78678ad1fbb44855b5ba570
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.3'
+          channel: stable
+          cache: true
+      - name: Resolve Flutter dependencies
+        run: flutter pub get
+      - name: Verify iOS project structure
+        run: python3 ios/scripts/validate_project.py
+      - name: Fetch verified libXray and build verified HEV Apple libraries
+        run: bash ios/scripts/prepare_native.sh
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+      - name: Check native target and Swift syntax
+        run: |
+          xcodebuild -list -project ios/Runner.xcodeproj
+          xcrun swiftc -frontend -parse ios/Shared/*.swift ios/PacketTunnel/*.swift ios/Runner/*.swift
+      - name: Test native Dart services
+        run: >-
+          flutter test test/android_vpn_controller_test.dart
+          test/ios_native_runtime_test.dart test/ios_xray_config_test.dart
+          test/xray_config_generator_test.dart
+      - name: Build unsigned iOS app and extension
+        run: |
+          cat > "$RUNNER_TEMP/neuravpn-unsigned.xcconfig" <<'CONFIG'
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          DEVELOPMENT_TEAM =
+          CONFIG
+          export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/neuravpn-unsigned.xcconfig"
+          flutter build ios --release --no-codesign
+      - name: Package unsigned IPA
+        run: |
+          app=build/ios/iphoneos/Runner.app
+          test -f "$app/PlugIns/PacketTunnel.appex/PacketTunnel"
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = com.neuravpn.app
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/PlugIns/PacketTunnel.appex/Info.plist")" = com.neuravpn.app.PacketTunnel
+          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$app/Info.plist")" = "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$app/PlugIns/PacketTunnel.appex/Info.plist")"
+          if find "$app/PlugIns/PacketTunnel.appex" -iname '*.dat' -o -name 'Flutter.framework' | grep -q .; then
+            echo 'Unexpected Flutter/geo assets in the extension' >&2
+            exit 1
+          fi
+          mkdir -p build/ios/unsigned/Payload
+          ditto "$app" build/ios/unsigned/Payload/Runner.app
+          cd build/ios/unsigned
+          /usr/bin/zip -q -r -y ../neuravpn-unsigned.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: neuravpn-ios-unsigned
+          path: |
+            build/ios/neuravpn-unsigned.ipa
+            ios/Runner/Runner.entitlements
+            ios/PacketTunnel/PacketTunnel.entitlements
+            ios/IOS_ARCHITECTURE.md
+          if-no-files-found: error
+          retention-days: 14

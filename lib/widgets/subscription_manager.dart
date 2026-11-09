@@ -188,7 +188,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         ],
       ),
       body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
+          ? const Center(child: CircularProgressIndicator.adaptive())
           : _subscriptions.isEmpty
           ? Center(
               child: Column(

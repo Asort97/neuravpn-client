@@ -1,0 +1,26 @@
+// Share only Flutter's version values, never Flutter/Pods runtime linkage.
+#include "../Flutter/Generated.xcconfig"
+PRODUCT_BUNDLE_IDENTIFIER = com.neuravpn.app.PacketTunnel
+PRODUCT_NAME = $(TARGET_NAME)
+PRODUCT_MODULE_NAME = PacketTunnel
+INFOPLIST_FILE = PacketTunnel/Info.plist
+CODE_SIGN_ENTITLEMENTS = PacketTunnel/PacketTunnel.entitlements
+CODE_SIGN_STYLE = Automatic
+IPHONEOS_DEPLOYMENT_TARGET = 15.0
+TARGETED_DEVICE_FAMILY = 1,2
+SUPPORTED_PLATFORMS = iphoneos iphonesimulator
+SKIP_INSTALL = YES
+APPLICATION_EXTENSION_API_ONLY = YES
+CLANG_ENABLE_MODULES = YES
+SWIFT_VERSION = 5.0
+ENABLE_BITCODE = NO
+ENABLE_USER_SCRIPT_SANDBOXING = NO
+CURRENT_PROJECT_VERSION = $(FLUTTER_BUILD_NUMBER)
+MARKETING_VERSION = $(FLUTTER_BUILD_NAME)
+LD_RUNPATH_SEARCH_PATHS = $(inherited) @executable_path/Frameworks @executable_path/../../Frameworks
+OTHER_LDFLAGS = $(inherited) -lresolv -framework NetworkExtension -framework Network -framework Security -framework SystemConfiguration
+// Both release XCFrameworks contain static libraries, with Clang module maps.
+// Explicit paths also support Xcode versions that do not propagate library
+// XCFramework header directories into Swift's Clang importer automatically.
+HEADER_SEARCH_PATHS[sdk=iphoneos*] = $(inherited) "$(SRCROOT)/Frameworks/LibXray.xcframework/ios-arm64/Headers" "$(SRCROOT)/Frameworks/HevSocks5Tunnel.xcframework/ios-arm64/Headers/HevSocks5Tunnel"
+HEADER_SEARCH_PATHS[sdk=iphonesimulator*] = $(inherited) "$(SRCROOT)/Frameworks/LibXray.xcframework/ios-arm64_x86_64-simulator/Headers" "$(SRCROOT)/Frameworks/HevSocks5Tunnel.xcframework/ios-arm64_x86_64-simulator/Headers/HevSocks5Tunnel"

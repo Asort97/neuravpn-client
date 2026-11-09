@@ -80,8 +80,10 @@ class VpnCoreController {
     VpnCoreProcessRunner? processRunner,
     bool? isWindowsOverride,
     bool? isAndroidOverride,
+    bool? isIOSOverride,
   }) : _isWindowsOverride = isWindowsOverride,
-       _isAndroidOverride = isAndroidOverride {
+       _isAndroidOverride = isAndroidOverride,
+       _isIOSOverride = isIOSOverride {
     _processStarter = processStarter ?? _defaultProcessStarter;
     _processRunner = processRunner ?? _defaultProcessRunner;
     _wintunManager = wintunManager ?? WintunManager();
@@ -121,6 +123,7 @@ class VpnCoreController {
   late final VpnCoreProcessRunner _processRunner;
   final bool? _isWindowsOverride;
   final bool? _isAndroidOverride;
+  final bool? _isIOSOverride;
 
   Process? _process;
   StreamSubscription<String>? _stdoutSub;
@@ -227,16 +230,17 @@ class VpnCoreController {
     if (_isWindows) {
       return _activeInterfaceName ?? WindowsTunGuard.defaultInterfaceName;
     }
-    return 'Android VPN';
+    return _isIOS ? 'iOS VPN' : 'Android VPN';
   }
 
-  bool get isRunning => _isAndroid ? _androidConnected : _windowsConnected;
+  bool get isRunning =>
+      isMobileNativeRuntime ? _androidConnected : _windowsConnected;
   AndroidVpnStatus get androidStatus => _androidStatus;
 
   Future<bool> isWintunAvailable() => _wintunManager.isWintunAvailable();
 
   Future<bool> syncRuntimeState() async {
-    if (!_isAndroid) {
+    if (!isMobileNativeRuntime) {
       return isRunning;
     }
     try {
@@ -250,29 +254,29 @@ class VpnCoreController {
   }
 
   Future<String> getAndroidNativeDebugLog() async {
-    if (!_isAndroid) return '';
+    if (!isMobileNativeRuntime) return '';
     return _androidController.getNativeDebugLog(runtime: _androidRuntimeId);
   }
 
   Future<void> clearAndroidNativeDebugLog() async {
-    if (!_isAndroid) return;
+    if (!isMobileNativeRuntime) return;
     _lastAndroidNativeDebugLogLength = 0;
     await _androidController.clearNativeDebugLog(runtime: _androidRuntimeId);
   }
 
   /// Asks the VPN service to re-register its underlying network callback.
   Future<void> refreshAndroidNetwork() async {
-    if (!_isAndroid) return;
+    if (!isMobileNativeRuntime) return;
     await _androidController.refreshNetwork();
   }
 
   Future<bool> openAndroidVpnSettings() async {
-    if (!_isAndroid) return false;
+    if (!isMobileNativeRuntime) return false;
     return _androidController.openVpnSettings();
   }
 
   void _startAndroidNativeLogPolling() {
-    if (!_isAndroid || !_useAndroidXrayRuntime) return;
+    if (!isMobileNativeRuntime || !_useMobileXrayRuntime) return;
     _androidNativeLogPollTimer?.cancel();
     _androidNativeLogPollTimer = Timer.periodic(
       const Duration(milliseconds: 500),
@@ -292,7 +296,7 @@ class VpnCoreController {
   }
 
   Future<void> _drainAndroidNativeDebugLog() async {
-    if (!_isAndroid || !_useAndroidXrayRuntime) return;
+    if (!isMobileNativeRuntime || !_useMobileXrayRuntime) return;
     try {
       final fullLog = await getAndroidNativeDebugLog();
       if (fullLog.isEmpty) {
@@ -329,6 +333,12 @@ class VpnCoreController {
       _isWindowsOverride == null;
   bool get _isAndroid => _isAndroidOverride ?? Platform.isAndroid;
   bool get _useAndroidXrayRuntime => _isAndroid && _androidXrayExperimental;
+  bool get _isIOS => _isIOSOverride ?? Platform.isIOS;
+
+  /// Native VPN services are used on both mobile platforms.
+  bool get isMobileNativeRuntime => _isAndroid || _isIOS;
+  bool get _useMobileXrayRuntime => _useAndroidXrayRuntime || _isIOS;
+  String get _nativePlatformLabel => _isIOS ? 'iOS' : 'Android';
   String get _androidRuntimeId => 'xray';
 
   Future<void> prepareWindowsRuntime({
@@ -588,7 +598,7 @@ class VpnCoreController {
     }
     _parsedLink = parsed;
     _activeWindowsOutboundTag = parsed.tag ?? 'proxy';
-    if (!_isWindows && !_isAndroid) {
+    if (!_isWindows && !isMobileNativeRuntime) {
       return VpnCoreStartResult.failure('Платформа не поддерживается');
     }
 
@@ -636,41 +646,54 @@ class VpnCoreController {
       );
     }
 
-    if (_isAndroid) {
+    if (isMobileNativeRuntime) {
       await clearAndroidNativeDebugLog();
       _startAndroidNativeLogPolling();
       _notifyStatus('Генерация конфига');
-      final jsonConfig = _buildConfigJson(
-        parsed: parsed,
-        splitConfig: splitConfig,
-        inboundTag: WindowsTunGuard.defaultInboundTag,
-        interfaceName: WindowsTunGuard.defaultInterfaceName,
-        interfaceAddresses: const ['172.19.0.1/30'],
-        useSmartEngineRules: useSmartEngineRules,
-        extraRouteRules: extraRouteRules,
-        extraOutbounds: extraOutbounds,
-        extraInbounds: extraInbounds,
-        dnsServers: dnsServers,
-        dnsFinalTag: dnsFinalTag,
-        dpiEvasionConfig: dpiEvasionConfig,
-        developerMode: developerMode,
-      );
+      late final String jsonConfig;
+      try {
+        jsonConfig = _buildConfigJson(
+          parsed: parsed,
+          splitConfig: splitConfig,
+          inboundTag: WindowsTunGuard.defaultInboundTag,
+          interfaceName: WindowsTunGuard.defaultInterfaceName,
+          interfaceAddresses: const ['172.19.0.1/30'],
+          useSmartEngineRules: useSmartEngineRules,
+          extraRouteRules: extraRouteRules,
+          extraOutbounds: extraOutbounds,
+          extraInbounds: extraInbounds,
+          dnsServers: dnsServers,
+          dnsFinalTag: dnsFinalTag,
+          dpiEvasionConfig: dpiEvasionConfig,
+          developerMode: developerMode,
+        );
+      } on UnsupportedError catch (error) {
+        if (!_isIOS) rethrow;
+        await _stopAndroidNativeLogPolling();
+        return VpnCoreStartResult.failure(error.toString());
+      }
       _generatedConfig = jsonConfig;
       _configFile = null;
       _appendConnectionLog(
-        '[android] generated redacted xray config (${jsonConfig.length} chars)',
+        '[${_isIOS ? 'ios' : 'android'}] generated redacted xray config (${jsonConfig.length} chars)',
       );
       _notifyStatus('Запрос разрешения VPN');
       bool granted;
       try {
         granted = await _androidController.prepareVpn();
       } catch (e) {
+        if (_isIOS) await _stopAndroidNativeLogPolling();
         return VpnCoreStartResult.failure(
           'Не удалось запросить разрешение VPN: $e',
         );
       }
       if (!granted) {
+        if (_isIOS) await _stopAndroidNativeLogPolling();
         return VpnCoreStartResult.failure('Разрешение отклонено пользователем');
+      }
+      if (_isIOS && !_isConnectionOperationCurrent(connectionOperation)) {
+        await _stopAndroidNativeLogPolling();
+        return _cancelledConnectResult();
       }
 
       final includePackages = splitConfig.mode == 'whitelist'
@@ -693,7 +716,7 @@ class VpnCoreController {
         }
       }
 
-      _notifyStatus('Запуск Android Xray сервиса');
+      _notifyStatus('Запуск $_nativePlatformLabel Xray сервиса');
       try {
         await _androidController.startVpn(
           jsonConfig,
@@ -704,8 +727,9 @@ class VpnCoreController {
           routingMode: splitConfig.smartRouting ? 'smart' : splitConfig.mode,
         );
       } catch (e) {
+        if (_isIOS) await _stopAndroidNativeLogPolling();
         return VpnCoreStartResult.failure(
-          'Не удалось запустить Android VPN сервис: $e',
+          'Не удалось запустить $_nativePlatformLabel VPN сервис: $e',
         );
       }
       final startup = await _waitForAndroidServiceStartup();
@@ -719,14 +743,14 @@ class VpnCoreController {
         final errorDetail = startup.error;
         if (errorDetail != null && errorDetail.isNotEmpty) {
           return VpnCoreStartResult.failure(
-            'Android VPN сервис не запустился: $errorDetail',
+            '$_nativePlatformLabel VPN сервис не запустился: $errorDetail',
           );
         }
         return VpnCoreStartResult.failure(
-          'Android VPN сервис не запустился (проверьте совместимость конфигурации)',
+          '$_nativePlatformLabel VPN сервис не запустился (проверьте совместимость конфигурации)',
         );
       }
-      _notifyStatus('Android Xray сервис запущен');
+      _notifyStatus('$_nativePlatformLabel Xray сервис запущен');
       return VpnCoreStartResult.success();
     }
 
@@ -1413,8 +1437,11 @@ class VpnCoreController {
         serverAddressOverride: serverAddressOverride,
       );
     }
-    if (_useAndroidXrayRuntime) {
-      return generateAndroidXrayConfig(
+    if (_useMobileXrayRuntime) {
+      final generate = _isIOS
+          ? generateIOSXrayConfig
+          : generateAndroidXrayConfig;
+      return generate(
         parsed,
         splitConfig,
         inboundTag: inboundTag,
@@ -1460,7 +1487,7 @@ class VpnCoreController {
 
   Future<({bool running, String? error})>
   _waitForAndroidServiceStartup() async {
-    if (!_isAndroid) return (running: true, error: null);
+    if (!isMobileNativeRuntime) return (running: true, error: null);
     // This is a local service-state deadline, not a network health check.
     // Return immediately when ready; allow slower devices a cold-start budget.
     const attempts = 100;
@@ -1491,7 +1518,7 @@ class VpnCoreController {
   }
 
   Future<bool> _waitForAndroidServiceStop({int attempts = 16}) async {
-    if (!_isAndroid) return true;
+    if (!isMobileNativeRuntime) return true;
     for (var i = 0; i < attempts; i++) {
       _androidStatus = await _androidController.getStatus();
       if (!_androidStatus.isActive) return true;
@@ -1751,9 +1778,9 @@ class VpnCoreController {
     _statusSink = onStatus ?? _statusSink;
     _logSink = onLog ?? _logSink;
 
-    if (_isAndroid) {
+    if (isMobileNativeRuntime) {
       final running = await syncRuntimeState();
-      if (!running) {
+      if (!running && !(_isIOS && _androidStatus.isActive)) {
         await _stopAndroidNativeLogPolling(drain: true);
         _notifyStatus('Остановлено');
         return;
@@ -1762,7 +1789,9 @@ class VpnCoreController {
       const stopAttempts = 2;
       var stopped = false;
       for (var attempt = 1; attempt <= stopAttempts; attempt++) {
-        _logSink?.call('[DBG] Android stop attempt $attempt/$stopAttempts');
+        _logSink?.call(
+          '[DBG] $_nativePlatformLabel stop attempt $attempt/$stopAttempts',
+        );
         try {
           await _androidController.stopVpn();
         } catch (e) {
@@ -1778,7 +1807,7 @@ class VpnCoreController {
       if (stopped) {
         _notifyStatus('Остановлено');
       } else {
-        _notifyStatus('Android VPN сервис все еще активен');
+        _notifyStatus('$_nativePlatformLabel VPN сервис все еще активен');
       }
       return;
     }
@@ -1823,9 +1852,9 @@ class VpnCoreController {
 
   Future<void> forceTerminate() async {
     _connectionOperationEpoch++;
-    if (_isAndroid) {
+    if (isMobileNativeRuntime) {
       final running = await syncRuntimeState();
-      if (running) {
+      if (running || (_isIOS && _androidStatus.isActive)) {
         const stopAttempts = 2;
         for (var attempt = 1; attempt <= stopAttempts; attempt++) {
           try {
@@ -1990,7 +2019,7 @@ class VpnCoreController {
   }
 
   Future<TrafficSample?> fetchTrafficSample({bool useDelta = false}) async {
-    if (_isAndroid) {
+    if (isMobileNativeRuntime) {
       return _fetchAndroidTrafficSample(useDelta: useDelta);
     }
     if (!_isWindows) return null;
@@ -2303,7 +2332,7 @@ if (-not \$s) { exit 0 }
   }
 
   Future<void> startTrafficStream() async {
-    if (!_isWindows && !_isAndroid) return;
+    if (!_isWindows && !isMobileNativeRuntime) return;
     if (_trafficSamplingMode == TrafficSamplingMode.stopped) {
       _trafficSamplingMode = TrafficSamplingMode.foreground;
     }

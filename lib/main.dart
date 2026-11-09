@@ -6,6 +6,7 @@ import 'dart:ui';
 import 'package:device_apps/device_apps.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -44,6 +45,7 @@ import 'widgets/dpi_evasion_widget.dart';
 import 'widgets/animated_emoji.dart';
 import 'widgets/neural_background.dart';
 import 'widgets/neura_ui.dart';
+import 'widgets/neura_motion.dart';
 import 'widgets/loading_screen.dart';
 
 @visibleForTesting
@@ -480,6 +482,11 @@ class _VlessHomePageState extends State<VlessHomePage>
   late final AnimationController _connectGlowController;
   late final Animation<double> _connectGlowAnimation;
   late final AnimationController _frameAnimController;
+  // Unbounded spring impulse: the "pop" when the tunnel comes up.
+  late final AnimationController _connectPopController;
+  // Traffic samples arrive several times a second; only the graph and the
+  // throughput label listen, so the rest of the screen is not rebuilt.
+  final ValueNotifier<int> _trafficRevision = ValueNotifier<int>(0);
   bool _frameAnimForward = false;
   bool _mobileReduceMotion = false;
 
@@ -500,13 +507,9 @@ class _VlessHomePageState extends State<VlessHomePage>
       'assets/images/anim_disconnect_mobile/${i.toString().padLeft(4, '0')}.webp',
   ];
   List<String> get _activeConnectFrames =>
-      Platform.isAndroid || debugForceMobileShell
-      ? _mobileConnectFrames
-      : _connectFrames;
+      _isMobileShell ? _mobileConnectFrames : _connectFrames;
   List<String> get _activeDisconnectFrames =>
-      Platform.isAndroid || debugForceMobileShell
-      ? _mobileDisconnectFrames
-      : _disconnectFrames;
+      _isMobileShell ? _mobileDisconnectFrames : _disconnectFrames;
   bool _androidAppsLoaded = false;
   bool _androidAppsLoading = false;
   String? _androidAppLoadError;
@@ -717,6 +720,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool get _isDesktopPlatform =>
       (Platform.isWindows || Platform.isLinux || Platform.isMacOS) &&
       !debugForceMobileShell;
+  bool get _isMobileShell => !_isDesktopPlatform;
+  // Android and iOS both run the native VPN runtime over happycat.vpn/native.
+  bool get _usesNativeMobileVpn => Platform.isAndroid || Platform.isIOS;
   bool get _hasActivePreset =>
       _activePresetName != null &&
       _splitPresets.any((preset) => preset.name == _activePresetName);
@@ -842,6 +848,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       vsync: this,
       duration: const Duration(milliseconds: 1100),
     );
+    _connectPopController = AnimationController.unbounded(vsync: this);
     _updateConnectGlowTicker();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _precacheAnimationFrames(context);
@@ -849,7 +856,7 @@ class _VlessHomePageState extends State<VlessHomePage>
     if (_isWindowsShellPlatform) {
       _installWindowsLaunchHandler();
     }
-    if (Platform.isAndroid) {
+    if (_usesNativeMobileVpn) {
       _installAndroidLaunchHandler();
     }
     unawaited(_bootstrapInitialState());
@@ -858,7 +865,7 @@ class _VlessHomePageState extends State<VlessHomePage>
       const Duration(minutes: 10),
       (_) => unawaited(_refreshAllSubscriptions()),
     );
-    if (Platform.isAndroid) {
+    if (_usesNativeMobileVpn) {
       _androidStateSyncTimer = Timer.periodic(
         const Duration(seconds: 2),
         (_) => unawaited(_pollAndroidVpnState()),
@@ -899,7 +906,7 @@ class _VlessHomePageState extends State<VlessHomePage>
         (Platform.isAndroid || debugForceMobileShell)) {
       _scheduleAndroidPlayUpdatePrompt();
     }
-    if (state == AppLifecycleState.resumed && Platform.isAndroid) {
+    if (state == AppLifecycleState.resumed && _usesNativeMobileVpn) {
       unawaited(_pollAndroidVpnState());
       if (_isRunning) {
         unawaited(_vpnCoreController.refreshAndroidNetwork());
@@ -1798,7 +1805,7 @@ $regItems = foreach ($rp in $regPaths) {
                 child: SizedBox(
                   width: 18,
                   height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+                  child: CircularProgressIndicator.adaptive(strokeWidth: 2),
                 ),
               ),
           ],
@@ -1847,7 +1854,7 @@ $regItems = foreach ($rp in $regPaths) {
                 child: SizedBox(
                   width: 18,
                   height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+                  child: CircularProgressIndicator.adaptive(strokeWidth: 2),
                 ),
               ),
           ],
@@ -1930,7 +1937,9 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _updateConnectGlowTicker() {
-    final shouldAnimate = !_mobileReduceMotion && (_isConnecting || _isRunning);
+    // Animate only while connecting. A connected screen stays still: a
+    // per-frame pulse re-blurs the glass card behind it and drains battery.
+    final shouldAnimate = !_mobileReduceMotion && _isConnecting;
     if (shouldAnimate) {
       if (!_connectGlowController.isAnimating) {
         _connectGlowController.repeat();
@@ -1968,17 +1977,14 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   void _precacheAnimationFrames(BuildContext context) {
-    if (Platform.isAndroid || debugForceMobileShell) return;
-    for (final path in _connectFrames) {
-      precacheImage(AssetImage(path), context);
-    }
-    for (final path in _disconnectFrames) {
+    // Decode the frames that will play, so the first tap never stutters.
+    for (final path in [..._activeConnectFrames, ..._activeDisconnectFrames]) {
       precacheImage(AssetImage(path), context);
     }
   }
 
   void _startTrafficMonitor() {
-    if (!Platform.isWindows && !Platform.isAndroid) return;
+    if (!Platform.isWindows && !_usesNativeMobileVpn) return;
     if (_trafficSub != null) return;
     if (_trafficHistory.isEmpty) {
       _trafficHistory.addAll(List<double>.filled(20, 0));
@@ -1989,25 +1995,24 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_syncTrafficSamplingMode());
     _trafficSub = _vpnCoreController.trafficSampleStream.listen((sample) {
       if (!mounted) return;
-      setState(() {
-        _appendTrafficTransition(
-          _trafficHistory,
-          sample.totalBps.toDouble(),
-          steps: _trafficGraphInterpolationSteps,
-        );
-        _appendTrafficTransition(
-          _trafficUplinkHistory,
-          sample.uplinkBps.toDouble(),
-          steps: _trafficGraphInterpolationSteps,
-        );
-        _appendTrafficTransition(
-          _trafficDownlinkHistory,
-          sample.downlinkBps.toDouble(),
-          steps: _trafficGraphInterpolationSteps,
-        );
-        _latestUplinkBps = sample.uplinkBps;
-        _latestDownlinkBps = sample.downlinkBps;
-      });
+      _appendTrafficTransition(
+        _trafficHistory,
+        sample.totalBps.toDouble(),
+        steps: _trafficGraphInterpolationSteps,
+      );
+      _appendTrafficTransition(
+        _trafficUplinkHistory,
+        sample.uplinkBps.toDouble(),
+        steps: _trafficGraphInterpolationSteps,
+      );
+      _appendTrafficTransition(
+        _trafficDownlinkHistory,
+        sample.downlinkBps.toDouble(),
+        steps: _trafficGraphInterpolationSteps,
+      );
+      _latestUplinkBps = sample.uplinkBps;
+      _latestDownlinkBps = sample.downlinkBps;
+      _trafficRevision.value++;
     });
   }
 
@@ -2053,6 +2058,7 @@ $regItems = foreach ($rp in $regPaths) {
     _trafficDownlinkHistory.clear();
     _latestUplinkBps = 0;
     _latestDownlinkBps = 0;
+    if (mounted) _trafficRevision.value++;
     await _vpnCoreController.stopTrafficStream();
     if (_isWindowsShellPlatform) {
       // Даем немного времени для полной остановки Windows traffic stream.
@@ -2104,7 +2110,7 @@ $regItems = foreach ($rp in $regPaths) {
     bool splitEnabled = prefs.getBool(_splitToggleKey) ?? false;
     _smartRouting = prefs.containsKey(_smartRoutingKey)
         ? (prefs.getBool(_smartRoutingKey) ?? false)
-        : Platform.isAndroid;
+        : _usesNativeMobileVpn;
     unawaited(
       _smartRouteEngine.ensureBundledWhitelistLoaded().catchError((_) => 0),
     );
@@ -2363,7 +2369,7 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _handleInitialAndroidLaunchUri() async {
-    if (!Platform.isAndroid || _initialAndroidLaunchUriHandled) {
+    if (!_usesNativeMobileVpn || _initialAndroidLaunchUriHandled) {
       return;
     }
     _initialAndroidLaunchUriHandled = true;
@@ -2585,12 +2591,12 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _maybeHotReloadWindowsRules({
     SplitTunnelConfig? previousConfig,
   }) async {
-    if (!Platform.isWindows && !Platform.isAndroid) return;
+    if (!Platform.isWindows && !_usesNativeMobileVpn) return;
     if (!_isRunning || _isConnecting || _isDisconnecting) return;
 
-    // Android: any split tunnel change requires a full reconnect because
-    // VpnService.Builder rules are immutable after establish().
-    if (Platform.isAndroid) {
+    // Android/iOS: any split tunnel change requires a full reconnect because
+    // the tunnel's routing rules are immutable once it is established.
+    if (_usesNativeMobileVpn) {
       if (previousConfig == null) return;
       final nextConfig = _configForConnection;
       if (!_requiresWindowsSessionResetForRuleChange(
@@ -2736,6 +2742,7 @@ $regItems = foreach ($rp in $regPaths) {
   void _changeSplitMode(String mode) {
     final normalized = _normalizeSplitMode(mode);
     if (_splitMode == normalized) return;
+    NeuraHaptics.selection();
     final previousConfig = _configForConnection;
     final current = _activeSplitConfig;
     final hadPreset = _hasActivePreset;
@@ -3739,6 +3746,7 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _onProfileSelected(VpnProfile profile) async {
     if (_isConnecting || _isDisconnecting || _isSwitchingProfile) return;
     if (_selectedProfile?.uri == profile.uri) return;
+    NeuraHaptics.selection();
 
     // Keep the desktop release behavior unchanged in this Android update.
     if (_isDesktopPlatform) {
@@ -3804,7 +3812,7 @@ $regItems = foreach ($rp in $regPaths) {
 
     var connectionEpoch = 0;
     try {
-      if (Platform.isAndroid) {
+      if (_usesNativeMobileVpn) {
         await _vpnCoreController.syncRuntimeState();
       }
 
@@ -3868,6 +3876,7 @@ $regItems = foreach ($rp in $regPaths) {
         } else {
           _showFastSnack(errorMsg);
         }
+        NeuraHaptics.error();
 
         setState(() {
           _status =
@@ -3889,6 +3898,8 @@ $regItems = foreach ($rp in $regPaths) {
             '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e';
         _isConnecting = false;
       });
+      NeuraHaptics.success();
+      _playConnectPop();
       unawaited(_updateTrayMenu());
       _updateConnectGlowTicker();
       _updateFrameAnimation();
@@ -3904,6 +3915,7 @@ $regItems = foreach ($rp in $regPaths) {
           (connectionEpoch != 0 && connectionEpoch != _connectionUiEpoch)) {
         return;
       }
+      NeuraHaptics.error();
       setState(() {
         _status =
             '\u041e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e';
@@ -3936,16 +3948,27 @@ $regItems = foreach ($rp in $regPaths) {
     }
 
     if (isRunning) {
+      NeuraHaptics.play(NeuraHaptic.soft);
       unawaited(_stop());
       return;
     }
 
     if (!isEnabled) {
+      NeuraHaptics.warning();
       _showFastSnack('Выберите подписку для подключения');
       return;
     }
 
+    NeuraHaptics.play(NeuraHaptic.rigid);
     unawaited(_start());
+  }
+
+  /// One spring impulse: the button swells and settles when the tunnel is up.
+  void _playConnectPop() {
+    if (_mobileReduceMotion) return;
+    _connectPopController.animateWith(
+      SpringSimulation(NeuraMotion.bouncy, 0, 0, 2.4),
+    );
   }
 
   String _connectButtonTooltip({
@@ -3966,9 +3989,7 @@ $regItems = foreach ($rp in $regPaths) {
 
   void _openConnectQuickActions() {
     if (_connectQuickActionsOpen) return;
-    if (Platform.isAndroid) {
-      unawaited(HapticFeedback.mediumImpact());
-    }
+    NeuraHaptics.medium();
     setState(() {
       _connectQuickActionsOpen = true;
       _connectButtonPressed = true;
@@ -3992,19 +4013,17 @@ $regItems = foreach ($rp in $regPaths) {
     }
     if (_connectQuickActionHover == nextAction) return;
     setState(() => _connectQuickActionHover = nextAction);
-    if (Platform.isAndroid && nextAction != null) {
-      unawaited(HapticFeedback.selectionClick());
-    }
+    if (nextAction != null) NeuraHaptics.selection();
   }
 
   void _commitConnectQuickAction() {
     final action = _connectQuickActionHover;
     if (action == 'routing') {
       unawaited(_setSmartRouting(!_smartRouting));
-      unawaited(HapticFeedback.lightImpact());
+      NeuraHaptics.light();
     } else if (action == 'settings') {
       _setWindowsView(_WindowsView.settings);
-      unawaited(HapticFeedback.lightImpact());
+      NeuraHaptics.light();
     }
     _closeConnectQuickActions();
   }
@@ -4039,7 +4058,7 @@ $regItems = foreach ($rp in $regPaths) {
     if (_isDisconnecting) return;
     final stopEpoch = ++_connectionUiEpoch;
     final wasConnecting = _isConnecting;
-    if (Platform.isAndroid && !_isRunning) {
+    if (_usesNativeMobileVpn && !_isRunning) {
       await _vpnCoreController.syncRuntimeState();
     }
     if (!_isRunning && !wasConnecting) return;
@@ -4068,7 +4087,7 @@ $regItems = foreach ($rp in $regPaths) {
       onLog: (line) => _appendLogs([line]),
     );
 
-    final androidStillRunning = Platform.isAndroid
+    final androidStillRunning = _usesNativeMobileVpn
         ? await _vpnCoreController.syncRuntimeState()
         : false;
 
@@ -4174,7 +4193,7 @@ $regItems = foreach ($rp in $regPaths) {
     var logText = _logLines.isEmpty
         ? 'Лог пуст. Подключитесь к VPN для просмотра сообщений.'
         : _logLines.join('\n');
-    if (Platform.isAndroid) {
+    if (_usesNativeMobileVpn) {
       final nativeLog = await _vpnCoreController.getAndroidNativeDebugLog();
       if (nativeLog.trim().isNotEmpty) {
         logText = logText.trim().isEmpty || logText.startsWith('Лог пуст.')
@@ -4329,11 +4348,12 @@ $regItems = foreach ($rp in $regPaths) {
     if (_isWindowsShellPlatform) {
       _windowsLaunchChannel.setMethodCallHandler(null);
     }
-    if (Platform.isAndroid) {
+    if (_usesNativeMobileVpn) {
       _androidLaunchChannel.setMethodCallHandler(null);
     }
     _connectGlowController.dispose();
     _frameAnimController.dispose();
+    _connectPopController.dispose();
     _windowsPageController.dispose();
     _controller.dispose();
     _logScrollController.dispose();
@@ -4349,6 +4369,8 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_stopTrafficMonitor());
     unawaited(_vpnCoreController.dispose());
     unawaited(_dpiEvasionManager.stopNativeInjector());
+    // After _stopTrafficMonitor: its synchronous part still notifies.
+    _trafficRevision.dispose();
     super.dispose();
   }
 
@@ -4365,142 +4387,154 @@ $regItems = foreach ($rp in $regPaths) {
     final media = MediaQuery.of(context);
     final compact = media.size.width < 360;
     final horizontalPadding = compact ? 10.0 : 16.0;
-    return Scaffold(
-      backgroundColor: _neuraBlack,
-      body: Stack(
-        children: [
-          const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
-          if (!kReleaseMode && !media.disableAnimations)
-            const Positioned.fill(child: NeuralBackground())
-          else
-            const Positioned.fill(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      Color(0xFF0A0A0A),
-                      Color(0xFF141018),
-                      Color(0xFF0A0A0A),
+    // Dark UI: light status bar icons (iOS would otherwise draw black ones).
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light,
+      child: Scaffold(
+        backgroundColor: _neuraBlack,
+        body: Stack(
+          children: [
+            const Positioned.fill(child: ColoredBox(color: _neuraBlack)),
+            if (!kReleaseMode && !media.disableAnimations)
+              const Positioned.fill(child: NeuralBackground())
+            else
+              const Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        Color(0xFF0A0A0A),
+                        Color(0xFF141018),
+                        Color(0xFF0A0A0A),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            SafeArea(
+              child: Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 720),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          horizontalPadding,
+                          8,
+                          horizontalPadding,
+                          6,
+                        ),
+                        child: NeuraReveal(
+                          child: NeuraGlassSurface(
+                            expand: true,
+                            borderRadius: 22,
+                            blur: 22,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
+                            ),
+                            child: Row(
+                              children: [
+                                SizedBox(
+                                  width: 38,
+                                  height: 38,
+                                  child: Image.asset(
+                                    'assets/images/11zon_cropped.png',
+                                    fit: BoxFit.contain,
+                                    filterQuality: FilterQuality.high,
+                                  ),
+                                ),
+                                const SizedBox(width: 10),
+                                const Expanded(
+                                  child: Align(
+                                    alignment: Alignment.centerLeft,
+                                    child: FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      child: Text(
+                                        'neuravpn',
+                                        maxLines: 1,
+                                        style: TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.w700,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                NeuraGlassPill(
+                                  active: _isRunning,
+                                  child: Text(
+                                    _isRunning ? 'Подключено' : 'Отключено',
+                                    style: TextStyle(
+                                      color: _isRunning
+                                          ? _neuraRed
+                                          : Colors.white70,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (hasConnectable)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                          child: _buildWindowsTabs(),
+                        ),
+                      Expanded(
+                        child: hasConnectable
+                            ? PageView(
+                                controller: _windowsPageController,
+                                physics: const PageScrollPhysics(
+                                  parent: BouncingScrollPhysics(),
+                                ),
+                                allowImplicitScrolling: true,
+                                onPageChanged: (index) {
+                                  final view = _windowsViewAt(index);
+                                  if (_windowsView != view) {
+                                    NeuraHaptics.selection();
+                                    setState(() => _windowsView = view);
+                                  }
+                                  if (Platform.isAndroid &&
+                                      view == _WindowsView.splitTunneling) {
+                                    unawaited(_loadAndroidApps());
+                                  }
+                                },
+                                children: [
+                                  _buildMobileNeuraPage(
+                                    _buildWindowsConnectionView(),
+                                  ),
+                                  _buildMobileNeuraPage(
+                                    _buildWindowsSplitView(),
+                                  ),
+                                  _buildMobileSettingsTab(),
+                                ],
+                              )
+                            : SingleChildScrollView(
+                                padding: const EdgeInsets.fromLTRB(
+                                  16,
+                                  8,
+                                  16,
+                                  16,
+                                ),
+                                child: _buildWindowsEmptyState(),
+                              ),
+                      ),
                     ],
                   ),
                 ),
               ),
             ),
-          SafeArea(
-            child: Align(
-              alignment: Alignment.topCenter,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 720),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: EdgeInsets.fromLTRB(
-                        horizontalPadding,
-                        8,
-                        horizontalPadding,
-                        6,
-                      ),
-                      child: NeuraReveal(
-                        child: NeuraGlassSurface(
-                          expand: true,
-                          borderRadius: 22,
-                          blur: 22,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 10,
-                          ),
-                          child: Row(
-                            children: [
-                              SizedBox(
-                                width: 38,
-                                height: 38,
-                                child: Image.asset(
-                                  'assets/images/11zon_cropped.png',
-                                  fit: BoxFit.contain,
-                                  filterQuality: FilterQuality.high,
-                                ),
-                              ),
-                              const SizedBox(width: 10),
-                              const Expanded(
-                                child: Align(
-                                  alignment: Alignment.centerLeft,
-                                  child: FittedBox(
-                                    fit: BoxFit.scaleDown,
-                                    child: Text(
-                                      'neuravpn',
-                                      maxLines: 1,
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 18,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              NeuraGlassPill(
-                                active: _isRunning,
-                                child: Text(
-                                  _isRunning ? 'Подключено' : 'Отключено',
-                                  style: TextStyle(
-                                    color: _isRunning
-                                        ? _neuraRed
-                                        : Colors.white70,
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (hasConnectable)
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                        child: _buildWindowsTabs(),
-                      ),
-                    Expanded(
-                      child: hasConnectable
-                          ? PageView(
-                              controller: _windowsPageController,
-                              physics: const PageScrollPhysics(
-                                parent: BouncingScrollPhysics(),
-                              ),
-                              allowImplicitScrolling: true,
-                              onPageChanged: (index) {
-                                final view = _windowsViewAt(index);
-                                if (_windowsView != view) {
-                                  setState(() => _windowsView = view);
-                                }
-                                if (Platform.isAndroid &&
-                                    view == _WindowsView.splitTunneling) {
-                                  unawaited(_loadAndroidApps());
-                                }
-                              },
-                              children: [
-                                _buildMobileNeuraPage(
-                                  _buildWindowsConnectionView(),
-                                ),
-                                _buildMobileNeuraPage(_buildWindowsSplitView()),
-                                _buildMobileSettingsTab(),
-                              ],
-                            )
-                          : SingleChildScrollView(
-                              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                              child: _buildWindowsEmptyState(),
-                            ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -5541,8 +5575,6 @@ $regItems = foreach ($rp in $regPaths) {
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
     final canRefreshMetrics = _selectedProfile != null && !_pingInProgress;
-    final throughputLabel =
-        'IN ${_formatThroughput(_latestDownlinkBps)}  •  OUT ${_formatThroughput(_latestUplinkBps)}';
     final connectButtonTooltip = _connectButtonTooltip(
       isEnabled: isEnabled,
       isRunning: isRunning,
@@ -5557,17 +5589,24 @@ $regItems = foreach ($rp in $regPaths) {
                 borderRadius: BorderRadius.circular(20),
                 child: Stack(
                   children: [
-                    CustomPaint(
-                      painter: _TrafficGraphPainter(
-                        uplinkSamples: List<double>.from(_trafficUplinkHistory),
-                        downlinkSamples: List<double>.from(
-                          _trafficDownlinkHistory,
+                    RepaintBoundary(
+                      child: ValueListenableBuilder<int>(
+                        valueListenable: _trafficRevision,
+                        builder: (context, _, __) => CustomPaint(
+                          painter: _TrafficGraphPainter(
+                            uplinkSamples: List<double>.from(
+                              _trafficUplinkHistory,
+                            ),
+                            downlinkSamples: List<double>.from(
+                              _trafficDownlinkHistory,
+                            ),
+                            progress: _connectGlowAnimation.value,
+                            color: _neuraRed,
+                            emphasizeBackground: true,
+                          ),
+                          child: const SizedBox.expand(),
                         ),
-                        progress: _connectGlowAnimation.value,
-                        color: _neuraRed,
-                        emphasizeBackground: true,
                       ),
-                      child: const SizedBox.expand(),
                     ),
                     DecoratedBox(
                       decoration: BoxDecoration(
@@ -5748,21 +5787,23 @@ $regItems = foreach ($rp in $regPaths) {
                                 )
                               : null,
                           child: AnimatedBuilder(
-                            animation: _connectGlowAnimation,
+                            animation: Listenable.merge([
+                              _connectGlowAnimation,
+                              _connectPopController,
+                            ]),
                             builder: (context, child) {
                               final rotation =
                                   _connectGlowAnimation.value * 2 * math.pi;
-                              final interactionScale = _connectButtonPressed
-                                  ? (Platform.isAndroid ? 0.96 : 0.95)
+                              final interactionTarget = _connectButtonPressed
+                                  ? 0.93
                                   : (_connectButtonHovered ||
                                         _connectButtonFocused)
                                   ? 1.04
                                   : 1.0;
                               final pulse = _isConnecting
                                   ? 1 + 0.03 * math.sin(rotation)
-                                  : (isRunning
-                                        ? 1 + 0.012 * math.sin(rotation)
-                                        : 1.0);
+                                  : 1.0;
+                              final pop = 1 + 0.3 * _connectPopController.value;
                               final ring = Container(
                                 width: 140,
                                 height: 140,
@@ -5778,8 +5819,15 @@ $regItems = foreach ($rp in $regPaths) {
                                 opacity: canInteract && (isEnabled || isRunning)
                                     ? 1
                                     : 0.5,
-                                child: Transform.scale(
-                                  scale: pulse * interactionScale,
+                                // Spring keeps the finger's momentum: press
+                                // sinks, release overshoots slightly.
+                                child: NeuraSpringValue(
+                                  value: interactionTarget,
+                                  builder: (context, interactionScale, child) =>
+                                      Transform.scale(
+                                        scale: pulse * interactionScale * pop,
+                                        child: child,
+                                      ),
                                   child: Stack(
                                     alignment: Alignment.center,
                                     children: [
@@ -5882,7 +5930,10 @@ $regItems = foreach ($rp in $regPaths) {
                                         ),
                                         child: Center(
                                           child: AnimatedScale(
-                                            duration: NeuraUi.fast,
+                                            duration: NeuraMotion.curveDuration(
+                                              NeuraUi.normal,
+                                            ),
+                                            curve: NeuraMotion.snappyCurve,
                                             scale: _connectButtonPressed
                                                 ? 0.92
                                                 : 1.0,
@@ -5922,10 +5973,7 @@ $regItems = foreach ($rp in $regPaths) {
                                                     framePath,
                                                     width: 48,
                                                     height: 48,
-                                                    cacheWidth:
-                                                        Platform.isAndroid
-                                                        ? 96
-                                                        : null,
+                                                    // 160 px frames stay sharp at 3x.
                                                     filterQuality:
                                                         FilterQuality.high,
                                                     gaplessPlayback: true,
@@ -5984,21 +6032,20 @@ $regItems = foreach ($rp in $regPaths) {
                 ),
               ),
               const SizedBox(height: 8),
-              AnimatedSwitcher(
-                duration: NeuraUi.fast,
-                switchInCurve: NeuraUi.curve,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (child, animation) =>
-                    FadeTransition(opacity: animation, child: child),
-                child: Text(
-                  throughputLabel,
-                  key: ValueKey(throughputLabel),
+              // Tabular digits keep the label from jittering as speeds change;
+              // a cross-fade per sample would only smear the numbers.
+              ValueListenableBuilder<int>(
+                valueListenable: _trafficRevision,
+                builder: (context, _, __) => Text(
+                  'IN ${_formatThroughput(_latestDownlinkBps)}  •  '
+                  'OUT ${_formatThroughput(_latestUplinkBps)}',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                     color: Colors.white.withOpacity(0.62),
                     fontSize: 11,
                     fontWeight: FontWeight.w600,
                     letterSpacing: 0.2,
+                    fontFeatures: const [FontFeature.tabularFigures()],
                   ),
                 ),
               ),
@@ -6572,28 +6619,31 @@ $regItems = foreach ($rp in $regPaths) {
                         ),
                         onRemove: _removeDomainEntry,
                       ),
-                      const SizedBox(height: 16),
-                      _buildSplitEntrySection(
-                        title: 'Приложения',
-                        icon: Icons.apps_outlined,
-                        items: activeApps,
-                        emptyLabel: 'Приложения не добавлены.',
-                        onAdd: Platform.isWindows
-                            ? _showWindowsAppPicker
-                            : (Platform.isAndroid
-                                  ? _showAndroidAppPicker
-                                  : () => _promptAddEntry(
-                                      title: 'Добавить приложение',
-                                      hint: 'com.example.app',
-                                      onSubmit: _addApplication,
-                                    )),
-                        onRemove: _removeApplication,
-                        labelBuilder: _describeApplicationEntry,
-                        subtitleBuilder: (value) =>
-                            _windowsAppLabels.containsKey(value) ? value : '',
-                        leadingBuilder: (value) =>
-                            _buildWindowsAppIcon(value, size: 18),
-                      ),
+                      // iOS has no per-app tunnelling for VPN apps.
+                      if (!Platform.isIOS) ...[
+                        const SizedBox(height: 16),
+                        _buildSplitEntrySection(
+                          title: 'Приложения',
+                          icon: Icons.apps_outlined,
+                          items: activeApps,
+                          emptyLabel: 'Приложения не добавлены.',
+                          onAdd: Platform.isWindows
+                              ? _showWindowsAppPicker
+                              : (Platform.isAndroid
+                                    ? _showAndroidAppPicker
+                                    : () => _promptAddEntry(
+                                        title: 'Добавить приложение',
+                                        hint: 'com.example.app',
+                                        onSubmit: _addApplication,
+                                      )),
+                          onRemove: _removeApplication,
+                          labelBuilder: _describeApplicationEntry,
+                          subtitleBuilder: (value) =>
+                              _windowsAppLabels.containsKey(value) ? value : '',
+                          leadingBuilder: (value) =>
+                              _buildWindowsAppIcon(value, size: 18),
+                        ),
+                      ],
                     ],
                   )
                 : const SizedBox.shrink(),
