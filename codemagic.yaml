@@ -1,0 +1,48 @@
+# Unsigned iOS build on Codemagic. Mirrors .github/workflows/ios.yml; both
+# call the same ios/scripts/*.sh, so keep version pins in sync with it.
+workflows:
+  ios-unsigned:
+    name: iOS unsigned build
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: 3.38.3
+      xcode: latest
+      cocoapods: default
+      vars:
+        LIBXRAY_VERSION: v26.7.28
+        LIBXRAY_SHA256: 07f7ed7697277930e1c517755855950f594f41435b0dfc5917a66eea6278aeb9
+        HEV_VERSION: 2.19.3
+        HEV_SHA256: 8aaa33b344cab03a5cfc3675b9aaae55c6ee6088d78678ad1fbb44855b5ba570
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: feature/ios-client
+        - pattern: master
+      cancel_previous_builds: true
+    scripts:
+      - name: Resolve Flutter dependencies
+        script: flutter pub get
+      - name: Verify iOS project structure
+        script: python3 ios/scripts/validate_project.py
+      - name: Fetch verified libXray and build verified HEV Apple libraries
+        script: bash ios/scripts/prepare_native.sh
+      - name: Install CocoaPods dependencies
+        script: cd ios && pod install
+      - name: Check native target and Swift syntax
+        script: |
+          xcodebuild -list -project ios/Runner.xcodeproj
+          xcrun swiftc -frontend -parse ios/Shared/*.swift ios/PacketTunnel/*.swift ios/Runner/*.swift
+      - name: Test native Dart services
+        script: >-
+          flutter test test/android_vpn_controller_test.dart
+          test/ios_native_runtime_test.dart test/ios_xray_config_test.dart
+          test/xray_config_generator_test.dart
+      - name: Build and package unsigned IPA
+        script: bash ios/scripts/build_unsigned_ipa.sh
+    artifacts:
+      - build/ios/neuravpn-unsigned.ipa
+      - ios/Runner/Runner.entitlements
+      - ios/PacketTunnel/PacketTunnel.entitlements
+      - ios/IOS_ARCHITECTURE.md

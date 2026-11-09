@@ -48,31 +48,8 @@ jobs:
           flutter test test/android_vpn_controller_test.dart
           test/ios_native_runtime_test.dart test/ios_xray_config_test.dart
           test/xray_config_generator_test.dart
-      - name: Build unsigned iOS app and extension
-        run: |
-          cat > "$RUNNER_TEMP/neuravpn-unsigned.xcconfig" <<'CONFIG'
-          CODE_SIGNING_ALLOWED = NO
-          CODE_SIGNING_REQUIRED = NO
-          CODE_SIGN_IDENTITY =
-          DEVELOPMENT_TEAM =
-          CONFIG
-          export XCODE_XCCONFIG_FILE="$RUNNER_TEMP/neuravpn-unsigned.xcconfig"
-          flutter build ios --release --no-codesign
-      - name: Package unsigned IPA
-        run: |
-          app=build/ios/iphoneos/Runner.app
-          test -f "$app/PlugIns/PacketTunnel.appex/PacketTunnel"
-          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Info.plist")" = com.neuravpn.app
-          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/PlugIns/PacketTunnel.appex/Info.plist")" = com.neuravpn.app.PacketTunnel
-          test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$app/Info.plist")" = "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$app/PlugIns/PacketTunnel.appex/Info.plist")"
-          if find "$app/PlugIns/PacketTunnel.appex" -iname '*.dat' -o -name 'Flutter.framework' | grep -q .; then
-            echo 'Unexpected Flutter/geo assets in the extension' >&2
-            exit 1
-          fi
-          mkdir -p build/ios/unsigned/Payload
-          ditto "$app" build/ios/unsigned/Payload/Runner.app
-          cd build/ios/unsigned
-          /usr/bin/zip -q -r -y ../neuravpn-unsigned.ipa Payload
+      - name: Build and package unsigned IPA
+        run: bash ios/scripts/build_unsigned_ipa.sh
       - uses: actions/upload-artifact@v4
         with:
           name: neuravpn-ios-unsigned

@@ -33,6 +33,8 @@ pinned Apple archive and HEV's Apple build use iOS 15.0. No Dart dependency or
 | `scripts/validate_project.py` | Portable OpenStep parser, ID/reference/target/plist checks |
 | `.gitignore` | Excludes native binaries, download cache and iOS build output |
 | `../.github/workflows/ios.yml` | macOS unsigned build, IPA packaging and artifact upload |
+| `scripts/build_unsigned_ipa.sh` | Unsigned app + extension build, bundle checks, IPA packaging (shared by both CI services) |
+| `../codemagic.yaml` | Same unsigned build on Codemagic (`ios-unsigned` workflow) |
 | `../lib/services/android_vpn_controller.dart` | Historical Dart bridge now supports Android and iOS |
 | `../lib/services/vpn_core_controller.dart` | Shared native runtime gating and `isMobileNativeRuntime` getter |
 | `../lib/vless/config_generator.dart` | Additive `generateIOSXrayConfig`; Android generator is unchanged |
@@ -196,8 +198,9 @@ QUIC, XHTTP and many simultaneous sockets need signed-device memory profiling.
 ## CI and unsigned artifact
 
 `../.github/workflows/ios.yml` runs on `macos-15` for pushes to `feature/ios-client`
-and `master`, or `workflow_dispatch`. Flutter is pinned to **3.38.3**, and Actions
-are pinned by commit. No Apple account, certificate, profile or team ID is needed
+and `master`, or `workflow_dispatch`. `../codemagic.yaml` runs the same steps on a
+Codemagic Mac mini M2; both call `scripts/build_unsigned_ipa.sh`, so keep the version
+pins in the two files equal. Flutter is pinned to **3.38.3**. No Apple account, certificate, profile or team ID is needed
 for the compile/package job.
 
 The workflow embeds these SHA-256 values and the download script checks them
