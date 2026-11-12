@@ -49,11 +49,17 @@ class AndroidProfileCheckBackend extends ProfileCheckBackend {
       );
     }
     // Reuse the real client's transport settings, but never its routing bypasses.
-    final generated =
-        jsonDecode(generateAndroidXrayConfig(link, SplitTunnelConfig())) as Map;
-    final config = jsonEncode({
-      'outbounds': [(generated['outbounds'] as List).first],
-    });
+    final String config;
+    if (link is XrayProfile) {
+      config = jsonEncode({...link.config, 'fullProfile': true});
+    } else {
+      final generated = jsonDecode(
+        generateAndroidXrayConfig(link, SplitTunnelConfig()),
+      ) as Map;
+      config = jsonEncode({
+        'outbounds': [(generated['outbounds'] as List).first],
+      });
+    }
     final result = await _channel.invokeMapMethod<String, dynamic>('check', {
       'config': config,
     });

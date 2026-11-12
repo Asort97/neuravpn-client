@@ -61,7 +61,7 @@ class VpnSubscription {
       profiles: profiles ?? this.profiles,
       selectedIndex: selectedIndex ?? this.selectedIndex,
       lastUpdated: lastUpdated ?? this.lastUpdated,
-      error: error ?? this.error,
+      error: error ?? (profiles != null ? null : this.error),
     );
   }
 

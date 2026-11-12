@@ -211,6 +211,10 @@ class VpnCoreController {
   void Function(String log)? _logSink;
 
   ProxyLink? get parsedLink => _parsedLink;
+
+  Future<void> forgetSavedMobileConfig() async {
+    if (_isAndroid) await _androidController.forgetSavedConfig();
+  }
   File? get configFile => _configFile;
   String? get generatedConfig => _generatedConfig;
   int get clashApiPort => _windowsCoreAdapter.apiPort;
@@ -629,7 +633,9 @@ class VpnCoreController {
     List<Map<String, dynamic>>? dnsServers;
     String? dnsFinalTag;
     final useSmartEngineRules =
-        smartRouteEngine != null && splitConfig.smartRouting;
+        parsed is! XrayProfile &&
+        smartRouteEngine != null &&
+        splitConfig.smartRouting;
     if (useSmartEngineRules) {
       await _ensureSmartRouteWhitelistLoaded(smartRouteEngine, onLog: onLog);
       extraRouteRules.addAll(
@@ -829,7 +835,7 @@ class VpnCoreController {
       return VpnCoreStartResult.failure(sanityError);
     }
 
-    var useHybridBackend = _useWindowsHybridTun;
+    var useHybridBackend = _useWindowsHybridTun || parsed is XrayProfile;
     String? singBoxExePath;
     if (useHybridBackend) {
       _notifyStatus('Подготовка TUN backend');
@@ -957,7 +963,9 @@ class VpnCoreController {
       }
 
       _activeInterfaceName = plan.interfaceName;
-      _activeWindowsInboundTag = hybridBackend ? 'socks-in' : plan.inboundTag;
+      _activeWindowsInboundTag = parsed is XrayProfile
+          ? parsed.primaryInboundTag
+          : (hybridBackend ? 'socks-in' : plan.inboundTag);
       _sessionInterfaces[token] = plan.interfaceName;
       await _sessionStore.markDirty(
         interfaceName: plan.interfaceName,
@@ -987,10 +995,12 @@ class VpnCoreController {
         );
         continue;
       }
-      final endpoint = await _measureConnectPhase(
-        'endpoint_resolve',
-        () => _resolveWindowsEndpoint(parsed.host),
-      );
+      final endpoint = parsed is XrayProfile
+          ? _WindowsEndpointResolution(routeHost: parsed.host)
+          : await _measureConnectPhase(
+              'endpoint_resolve',
+              () => _resolveWindowsEndpoint(parsed.host),
+            );
       if (!_isConnectionOperationCurrent(connectionOperation)) {
         return _cancelWindowsAttempt(token);
       }
@@ -1074,6 +1084,7 @@ class VpnCoreController {
           interfaceName: plan.interfaceName,
           addresses: plan.addresses,
           logLevel: developerMode ? 'debug' : 'info',
+          useProfileDns: parsed is XrayProfile,
         );
         await _measureConnectPhase(
           'singbox_config_write',
@@ -1087,7 +1098,11 @@ class VpnCoreController {
       _notifyStatus('Проверка конфигурации');
       final configValidationError = await _measureConnectPhase(
         'config_validate',
-        () => _validateWindowsConfig(resolvedExePath, cfgFile),
+        () => _validateWindowsConfig(
+          resolvedExePath,
+          cfgFile,
+          hideDetails: parsed is XrayProfile,
+        ),
       );
       if (!_isConnectionOperationCurrent(connectionOperation)) {
         return _cancelWindowsAttempt(token);
@@ -1596,8 +1611,9 @@ class VpnCoreController {
 
   Future<String?> _validateWindowsConfig(
     String executablePath,
-    File configFile,
-  ) async {
+    File configFile, {
+    bool hideDetails = false,
+  }) async {
     try {
       final result = await _runMeasuredProcess(executablePath, [
         'run',
@@ -1606,12 +1622,14 @@ class VpnCoreController {
         configFile.path,
       ]);
       if (result.exitCode == 0) return null;
+      if (hideDetails) return 'Конфигурация подписки не прошла проверку Xray';
       final details = '${result.stderr}\n${result.stdout}'.trim();
       final compact = details.replaceAll(RegExp(r'\s+'), ' ');
       return compact.isEmpty
           ? 'Конфигурация Xray не прошла проверку'
           : 'Конфигурация Xray не прошла проверку: $compact';
     } catch (e) {
+      if (hideDetails) return 'Не удалось проверить конфигурацию подписки';
       return 'Не удалось проверить конфигурацию Xray: $e';
     }
   }
@@ -1667,7 +1685,8 @@ class VpnCoreController {
     DpiEvasionConfig dpiEvasionConfig = DpiEvasionConfig.balanced,
     void Function(String log)? onLog,
   }) async {
-    if (!_isWindows || _process == null || _parsedLink == null) {
+    if (!_isWindows || _process == null || _parsedLink == null ||
+        _parsedLink is XrayProfile) {
       return false;
     }
 

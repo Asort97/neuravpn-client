@@ -103,10 +103,15 @@ class SubscriptionRequestIdentity {
     return Map.unmodifiable({
       'X-HWID': id,
       'X-Device-OS': os.isEmpty ? _platformName : os,
+      'X-Ver-OS': _headerValue(
+        device['osVersion'] as String? ?? Platform.operatingSystemVersion,
+      ),
       'X-Device-Model': model.isEmpty ? 'Unknown' : model,
       'User-Agent':
           'NeuraVPN/$version ($os; build ${_headerValue(info.buildNumber)})',
-      'Accept': '*/*',
+      'Accept': os == 'Android' || os == 'Windows'
+          ? 'application/vnd.neuravpn.xray+json'
+          : '*/*',
     });
   }
 

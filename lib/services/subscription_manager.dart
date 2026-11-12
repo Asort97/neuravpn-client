@@ -18,6 +18,11 @@ class SubscriptionDeviceLimitException extends SubscriptionFetchException {
   const SubscriptionDeviceLimitException(super.message);
 }
 
+class SubscriptionDeviceRevokedException
+    extends SubscriptionDeviceLimitException {
+  const SubscriptionDeviceRevokedException(super.message);
+}
+
 class SubscriptionService {
   final http.Client _client;
   final Duration _timeout;
@@ -62,6 +67,15 @@ class SubscriptionService {
       final response = await _fetchResponse(uri, headers);
       // A limit response may deliberately contain a syntactically valid dummy URI.
       // Check the headers before HTTP status, decoding or updating saved profiles.
+      if (_header(response, 'x-neura-device-revoked')?.trim().toLowerCase() ==
+          'true') {
+        throw SubscriptionDeviceRevokedException(
+          _deviceLimitMessage(
+            _header(response, 'profile-title'),
+            revoked: true,
+          ),
+        );
+      }
       if (_header(response, 'x-neura-device-limit')?.trim().toLowerCase() ==
           'true') {
         throw SubscriptionDeviceLimitException(
@@ -71,7 +85,9 @@ class SubscriptionService {
       if (response.statusCode != 200) {
         throw SubscriptionFetchException('Ошибка HTTP ${response.statusCode}');
       }
-      final content = _decodeSubscriptionContent(response.body);
+      final content = _decodeSubscriptionContent(
+        utf8.decode(response.bodyBytes, allowMalformed: true),
+      );
 
       if (content == null) {
         throw const SubscriptionFetchException(
@@ -89,6 +105,10 @@ class SubscriptionService {
       return profiles;
     } on SubscriptionFetchException {
       rethrow;
+    } on FormatException {
+      throw const SubscriptionFetchException(
+        'Подписка содержит некорректный или неподдерживаемый Xray-профиль.',
+      );
     } on HandshakeException {
       throw const SubscriptionFetchException(
         'Не удалось установить защищённое соединение с сервером подписки. '
@@ -96,16 +116,14 @@ class SubscriptionService {
       );
     } on SocketException catch (e) {
       throw SubscriptionFetchException('Ошибка сети: ${e.message}');
-    } on http.ClientException catch (e) {
-      throw SubscriptionFetchException(
-        'Ошибка загрузки подписки: ${e.message}',
-      );
+    } on http.ClientException {
+      throw const SubscriptionFetchException('Не удалось загрузить подписку.');
     } on TimeoutException {
       throw const SubscriptionFetchException(
         'Сервер подписки не ответил вовремя',
       );
-    } catch (e) {
-      throw SubscriptionFetchException(e.toString());
+    } catch (_) {
+      throw const SubscriptionFetchException('Не удалось обработать подписку.');
     }
   }
 
@@ -150,6 +168,7 @@ class SubscriptionService {
       final next = current.resolve(location);
       if (redirects >= 5 ||
           next.host.isEmpty ||
+          (current.scheme == 'https' && next.scheme != 'https') ||
           (next.scheme != 'https' && next.scheme != 'http')) {
         throw const SubscriptionFetchException(
           'Сервер подписки вернул недопустимое перенаправление',
@@ -179,7 +198,7 @@ class SubscriptionService {
         '--proto',
         '=http,https',
         '--proto-redir',
-        '=http,https',
+        uri.scheme == 'https' ? '=https' : '=http,https',
         '--silent',
         '--show-error',
         '--connect-timeout',
@@ -243,10 +262,11 @@ class SubscriptionService {
     return null;
   }
 
-  String _deviceLimitMessage(String? title) {
-    const fallback =
-        'Достигнут лимит устройств для этой подписки. '
-        'Удалите ненужное устройство в личном кабинете или обратитесь в поддержку.';
+  String _deviceLimitMessage(String? title, {bool revoked = false}) {
+    final fallback = revoked
+        ? 'Это устройство удалено из подписки. Восстановите доступ в личном кабинете.'
+        : 'Достигнут лимит устройств для этой подписки. '
+              'Удалите ненужное устройство в личном кабинете или обратитесь в поддержку.';
     var text = title?.trim() ?? '';
     if (text.toLowerCase().startsWith('base64:')) {
       try {
@@ -266,6 +286,7 @@ class SubscriptionService {
   String? _decodeSubscriptionContent(String raw) {
     final trimmed = raw.trim();
     if (trimmed.isEmpty) return null;
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) return trimmed;
     if (RegExp(
       r'(?:vless|hysteria2|hy2)://',
       caseSensitive: false,
@@ -289,6 +310,14 @@ class SubscriptionService {
 
   /// Парсить VLESS/Hysteria 2 URI из текста.
   List<String> _parseProfiles(String content) {
+    final trimmed = content.trim();
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+      final decoded = jsonDecode(trimmed);
+      final objects = decoded is List ? decoded : [decoded];
+      return objects
+          .map((value) => XrayProfile.fromJson(value).serialized)
+          .toList();
+    }
     final profiles = <String>[];
     final seen = <String>{};
 
@@ -296,6 +325,34 @@ class SubscriptionService {
       r'(?:vless|hysteria2|hy2)://[^\s]+',
       caseSensitive: false,
     ).allMatches(content);
+    final links = matches.map((match) => match.group(0)!).toList();
+    // Older servers return one deliberately unusable URI instead of headers.
+    // Recognize only an explicit denial title and a dummy endpoint, never an
+    // arbitrary working profile whose name happens to mention a device.
+    if (links.length == 1) {
+      final placeholder = Uri.tryParse(links.single);
+      final title = placeholder == null
+          ? ''
+          : Uri.decodeComponent(placeholder.fragment);
+      final lower = title.toLowerCase();
+      final revoked =
+          lower.contains('устройство') &&
+              (lower.contains('удален') || lower.contains('удалён')) ||
+          lower.contains('device revoked');
+      final limited =
+          lower.contains('лимит') && lower.contains('устройств') ||
+          lower.contains('device limit');
+      if (placeholder != null &&
+          placeholder.port <= 1 &&
+          const {
+            '192.0.2.1',
+            '0.0.0.0',
+            '127.0.0.1',
+          }.contains(placeholder.host)) {
+        if (revoked) throw SubscriptionDeviceRevokedException(title);
+        if (limited) throw SubscriptionDeviceLimitException(title);
+      }
+    }
     for (final match in matches) {
       final uri = match.group(0)?.trim().replaceFirst(RegExp("[\"',;]+\$"), '');
       if (uri == null || uri.isEmpty) continue;

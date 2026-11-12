@@ -63,6 +63,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       }
 
       // Загружаем профили из подписки
+      final requestedAt = DateTime.now();
       final profiles = await _manager.fetchSubscription(url);
       if (profiles.isEmpty) {
         throw 'В подписке не найдено ни одного профиля VLESS';
@@ -74,6 +75,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         url: url,
         profiles: profiles,
         selectedIndex: 0,
+        lastUpdated: requestedAt,
       );
 
       final added = await _repository.addSubscription(subscription);
@@ -84,6 +86,8 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         throw 'Не удалось добавить подписку';
       }
     } on SubscriptionDeviceLimitException catch (error) {
+      await _repository.invalidateAccess(url, error.message);
+      await _loadSubscriptions();
       if (mounted) _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
       _toast('Ошибка: $e', tone: NeuraToastTone.error);
@@ -96,6 +100,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
     setState(() => _isLoading = true);
     try {
       // Перезагружаем профили из подписки
+      final requestedAt = DateTime.now();
       final profiles = await _manager.fetchSubscription(subscription.url);
       if (profiles.isEmpty) {
         throw 'В подписке не найдено ни одного профиля VLESS';
@@ -104,7 +109,7 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
       // Обновляем подписку
       final updated = subscription.copyWith(
         profiles: profiles,
-        lastUpdated: DateTime.now(),
+        lastUpdated: requestedAt,
       );
 
       final success = await _repository.updateSubscription(updated);
@@ -113,6 +118,8 @@ class _SubscriptionManagerState extends State<SubscriptionManager> {
         _toast('Подписка обновлена', tone: NeuraToastTone.success);
       }
     } on SubscriptionDeviceLimitException catch (error) {
+      await _repository.invalidateAccess(subscription.url, error.message);
+      await _loadSubscriptions();
       if (mounted) _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
       _toast('Ошибка обновления: $e', tone: NeuraToastTone.error);

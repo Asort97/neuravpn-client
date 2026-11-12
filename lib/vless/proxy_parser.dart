@@ -1,6 +1,8 @@
 import 'hysteria2_parser.dart';
 import 'proxy_link.dart';
 import 'vless_parser.dart';
+import 'xray_profile.dart';
+export 'xray_profile.dart';
 export 'hysteria2_parser.dart';
 export 'proxy_link.dart';
 export 'vless_parser.dart';
@@ -11,9 +13,10 @@ bool isProxyUri(String raw) => RegExp(
 ).hasMatch(raw.trim());
 
 ProxyLink? parseProxyUri(String raw) =>
-    parseVlessUri(raw) ?? parseHysteria2Uri(raw);
+    XrayProfile.tryParse(raw) ?? parseVlessUri(raw) ?? parseHysteria2Uri(raw);
 
 String? proxyValidationError(ProxyLink link) {
+  if (link is XrayProfile) return null;
   if (link is VlessLink) {
     return isSecureVlessLink(link) ? null : 'VLESS требует TLS или Reality.';
   }

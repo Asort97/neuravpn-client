@@ -10,6 +10,28 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
 class ProfileProbeConfigTest {
+    @Test fun fullProfileKeepsBalancerAndNeverFallsBackToFirstOutbound() {
+        val source = JSONObject("""{"fullProfile":true,"remarks":"Auto",
+            "inbounds":[{"tag":"socks","protocol":"socks","listen":"0.0.0.0","port":10808}],
+            "outbounds":[{"tag":"auto-a","protocol":"vless"},{"tag":"auto-b","protocol":"hysteria"},
+                {"tag":"blocked","protocol":"blackhole"}],
+            "dns":{"servers":["https://1.1.1.1/dns-query"]},
+            "routing":{"rules":[{"network":"tcp,udp","balancerTag":"auto"}],
+                "balancers":[{"tag":"auto","selector":["auto-"],"strategy":{"type":"leastPing"},"fallbackTag":"blocked"}]},
+            "observatory":{"subjectSelector":["auto-"],"probeInterval":"60s"}}""")
+        val result = JSONObject(ProfileProbeConfig.build(source.toString(), 19582))
+        for (key in listOf("outbounds", "dns", "routing", "observatory")) {
+            assertEquals(source.get(key).toString(), result.get(key).toString())
+        }
+        assertEquals(1, result.getJSONArray("inbounds").length())
+        val inbound = result.getJSONArray("inbounds").getJSONObject(0)
+        assertEquals("socks", inbound.getString("tag"))
+        assertEquals("http", inbound.getString("protocol"))
+        assertEquals("127.0.0.1", inbound.getString("listen"))
+        assertEquals(19582, inbound.getInt("port"))
+        source.getJSONArray("outbounds").getJSONObject(0).put("protocol", "freedom")
+        assertThrows(IllegalArgumentException::class.java) { ProfileProbeConfig.build(source.toString(), 19582) }
+    }
     @Test fun preservesHysteria2TransportAndObfuscation() {
         val source = """{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"example.com","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"secret"},"finalmask":{"udp":[{"type":"salamander","settings":{"password":"test"}}]}}}]}"""
         val result = JSONObject(ProfileProbeConfig.build(source, 19582))

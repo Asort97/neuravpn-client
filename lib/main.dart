@@ -662,6 +662,7 @@ class _VlessHomePageState extends State<VlessHomePage>
   int _profileNameCounter = 0;
   int _subscriptionsRefreshToken = 0;
   Timer? _subscriptionRefreshTimer;
+  StreamSubscription<Set<String>>? _subscriptionRevocations;
   Timer? _androidStateSyncTimer;
   static const String _profileMetricsKey = 'vpn_profile_metrics';
   static const String _profileCounterKey = 'vpn_profile_counter';
@@ -832,6 +833,9 @@ class _VlessHomePageState extends State<VlessHomePage>
   @override
   void initState() {
     super.initState();
+    _subscriptionRevocations = SubscriptionRepository.revokedProfiles.listen(
+      (profiles) => unawaited(_handleRevokedProfiles(profiles)),
+    );
     WidgetsBinding.instance.addObserver(this);
     _windowsPageController = PageController(
       initialPage: _windowsViewIndex(_windowsView),
@@ -2813,6 +2817,10 @@ $regItems = foreach ($rp in $regPaths) {
       }
       return;
     }
+    if (link is XrayProfile) {
+      setState(() => _pingMs = null);
+      return;
+    }
     if (link is Hysteria2Link) {
       // TCP connect timing says nothing about a QUIC-only endpoint.
       setState(() => _pingMs = null);
@@ -3485,6 +3493,7 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _addSubscription(String url, String name) async {
     try {
       final manager = SubscriptionService();
+      final requestedAt = DateTime.now();
       final profiles = await manager.fetchSubscription(url);
       if (profiles.isEmpty) {
         throw 'Подписка не содержит поддерживаемых VLESS/Hysteria 2 профилей';
@@ -3494,6 +3503,7 @@ $regItems = foreach ($rp in $regPaths) {
         name: _deriveSubscriptionNameFromUrl(url),
         url: url,
         profiles: profiles,
+        lastUpdated: requestedAt,
       );
 
       final repository = SubscriptionRepository();
@@ -3533,6 +3543,8 @@ $regItems = foreach ($rp in $regPaths) {
         );
       }
     } on SubscriptionDeviceLimitException catch (error) {
+      await SubscriptionRepository().invalidateAccess(url, error.message);
+      await _reloadSubscriptions();
       if (!mounted) return;
       showNeuraToast(context, error.message, tone: NeuraToastTone.error);
     } catch (e, stack) {
@@ -3563,15 +3575,17 @@ $regItems = foreach ($rp in $regPaths) {
       if (subs.isEmpty) return;
       for (final sub in subs) {
         try {
+          final requestedAt = DateTime.now();
           final profiles = await manager.fetchSubscription(sub.url);
           if (profiles.isEmpty) continue;
           final updated = sub.copyWith(
             profiles: profiles,
-            lastUpdated: DateTime.now(),
+            lastUpdated: requestedAt,
           );
           await repository.updateSubscription(updated);
           _reportedSubscriptionDeviceLimits.remove(sub.url);
         } on SubscriptionDeviceLimitException catch (error) {
+          await repository.invalidateAccess(sub.url, error.message);
           if (mounted && _reportedSubscriptionDeviceLimits.add(sub.url)) {
             showNeuraToast(context, error.message, tone: NeuraToastTone.error);
           }
@@ -3637,6 +3651,28 @@ $regItems = foreach ($rp in $regPaths) {
       _syncMetricsFromProfile(null);
     });
     await _persistSelectedProfile();
+  }
+
+  Future<void> _handleRevokedProfiles(Set<String> profiles) async {
+    if (!mounted || !profiles.contains(_selectedProfile?.uri)) return;
+    // Cancel an in-flight start too; a denied key cannot survive via Quick Tile.
+    try {
+      if (_isRunning || _isConnecting || _vpnCoreController.androidStatus.isActive) {
+        await _stop();
+      }
+      await _vpnCoreController.forgetSavedMobileConfig();
+    } catch (_) {
+      if (mounted) _showFastSnack('Доступ к подписке отозван. Сохранённые ключи удалены.');
+    } finally {
+      if (mounted && profiles.contains(_selectedProfile?.uri)) {
+        setState(() {
+          _selectedProfile = null;
+          _controller.clear();
+          _syncMetricsFromProfile(null);
+        });
+        await _persistSelectedProfile();
+      }
+    }
   }
 
   String _ensureUniqueProfileName(String base, {String? skipName}) {
@@ -3709,6 +3745,7 @@ $regItems = foreach ($rp in $regPaths) {
   String _deriveProfileNameFromUri(String uri) {
     final parsed = parseProxyUri(uri);
     if (parsed == null) return '';
+    if (parsed is XrayProfile) return parsed.tag;
     if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
     if (parsed.host.isNotEmpty) return parsed.host;
     if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
@@ -4118,7 +4155,7 @@ $regItems = foreach ($rp in $regPaths) {
       return;
     }
     final link = _currentLink;
-    if (link == null) return;
+    if (link == null || link is XrayProfile) return;
     await _dpiEvasionManager.startForHost(
       link.host,
       link.port,
@@ -4344,6 +4381,7 @@ $regItems = foreach ($rp in $regPaths) {
     WidgetsBinding.instance.removeObserver(this);
     _androidStateSyncTimer?.cancel();
     _subscriptionRefreshTimer?.cancel();
+    unawaited(_subscriptionRevocations?.cancel());
     _logFlushTimer?.cancel();
     if (_isWindowsShellPlatform) {
       _windowsLaunchChannel.setMethodCallHandler(null);
@@ -6350,7 +6388,7 @@ $regItems = foreach ($rp in $regPaths) {
     final link = _currentLink;
     final serverLabel = link == null
         ? '\u041e\u043f\u0442\u0438\u043c\u0430\u043b\u044c\u043d\u043e \u00b7 \u0410\u0432\u0442\u043e\u0432\u044b\u0431\u043e\u0440'
-        : '${link.host}:${link.port}';
+        : link is XrayProfile ? link.tag : '${link.host}:${link.port}';
     return _neuraCard(
       padding: const EdgeInsets.all(16),
       child: Row(

@@ -44,6 +44,13 @@ object AndroidVpnConfigStore {
         JSONObject(String(cipher.doFinal(encrypted), Charsets.UTF_8))
     }.getOrNull()
 
+    fun clear(context: Context) {
+        for (name in listOf(FILE_NAME, "$FILE_NAME.tmp", "neuravpn_last_config.json")) {
+            val file = File(context.filesDir, name)
+            check(!file.exists() || file.delete()) { "Cannot remove saved VPN configuration" }
+        }
+    }
+
     private fun getOrCreateKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }

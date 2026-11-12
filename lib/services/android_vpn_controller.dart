@@ -123,6 +123,11 @@ class AndroidVpnController {
     }
   }
 
+  Future<void> forgetSavedConfig() async {
+    if (!isSupported) return;
+    await _channel.invokeMethod<void>('forgetSavedVpnConfig');
+  }
+
   Future<AndroidVpnStatus> getStatus() async {
     if (!isSupported) {
       return const AndroidVpnStatus(phase: AndroidVpnPhase.stopped);

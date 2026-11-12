@@ -114,6 +114,11 @@ class FakeVpnCore extends VpnCoreController {
   Future<void> stopTrafficStream() async {}
 
   @override
+  Future<void> forgetSavedMobileConfig() async {
+    calls.add('forget-config');
+  }
+
+  @override
   Future<void> dispose() async {}
 }
 
@@ -205,6 +210,37 @@ void main() {
           null,
         );
   });
+
+  testWidgets(
+    'revocation stops the active session and forgets Quick Tile config',
+    (tester) async {
+      final core = FakeVpnCore()..phase = AndroidVpnPhase.running;
+      final repository = SubscriptionRepository();
+      await repository.addSubscription(
+        VpnSubscription(
+          id: 'revoked',
+          name: 'Subscription',
+          url: 'https://example.com/revoked',
+          profiles: [profiles.first.uri],
+        ),
+      );
+      await pumpApp(tester, core);
+      await repository.invalidateAccess(
+        'https://example.com/revoked',
+        'Device revoked',
+      );
+      await tester.pumpAndSettle();
+      expect(
+        core.calls,
+        containsAllInOrder(['stop', 'stop-complete', 'forget-config']),
+      );
+      expect(core.startedUris, isEmpty);
+      expect(profileList(tester).selectedProfile, isNull);
+      expect((await repository.getSubscription('revoked'))!.profiles, isEmpty);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpAndSettle();
+    },
+  );
 
   testWidgets(
     'standalone HY2 import preserves subscriptions, manual keys and selection after restart',
@@ -319,7 +355,7 @@ void main() {
   );
 
   testWidgets(
-    'device-limit import and refresh show server message without changing saved profiles',
+    'device-limit clears rejected subscription but preserves unrelated manual profiles',
     (tester) async {
       var message = 'Device limit reached. Remove an unused device.';
       var requests = 0;
@@ -349,7 +385,6 @@ void main() {
         ),
       );
       final prefs = await SharedPreferences.getInstance();
-      final saved = prefs.getStringList('vpn_subscriptions_list')!.toList();
       final manual = prefs.getString('vpn_profiles');
       Future<void> waitForMessage() async {
         for (var i = 0; i < 40 && find.text(message).evaluate().isEmpty; i++) {
@@ -359,7 +394,9 @@ void main() {
           await tester.pump(const Duration(milliseconds: 25));
         }
         expect(find.text(message), findsWidgets);
-        expect(prefs.getStringList('vpn_subscriptions_list'), saved);
+        final stored = (await repository.getAllSubscriptions()).single;
+        expect(stored.profiles, isEmpty);
+        expect(stored.error, isNotEmpty);
         expect(prefs.getString('vpn_profiles'), manual);
         expect(profileList(tester).selectedProfile?.uri, profiles.first.uri);
         expect(find.textContaining('DoNotImport'), findsNothing);

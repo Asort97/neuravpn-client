@@ -72,6 +72,7 @@ class _ProfileListViewState extends State<ProfileListView> {
 
   String _vlessProtocolLine(String uri) {
     final parsed = parseProxyUri(uri);
+    if (parsed is XrayProfile) return parsed.protocolLabel;
     final transport = (parsed?.type?.trim().isNotEmpty ?? false)
         ? parsed!.type!.trim()
         : 'tcp';
@@ -268,6 +269,7 @@ class _ProfileListViewState extends State<ProfileListView> {
     if (_refreshingSubscriptions.contains(subscription.id)) return;
     setState(() => _refreshingSubscriptions.add(subscription.id));
     try {
+      final requestedAt = DateTime.now();
       final profiles = await _manager.fetchSubscription(subscription.url);
       if (profiles.isEmpty) {
         throw 'Подписка не вернула профили.';
@@ -275,11 +277,12 @@ class _ProfileListViewState extends State<ProfileListView> {
 
       final updated = subscription.copyWith(
         profiles: profiles,
-        lastUpdated: DateTime.now(),
+        lastUpdated: requestedAt,
       );
 
-      await _repository.updateSubscription(updated);
+      final saved = await _repository.updateSubscription(updated);
       await _loadSubscriptions();
+      if (!saved) return;
 
       // Re-select the same index profile after refresh so selection is not lost.
       if (widget.selectedProfile != null &&
@@ -308,6 +311,8 @@ class _ProfileListViewState extends State<ProfileListView> {
       if (!mounted) return;
       _toast('Подписка обновлена.', tone: NeuraToastTone.success);
     } on SubscriptionDeviceLimitException catch (error) {
+      await _repository.invalidateAccess(subscription.url, error.message);
+      await _loadSubscriptions();
       if (!mounted) return;
       _toast(error.message, tone: NeuraToastTone.error);
     } catch (e) {
@@ -660,7 +665,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                               ),
                               const SizedBox(height: 3),
                               Text(
-                                '${_profileCountLabel(subscription.profileCount)} · ${_lastUpdatedLabel(subscription.lastUpdated)}',
+                                subscription.error ?? '${_profileCountLabel(subscription.profileCount)} · ${_lastUpdatedLabel(subscription.lastUpdated)}',
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(

@@ -45,6 +45,7 @@ class MainActivity : FlutterActivity() {
 					result.success(mapOf(
 						"os" to "Android",
 						"model" to "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+						"osVersion" to Build.VERSION.RELEASE,
 						"noBackupDirectory" to noBackupFilesDir.absolutePath,
 					))
 				} else {
@@ -101,6 +102,10 @@ class MainActivity : FlutterActivity() {
 					} catch (t: Throwable) {
 						result.error("STOP_VPN_FAILED", t.message, null)
 					}
+				}
+				"forgetSavedVpnConfig" -> {
+					com.neuravpn.app.vpn.AndroidVpnConfigStore.clear(applicationContext)
+					result.success(null)
 				}
 				METHOD_STATUS -> {
 					try {

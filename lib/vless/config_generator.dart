@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:path/path.dart' as path;
 import 'proxy_parser.dart';
+import 'xray_profile_config.dart';
 
 import '../models/split_tunnel_config.dart';
 import '../services/dpi_evasion_config.dart';
@@ -525,6 +526,16 @@ String generateWindowsXrayProxyConfig(
   String logLevel = 'info',
   String? serverAddressOverride,
 }) {
+  if (link is XrayProfile) {
+    return adaptXrayProfile(
+      link,
+      socksPort: socksPort,
+      forceSocksPort: forceSocksPort,
+      apiPort: apiPort,
+      interfaceName: outboundInterfaceName,
+      bindAddress: outboundBindAddress,
+    );
+  }
   final decoded =
       jsonDecode(
             generateXrayConfig(
@@ -597,6 +608,7 @@ String generateWindowsHybridTunConfig(
   int forceSocksPort = 10809,
   int mtu = 1500,
   String logLevel = 'info',
+  bool useProfileDns = false,
 }) {
   final applicationRules = _buildApplicationRules(splitConfig, 'proxy').map((
     rule,
@@ -614,20 +626,29 @@ String generateWindowsHybridTunConfig(
     },
     'dns': <String, dynamic>{
       'servers': <Map<String, dynamic>>[
-        <String, dynamic>{
-          'type': 'https',
-          'tag': 'dns-vpn',
-          'server': '1.1.1.1',
-          'server_port': 443,
-          'path': '/dns-query',
-          'tls': <String, dynamic>{
-            'enabled': true,
-            'server_name': 'cloudflare-dns.com',
+        if (useProfileDns)
+          <String, dynamic>{
+            'type': 'udp',
+            'tag': 'dns-vpn',
+            'server': '172.19.0.2',
+            'server_port': 53,
+            'detour': 'proxy',
+          }
+        else
+          <String, dynamic>{
+            'type': 'https',
+            'tag': 'dns-vpn',
+            'server': '1.1.1.1',
+            'server_port': 443,
+            'path': '/dns-query',
+            'tls': <String, dynamic>{
+              'enabled': true,
+              'server_name': 'cloudflare-dns.com',
+            },
+            // DNS must follow the VPN path. Direct UDP DNS is filtered or
+            // delayed on some uplinks and previously stalled CDN lookups.
+            'detour': 'proxy',
           },
-          // DNS must follow the VPN path. Direct UDP DNS is filtered or
-          // delayed on some uplinks and previously stalled CDN lookups.
-          'detour': 'proxy',
-        },
       ],
       'final': 'dns-vpn',
       'strategy': 'prefer_ipv4',
@@ -703,6 +724,7 @@ String generateAndroidXrayConfig(
   List<String> smartDomains = const <String>[],
   List<Map<String, dynamic>> extraRouteRules = const <Map<String, dynamic>>[],
 }) {
+  if (link is XrayProfile) return adaptXrayProfile(link);
   final vpnTag = link.tag ?? 'proxy';
 
   final routeRules = <Map<String, dynamic>>[];
