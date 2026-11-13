@@ -258,11 +258,7 @@ void main() {
     );
     for (final interval in ['0s', '-10s', 'invalid']) {
       final source = xraySubscriptionProfile();
-      if (interval == null) {
-        source['observatory'].remove('probeInterval');
-      } else {
-        source['observatory']['probeInterval'] = interval;
-      }
+      source['observatory']['probeInterval'] = interval;
       expect(() => XrayProfile.fromJson(source), throwsFormatException);
     }
   });
