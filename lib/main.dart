@@ -382,6 +382,29 @@ class _AppScrollBehavior extends MaterialScrollBehavior {
     PointerDeviceKind.mouse,
     PointerDeviceKind.trackpad,
   };
+
+  // Phones rubber-band past the edges like UIScrollView instead of Android's
+  // clamp + stretch glow.
+  @override
+  ScrollPhysics getScrollPhysics(BuildContext context) {
+    return switch (getPlatform(context)) {
+      TargetPlatform.android || TargetPlatform.iOS =>
+        const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+      _ => super.getScrollPhysics(context),
+    };
+  }
+
+  @override
+  Widget buildOverscrollIndicator(
+    BuildContext context,
+    Widget child,
+    ScrollableDetails details,
+  ) {
+    return switch (getPlatform(context)) {
+      TargetPlatform.android || TargetPlatform.iOS => child,
+      _ => super.buildOverscrollIndicator(context, child, details),
+    };
+  }
 }
 
 enum _WindowsView { connection, splitTunneling, settings }

@@ -211,8 +211,9 @@ enum NeuraHaptic {
   error,
 }
 
-/// Haptics with iOS-native generators (UIImpact/UISelection/UINotification)
-/// through the `neuravpn/haptics` channel, and [HapticFeedback] elsewhere.
+/// Haptics through the `neuravpn/haptics` channel: UIKit feedback generators
+/// on iOS, VibrationEffect compositions on Android. [HapticFeedback] is the
+/// fallback when the channel is missing.
 class NeuraHaptics {
   const NeuraHaptics._();
 
@@ -222,6 +223,12 @@ class NeuraHaptics {
   static TargetPlatform? debugPlatformOverride;
 
   static bool _nativeUnavailable = false;
+
+  @visibleForTesting
+  static void debugReset() {
+    debugPlatformOverride = null;
+    _nativeUnavailable = false;
+  }
 
   static TargetPlatform get _platform =>
       debugPlatformOverride ?? defaultTargetPlatform;
@@ -237,15 +244,14 @@ class NeuraHaptics {
     if (haptic == NeuraHaptic.none) return;
     switch (_platform) {
       case TargetPlatform.iOS:
-        unawaited(_playIos(haptic));
       case TargetPlatform.android:
-        unawaited(_playFallback(haptic));
+        unawaited(_playNative(haptic));
       default:
         return;
     }
   }
 
-  static Future<void> _playIos(NeuraHaptic haptic) async {
+  static Future<void> _playNative(NeuraHaptic haptic) async {
     if (_nativeUnavailable) return _playFallback(haptic);
     try {
       switch (haptic) {

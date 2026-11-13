@@ -303,7 +303,7 @@ class XrayProfile extends ProxyLink {
           probe.scheme != 'https' ||
           probe.host.isEmpty ||
           probe.userInfo.isNotEmpty ||
-          observation['probeInterval'] != '60s') {
+          !_validProbeInterval(observation['probeInterval'])) {
         _invalid();
       }
       final selectors = _list(
@@ -330,5 +330,16 @@ class XrayProfile extends ProxyLink {
       Set.unmodifiable(endpoints),
       balancers.isNotEmpty,
     );
+  }
+
+  static bool _validProbeInterval(dynamic value) {
+    // Xray uses Go durations, including compound and fractional values.
+    // An omitted/empty value leaves the core's default in effect.
+    if (value == null || value == '') return true;
+    if (value is! String) return false;
+    return RegExp(
+          r'^\+?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:ns|us|\u00b5s|\u03bcs|ms|s|m|h))+$',
+        ).hasMatch(value) &&
+        RegExp(r'[1-9]').hasMatch(value);
   }
 }

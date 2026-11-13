@@ -28,6 +28,12 @@ class NeuraUi {
 
   static bool get isIOS => defaultTargetPlatform == TargetPlatform.iOS;
 
+  /// Phones get the same iOS-grade feel on both platforms: highlight instead
+  /// of ripple, banners from the top, rubber-band scrolling, slide-in pages.
+  static bool get isMobile =>
+      defaultTargetPlatform == TargetPlatform.iOS ||
+      defaultTargetPlatform == TargetPlatform.android;
+
   static ThemeData buildTheme() {
     final baseScheme = ColorScheme.fromSeed(
       seedColor: redSoft,
@@ -47,9 +53,9 @@ class NeuraUi {
       colorScheme: scheme,
       useMaterial3: true,
       scaffoldBackgroundColor: const Color(0xFF050608),
-      // iOS controls highlight instead of rippling.
-      splashFactory: isIOS ? NoSplash.splashFactory : InkSparkle.splashFactory,
-      highlightColor: isIOS ? Colors.white.withOpacity(0.06) : null,
+      // Phone controls highlight instead of rippling, like UIKit.
+      splashFactory: isMobile ? NoSplash.splashFactory : InkSparkle.splashFactory,
+      highlightColor: isMobile ? Colors.white.withOpacity(0.06) : null,
       dialogTheme: const DialogThemeData(backgroundColor: Colors.transparent),
       bottomSheetTheme: const BottomSheetThemeData(
         backgroundColor: Colors.transparent,
@@ -120,7 +126,7 @@ class NeuraUi {
       ),
       pageTransitionsTheme: const PageTransitionsTheme(
         builders: <TargetPlatform, PageTransitionsBuilder>{
-          TargetPlatform.android: FadeForwardsPageTransitionsBuilder(),
+          TargetPlatform.android: CupertinoPageTransitionsBuilder(),
           TargetPlatform.iOS: CupertinoPageTransitionsBuilder(),
           TargetPlatform.windows: FadeForwardsPageTransitionsBuilder(),
           TargetPlatform.macOS: CupertinoPageTransitionsBuilder(),
@@ -678,9 +684,9 @@ Future<void> _showNeuraToastInternal(
     NeuraToastTone.error => NeuraHaptic.error,
   });
 
-  // iOS banners drop in from the top on a spring; elsewhere they rise from
-  // the bottom edge.
-  final fromTop = NeuraUi.isIOS;
+  // On phones banners drop in from the top on a spring; on desktop they rise
+  // from the bottom edge.
+  final fromTop = NeuraUi.isMobile;
   final controller = AnimationController(
     vsync: overlay,
     duration: NeuraMotion.curveDuration(const Duration(milliseconds: 420)),

@@ -6,6 +6,7 @@ import android.content.pm.ApplicationInfo
 import android.net.VpnService
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.Settings
 import androidx.lifecycle.Lifecycle
 import com.google.android.play.core.appupdate.AppUpdateManager
@@ -37,8 +38,39 @@ class MainActivity : FlutterActivity() {
 	}
 	private var profileProbeChannel: ProfileProbeChannel? = null
 
+	override fun onCreate(savedInstanceState: Bundle?) {
+		super.onCreate(savedInstanceState)
+		requestHighestRefreshRate()
+	}
+
+	/**
+	 * Many 90/120 Hz phones keep apps at 60 Hz unless the window asks for a
+	 * faster mode. Ask for the fastest mode at the current resolution; LTPO
+	 * panels still drop the rate when nothing moves.
+	 */
+	private fun requestHighestRefreshRate() {
+		runCatching {
+			val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+				display
+			} else {
+				@Suppress("DEPRECATION")
+				windowManager.defaultDisplay
+			} ?: return
+			val current = display.mode
+			val best = display.supportedModes
+				.filter {
+					it.physicalWidth == current.physicalWidth &&
+						it.physicalHeight == current.physicalHeight
+				}
+				.maxByOrNull { it.refreshRate } ?: return
+			if (window.attributes.preferredDisplayModeId == best.modeId) return
+			window.attributes = window.attributes.also { it.preferredDisplayModeId = best.modeId }
+		}
+	}
+
 	override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
 		super.configureFlutterEngine(flutterEngine)
+		NativeHaptics(this).register(flutterEngine.dartExecutor.binaryMessenger)
 		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "neuravpn/device_info")
 			.setMethodCallHandler { call, result ->
 				if (call.method == "getDeviceInfo") {

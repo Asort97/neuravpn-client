@@ -49,7 +49,7 @@ void main() {
     });
 
     tearDown(() {
-      NeuraHaptics.debugPlatformOverride = null;
+      NeuraHaptics.debugReset();
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(
             const MethodChannel('neuravpn/haptics'),
@@ -73,10 +73,26 @@ void main() {
       expect(platformCalls, isEmpty);
     });
 
-    test('Android falls back to HapticFeedback', () async {
+    test('Android uses the native haptics channel', () async {
+      NeuraHaptics.debugPlatformOverride = TargetPlatform.android;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel('neuravpn/haptics'), (
+            call,
+          ) async {
+            calls.add(call);
+            return null;
+          });
+      NeuraHaptics.play(NeuraHaptic.rigid);
+      await Future<void>.delayed(Duration.zero);
+      expect(calls.single.method, 'impact');
+      expect(calls.single.arguments, {'style': 'rigid'});
+      expect(platformCalls, isEmpty);
+    });
+
+    test('Android falls back to HapticFeedback without the channel', () async {
       NeuraHaptics.debugPlatformOverride = TargetPlatform.android;
       NeuraHaptics.selection();
-      await Future<void>.delayed(Duration.zero);
+      await pumpEventQueue();
       expect(platformCalls.single.method, 'HapticFeedback.vibrate');
     });
 

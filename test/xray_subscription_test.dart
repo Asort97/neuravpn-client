@@ -222,6 +222,51 @@ void main() {
     },
   );
 
+  test('server-defined Go durations are preserved without client limits', () {
+    for (final interval in [
+      '10s',
+      '60s',
+      '1m',
+      '1500ms',
+      '1h',
+      '1ms',
+      '2h',
+      '1m30s',
+      '.5s',
+      '+2s',
+      '',
+    ]) {
+      final source = xraySubscriptionProfile();
+      source['observatory']['probeInterval'] = interval;
+      final profile = XrayProfile.fromJson(source);
+      final config = jsonDecode(
+        generateAndroidXrayConfig(profile, SplitTunnelConfig()),
+      );
+      expect(config['observatory']['probeInterval'], interval);
+      final windows = jsonDecode(
+        generateWindowsXrayProxyConfig(profile, SplitTunnelConfig()),
+      );
+      expect(windows['observatory']['probeInterval'], interval);
+    }
+    final defaults = xraySubscriptionProfile();
+    defaults['observatory'].remove('probeInterval');
+    expect(
+      XrayProfile.fromJson(
+        defaults,
+      ).config['observatory'].containsKey('probeInterval'),
+      isFalse,
+    );
+    for (final interval in ['0s', '-10s', 'invalid']) {
+      final source = xraySubscriptionProfile();
+      if (interval == null) {
+        source['observatory'].remove('probeInterval');
+      } else {
+        source['observatory']['probeInterval'] = interval;
+      }
+      expect(() => XrayProfile.fromJson(source), throwsFormatException);
+    }
+  });
+
   test(
     'revocation, limit and legacy dummy are explicit denials, not profiles',
     () async {
