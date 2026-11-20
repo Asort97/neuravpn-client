@@ -1,5 +1,6 @@
 package com.neuravpn.app.vpn
 
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -10,63 +11,72 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [33])
 class ProfileProbeConfigTest {
-    @Test fun fullProfileKeepsBalancerAndNeverFallsBackToFirstOutbound() {
-        val source = JSONObject("""{"fullProfile":true,"remarks":"Auto",
-            "inbounds":[{"tag":"socks","protocol":"socks","listen":"0.0.0.0","port":10808}],
-            "outbounds":[{"tag":"auto-a","protocol":"vless"},{"tag":"auto-b","protocol":"hysteria"},
-                {"tag":"blocked","protocol":"blackhole"}],
-            "dns":{"servers":["https://1.1.1.1/dns-query"]},
-            "routing":{"rules":[{"network":"tcp,udp","balancerTag":"auto"}],
-                "balancers":[{"tag":"auto","selector":["auto-"],"strategy":{"type":"leastPing"},"fallbackTag":"blocked"}]},
-            "observatory":{"subjectSelector":["auto-"],"probeInterval":"60s"}}""")
-        val result = JSONObject(ProfileProbeConfig.build(source.toString(), 19582))
-        for (key in listOf("outbounds", "dns", "routing", "observatory")) {
-            assertEquals(source.get(key).toString(), result.get(key).toString())
-        }
-        assertEquals(1, result.getJSONArray("inbounds").length())
-        val inbound = result.getJSONArray("inbounds").getJSONObject(0)
-        assertEquals("socks", inbound.getString("tag"))
-        assertEquals("http", inbound.getString("protocol"))
-        assertEquals("127.0.0.1", inbound.getString("listen"))
-        assertEquals(19582, inbound.getInt("port"))
-        source.getJSONArray("outbounds").getJSONObject(0).put("protocol", "freedom")
-        assertThrows(IllegalArgumentException::class.java) { ProfileProbeConfig.build(source.toString(), 19582) }
-    }
-    @Test fun preservesHysteria2TransportAndObfuscation() {
-        val source = """{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"example.com","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"secret"},"finalmask":{"udp":[{"type":"salamander","settings":{"password":"test"}}]}}}]}"""
-        val result = JSONObject(ProfileProbeConfig.build(source, 19582))
-        val outbound = result.getJSONArray("outbounds").getJSONObject(0)
-        assertEquals("hysteria", outbound.getString("protocol"))
-        assertEquals(JSONObject(source).getJSONArray("outbounds").getJSONObject(0).getJSONObject("streamSettings").toString(), outbound.getJSONObject("streamSettings").toString())
-        assertFalse(result.has("routing"))
-    }
+    private val vless = """{"tag":"user-name","protocol":"vless",
+        "settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"test-id","flow":"xtls-rprx-vision"}]}]},
+        "streamSettings":{"network":"xhttp","security":"reality","realitySettings":{"serverName":"example.org","publicKey":"test-key","shortId":"aa"}}}"""
+    private val hysteria = """{"protocol":"hysteria","settings":{"version":2,"address":"example.com","port":443},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"secret"},"finalmask":{"udp":[{"type":"salamander","settings":{"password":"test"}}]}}}"""
 
-    @Test fun isolatesRealTransportWithoutDirectBypass() {
-        for (transport in listOf("tcp", "xhttp")) {
-            val source = """{"outbounds":[{"tag":"user-name","protocol":"vless",
-                "settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"test-id","flow":"xtls-rprx-vision"}]}]},
-                "streamSettings":{"network":"$transport","security":"reality","realitySettings":{"serverName":"example.org","publicKey":"test-key","shortId":"aa"}}},
-                {"protocol":"freedom"}],"dns":{},"routing":{"rules":[]}}"""
-            val config = JSONObject(ProfileProbeConfig.build(source, 19582))
-            assertFalse(config.has("dns"))
-            assertFalse(config.has("routing"))
-            assertEquals(1, config.getJSONArray("outbounds").length())
-            val outbound = config.getJSONArray("outbounds").getJSONObject(0)
-            val original = JSONObject(source).getJSONArray("outbounds").getJSONObject(0)
-            assertEquals(original.getJSONObject("settings").toString(), outbound.getJSONObject("settings").toString())
-            assertEquals(original.getJSONObject("streamSettings").toString(), outbound.getJSONObject("streamSettings").toString())
-            val inbound = config.getJSONArray("inbounds").getJSONObject(0)
+    private fun targets(vararg outbounds: String) =
+        JSONArray().apply {
+            outbounds.forEachIndexed { index, outbound ->
+                put(JSONObject().put("id", "t$index").put("outbound", JSONObject(outbound)))
+            }
+        }.toString()
+
+    @Test fun routesEachLocalPortToExactlyOneServer() {
+        val (valid, rejected) = ProfileProbeConfig.parseTargets(targets(vless, hysteria))
+        assertTrue(rejected.isEmpty())
+        val config = JSONObject(ProfileProbeConfig.build(valid, intArrayOf(19582, 19583)))
+        assertFalse(config.has("dns"))
+        assertEquals("none", config.getJSONObject("log").getString("loglevel"))
+
+        val inbounds = config.getJSONArray("inbounds")
+        assertEquals(2, inbounds.length())
+        for (index in 0 until 2) {
+            val inbound = inbounds.getJSONObject(index)
             assertEquals("127.0.0.1", inbound.getString("listen"))
             assertEquals("http", inbound.getString("protocol"))
-            assertEquals(19582, inbound.getInt("port"))
+            assertEquals(19582 + index, inbound.getInt("port"))
             assertFalse(inbound.has("sniffing"))
-            assertEquals("none", config.getJSONObject("log").getString("loglevel"))
         }
+        val outbounds = config.getJSONArray("outbounds")
+        val original = JSONObject(vless)
+        val first = outbounds.getJSONObject(0)
+        assertEquals("probe-out-0", first.getString("tag"))
+        assertEquals(original.getJSONObject("settings").toString(), first.getJSONObject("settings").toString())
+        assertEquals(original.getJSONObject("streamSettings").toString(), first.getJSONObject("streamSettings").toString())
+        assertEquals(
+            JSONObject(hysteria).getJSONObject("streamSettings").toString(),
+            outbounds.getJSONObject(1).getJSONObject("streamSettings").toString(),
+        )
+        // Nothing can leave direct: the only extra outbound drops traffic.
+        assertEquals("blackhole", outbounds.getJSONObject(2).getString("protocol"))
+        for (index in 0 until outbounds.length()) {
+            assertNotEquals("freedom", outbounds.getJSONObject(index).getString("protocol"))
+        }
+        val rules = config.getJSONObject("routing").getJSONArray("rules")
+        for (index in 0 until 2) {
+            val rule = rules.getJSONObject(index)
+            assertEquals("probe-in-$index", rule.getJSONArray("inboundTag").getString(0))
+            assertEquals("probe-out-$index", rule.getString("outboundTag"))
+        }
+        assertEquals("probe-drop", rules.getJSONObject(2).getString("outboundTag"))
     }
 
-    @Test fun rejectsDirectProfilesAndUnexpectedHttpResponses() {
+    @Test fun rejectsDirectChainedAndBrokenServersButKeepsTheRest() {
+        val chained = """{"protocol":"vless","proxySettings":{"tag":"other"},"settings":{}}"""
+        val dialer = """{"protocol":"trojan","streamSettings":{"sockopt":{"dialerProxy":"x"}}}"""
+        val (valid, rejected) = ProfileProbeConfig.parseTargets(
+            targets(vless, """{"protocol":"freedom"}""", chained, dialer, """{"protocol":"hysteria"}"""),
+        )
+        assertEquals(listOf("t0"), valid.map { it.id })
+        assertEquals(listOf("t1", "t2", "t3", "t4"), rejected)
+    }
+
+    @Test fun capsPayloadAndAcceptsOnlyNoContent() {
+        assertThrows(IllegalArgumentException::class.java) { ProfileProbeConfig.parseTargets("[]") }
         assertThrows(IllegalArgumentException::class.java) {
-            ProfileProbeConfig.build("""{"outbounds":[{"protocol":"freedom"}]}""", 10809)
+            ProfileProbeConfig.parseTargets("x".repeat(ProfileProbeConfig.MAX_PAYLOAD + 1))
         }
         assertTrue(ProfileProbeConfig.accepts(204))
         for (status in listOf(200, 301, 302, 403, 407, 500)) assertFalse(ProfileProbeConfig.accepts(status))

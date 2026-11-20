@@ -8,6 +8,7 @@ import '../services/subscription_manager.dart';
 import '../services/subscription_repository.dart';
 import '../services/profile_availability.dart';
 import '../vless/proxy_parser.dart';
+import 'neura_motion.dart';
 import 'neura_ui.dart';
 import 'profile_availability_indicator.dart';
 
@@ -22,6 +23,7 @@ class ProfileListView extends StatefulWidget {
     this.onSubscriptionsChanged,
     this.mobile = false,
     this.checkBackend,
+    this.pendingProfileUri,
   });
 
   final List<VpnProfile> profiles;
@@ -33,8 +35,119 @@ class ProfileListView extends StatefulWidget {
   final bool mobile;
   final ProfileCheckBackend? checkBackend;
 
+  /// Profile the user just tapped while the app is still applying it. Shown
+  /// as selected right away, with a spinner instead of the check mark.
+  final String? pendingProfileUri;
+
   @override
   State<ProfileListView> createState() => _ProfileListViewState();
+}
+
+/// Display text for one stored profile URI, computed once per URI.
+///
+/// Parsing a server JSON profile decodes base64 and JSON and deep-copies its
+/// outbounds (about half a millisecond each), so the list must never parse
+/// URIs while building rows.
+class ProfileLabel {
+  const ProfileLabel({
+    required this.name,
+    required this.summary,
+    required this.detail,
+  });
+
+  factory ProfileLabel.fromUri(String uri) {
+    final parsed = parseProxyUri(uri);
+    if (parsed == null) {
+      return const ProfileLabel(
+        name: 'Неподдерживаемый профиль',
+        summary: 'Неподдерживаемый профиль',
+        detail: 'Формат не распознан',
+      );
+    }
+    final tag = parsed.tag?.trim() ?? '';
+    final sni = parsed.sni?.trim() ?? '';
+    final host = parsed.host.trim();
+    final name = tag.isNotEmpty
+        ? _safeDecode(tag)
+        : sni.isNotEmpty
+        ? sni
+        : host.isNotEmpty
+        ? host
+        : _safeDecode(uri);
+    final summary = tag.isNotEmpty
+        ? tag
+        : sni.isNotEmpty
+        ? sni
+        : host.isNotEmpty
+        ? host
+        : uri;
+    return ProfileLabel(name: name, summary: summary, detail: _detail(parsed));
+  }
+
+  /// Title shown in the list.
+  final String name;
+
+  /// Legacy name stored in [VpnProfile.name] when a profile is selected.
+  final String summary;
+
+  /// Protocol line, e.g. "VLESS · XHTTP · Reality" or "Автовыбор · 5 серверов".
+  final String detail;
+
+  static String _detail(ProxyLink link) {
+    if (link is XrayProfile) {
+      final servers = (link.config['outbounds'] as List)
+          .whereType<Map>()
+          .where((o) => o['protocol'] == 'vless' || o['protocol'] == 'hysteria')
+          .toList();
+      if (!link.isAutomatic) {
+        return servers.isNotEmpty && servers.first['protocol'] == 'hysteria'
+            ? 'Hysteria 2'
+            : 'VLESS';
+      }
+      return servers.length > 1
+          ? 'Автовыбор · ${serverCountLabel(servers.length)}'
+          : 'Автовыбор';
+    }
+    if (link is Hysteria2Link) return 'Hysteria 2';
+    final parts = <String>[link.protocolLabel];
+    final transport = link.type?.trim().toLowerCase() ?? '';
+    parts.add(switch (transport) {
+      '' || 'tcp' || 'raw' => 'TCP',
+      'ws' => 'WebSocket',
+      'grpc' => 'gRPC',
+      'xhttp' => 'XHTTP',
+      'splithttp' => 'SplitHTTP',
+      'httpupgrade' => 'HTTPUpgrade',
+      'kcp' || 'mkcp' => 'mKCP',
+      _ => transport.toUpperCase(),
+    });
+    if (link.isReality) {
+      parts.add('Reality');
+    } else if (link.isTls) {
+      parts.add('TLS');
+    }
+    return parts.join(' · ');
+  }
+
+  static String _safeDecode(String value) {
+    try {
+      return Uri.decodeComponent(value);
+    } catch (_) {
+      return value;
+    }
+  }
+}
+
+/// "1 сервер", "3 сервера", "5 серверов".
+String serverCountLabel(int count) {
+  final mod10 = count % 10;
+  final mod100 = count % 100;
+  final noun = mod10 == 1 && mod100 != 11
+      ? 'сервер'
+      : (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14))
+      ? 'сервера'
+      : 'серверов';
+  return '$count $noun';
 }
 
 class _ProfileListViewState extends State<ProfileListView> {
@@ -42,75 +155,92 @@ class _ProfileListViewState extends State<ProfileListView> {
     showNeuraToast(context, message, tone: tone);
   }
 
-  String _formatVlessSummary(String uri) {
-    final parsed = parseProxyUri(uri);
-    if (parsed == null) return 'Неподдерживаемый профиль';
-    if (parsed.tag != null && parsed.tag!.isNotEmpty) return parsed.tag!;
-    if (parsed.sni != null && parsed.sni!.isNotEmpty) return parsed.sni!;
-    if (parsed.host.isNotEmpty) return parsed.host;
-    return uri;
+  final Map<String, ProfileLabel> _labels = <String, ProfileLabel>{};
+
+  ProfileLabel _labelFor(String uri) =>
+      _labels[uri] ??= ProfileLabel.fromUri(uri);
+
+  /// Drops labels of profiles that left the list (refresh, delete).
+  void _pruneLabels() {
+    if (_labels.isEmpty) return;
+    final live = <String>{
+      ...widget.profiles.map((profile) => profile.uri),
+      ..._subscriptions.expand((subscription) => subscription.profiles),
+    };
+    _labels.removeWhere((uri, _) => !live.contains(uri));
   }
 
-  String _safeDecode(String value) {
-    try {
-      return Uri.decodeComponent(value);
-    } catch (_) {
-      return value;
-    }
-  }
+  String _formatVlessSummary(String uri) => _labelFor(uri).summary;
 
-  String _vlessDisplayName(String uri) {
-    final parsed = parseProxyUri(uri);
-    if (parsed == null) return 'Неподдерживаемый профиль';
-    final tag = parsed.tag;
-    if (tag != null && tag.trim().isNotEmpty) return _safeDecode(tag.trim());
-    final sni = parsed.sni;
-    if (sni != null && sni.trim().isNotEmpty) return sni.trim();
-    if (parsed.host.trim().isNotEmpty) return parsed.host.trim();
-    return _safeDecode(uri);
-  }
+  String _vlessDisplayName(String uri) => _labelFor(uri).name;
 
-  String _vlessProtocolLine(String uri) {
-    final parsed = parseProxyUri(uri);
-    if (parsed is XrayProfile) return parsed.protocolLabel;
-    final transport = (parsed?.type?.trim().isNotEmpty ?? false)
-        ? parsed!.type!.trim()
-        : 'tcp';
-    return '${parsed?.protocolLabel ?? 'VPN'} / ${transport.toUpperCase()}';
-  }
+  String? get _effectiveSelectedUri =>
+      widget.pendingProfileUri ?? widget.selectedProfile?.uri;
 
-  Widget _configTitleMarquee(String text, {required bool enabled}) {
-    // Marquee removed: keep UI stable and performant.
-    return Text(
-      text,
-      maxLines: 1,
-      overflow: TextOverflow.ellipsis,
-      style: TextStyle(
-        fontSize: 13.5,
-        color: Colors.white,
-        fontWeight: enabled ? FontWeight.w700 : FontWeight.w500,
-      ),
-    );
-  }
-
-  Widget _subscriptionProfileTitle(String uri, {required bool selected}) {
+  Widget _profileTitle(String uri) {
+    final label = _labelFor(uri);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        _configTitleMarquee(_vlessDisplayName(uri), enabled: true),
-        const SizedBox(height: 4),
         Text(
-          _vlessProtocolLine(uri),
+          label.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(
+            fontSize: 14,
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          label.detail,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
             fontSize: 12,
-            color: Colors.white.withOpacity(0.65),
+            color: Colors.white.withValues(alpha: 0.66),
             fontWeight: FontWeight.w600,
           ),
         ),
       ],
     );
+  }
+
+  /// Trailing check for the selected row; a spinner while it is being applied.
+  Widget _selectionMark(String uri) {
+    final selected = _effectiveSelectedUri == uri;
+    final pending = selected && widget.pendingProfileUri == uri;
+    final Widget child;
+    if (pending) {
+      child = const SizedBox(
+        key: ValueKey('pending'),
+        width: 24,
+        height: 24,
+        child: Padding(
+          padding: EdgeInsets.all(4),
+          child: CircularProgressIndicator(strokeWidth: 2, color: _accentColor),
+        ),
+      );
+    } else if (selected) {
+      child = Container(
+        key: const ValueKey('selected'),
+        width: 24,
+        height: 24,
+        decoration: BoxDecoration(
+          color: _accentColor.withValues(alpha: 0.18),
+          shape: BoxShape.circle,
+        ),
+        child: const Icon(Icons.check_rounded, color: _accentColor, size: 16),
+      );
+    } else {
+      child = const SizedBox(
+        key: ValueKey('not-selected'),
+        width: 24,
+        height: 24,
+      );
+    }
+    return AnimatedSwitcher(duration: NeuraUi.fast, child: child);
   }
 
   late final SubscriptionRepository _repository;
@@ -121,6 +251,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   final Map<String, bool> _expandedSubscriptions = <String, bool>{};
   final Set<String> _refreshingSubscriptions = <String>{};
   bool _isLoading = false;
+  bool _loadedOnce = false;
   late int _lastRefreshToken;
   ProfileAvailabilityController? _availability;
   Timer? _availabilityRefresh;
@@ -145,8 +276,16 @@ class _ProfileListViewState extends State<ProfileListView> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
-              title: Text(subscription.name),
-              subtitle: Text(_profileCountLabel(subscription.profileCount)),
+              title: Text(
+                _subscriptionDisplayName(
+                  subscription,
+                  _subscriptions.indexOf(subscription),
+                ),
+              ),
+              subtitle: Text(
+                '${_profileCountLabel(subscription.profileCount)} · '
+                '${_lastUpdatedLabel(subscription.lastUpdated)}',
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.refresh_rounded),
@@ -228,6 +367,7 @@ class _ProfileListViewState extends State<ProfileListView> {
   void didUpdateWidget(covariant ProfileListView oldWidget) {
     super.didUpdateWidget(oldWidget);
     _syncCheckProfiles();
+    if (!identical(widget.profiles, oldWidget.profiles)) _pruneLabels();
     if (widget.subscriptionsRefreshToken != _lastRefreshToken) {
       _lastRefreshToken = widget.subscriptionsRefreshToken;
       unawaited(_loadSubscriptions());
@@ -245,12 +385,16 @@ class _ProfileListViewState extends State<ProfileListView> {
 
   Future<void> _loadSubscriptions() async {
     if (!mounted) return;
-    setState(() => _isLoading = true);
+    // Reloads after refresh/rename keep the list on screen: swapping it for a
+    // spinner flashed the whole card and lost the scroll position.
+    if (!_loadedOnce) setState(() => _isLoading = true);
     try {
       final subs = await _repository.getAllSubscriptions();
       if (!mounted) return;
       setState(() {
         _subscriptions = subs;
+        _loadedOnce = true;
+        _pruneLabels();
         _syncCheckProfiles();
         for (final sub in subs) {
           _expandedSubscriptions.putIfAbsent(sub.id, () => true);
@@ -261,7 +405,7 @@ class _ProfileListViewState extends State<ProfileListView> {
       if (!mounted) return;
       debugPrint('[ProfileListView] Failed to load subscriptions: $e');
     } finally {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted && _isLoading) setState(() => _isLoading = false);
     }
   }
 
@@ -332,7 +476,7 @@ class _ProfileListViewState extends State<ProfileListView> {
         title: const Text('Удалить подписку?'),
         child: Text(
           'Удалить "${subscription.name}" с устройства? Это действие нельзя отменить.',
-          style: TextStyle(color: Colors.white.withOpacity(0.78)),
+          style: TextStyle(color: Colors.white.withValues(alpha: 0.78)),
         ),
         actions: [
           TextButton(
@@ -360,28 +504,33 @@ class _ProfileListViewState extends State<ProfileListView> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isLoading) {
-      return const Center(child: CircularProgressIndicator.adaptive());
-    }
-
-    final children = <Widget>[];
-    if (widget.mobile && _availability != null) {
-      children.add(
-        Padding(
-          padding: const EdgeInsets.fromLTRB(4, 0, 4, 12),
-          child: _buildCheckButton(),
-        ),
+    if (_isLoading && !_loadedOnce) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Center(child: CircularProgressIndicator()),
       );
     }
 
-    final selectedProfile = widget.selectedProfile;
-    if (selectedProfile != null) {
-      children.add(_buildCurrentSelection(selectedProfile));
+    final children = <Widget>[];
+
+    final selectedUri = _effectiveSelectedUri;
+    if (selectedUri != null) {
+      children.add(_buildCurrentSelection(selectedUri));
     }
 
     if (widget.profiles.isNotEmpty) {
       // Standalone VLESS keys imported manually
-      children.add(_buildSectionHeader('Конфигурации'));
+      children.add(
+        _buildSectionHeader(
+          'Конфигурации',
+          trailing: _availability == null
+              ? null
+              : _checkAction(
+                  scope: _localScope,
+                  uris: [for (final profile in widget.profiles) profile.uri],
+                ),
+        ),
+      );
       children.addAll(_buildRegularKeys());
     }
 
@@ -390,13 +539,8 @@ class _ProfileListViewState extends State<ProfileListView> {
       children.addAll(_buildSubscriptions());
     }
 
-    if (widget.mobile && widget.profiles.isEmpty && _subscriptions.isEmpty) {
-      children.add(
-        const Padding(padding: EdgeInsets.all(16), child: Text('Профилей нет')),
-      );
-    }
-    if (children.isEmpty) {
-      return const Center(child: Text('Профилей нет'));
+    if (widget.profiles.isEmpty && _subscriptions.isEmpty) {
+      children.add(_buildEmptyHint());
     }
 
     return ListView(
@@ -411,99 +555,102 @@ class _ProfileListViewState extends State<ProfileListView> {
     );
   }
 
-  Widget _buildCheckButton() {
+  static const String _localScope = '__local__';
+
+  /// Small per-group check button: probes only the servers of this group.
+  /// While its own run is going it shows progress and stops the run.
+  Widget _checkAction({required String scope, required List<String> uris}) {
     final checks = _availability!;
-    final hasProfiles =
-        widget.profiles.isNotEmpty ||
-        _subscriptions.any((sub) => sub.profiles.isNotEmpty);
-    return Tooltip(
-      message: checks.cancelling
-          ? 'Отмена проверки'
-          : checks.running
-          ? 'Остановить проверку'
-          : 'Проверить все конфигурации через HTTPS',
-      child: OutlinedButton(
-        key: const ValueKey('check-all-profiles'),
-        style: OutlinedButton.styleFrom(
-          minimumSize: const Size(double.infinity, 64),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-          foregroundColor: Colors.white,
-          backgroundColor: _accentColor.withValues(alpha: 0.10),
-          side: BorderSide(color: _accentColor.withValues(alpha: 0.35)),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        ),
-        onPressed: !hasProfiles || checks.cancelling
-            ? null
-            : () {
-                if (checks.running) {
-                  unawaited(checks.cancel());
-                } else {
-                  _syncCheckProfiles();
-                  unawaited(checks.checkAll());
-                }
-              },
-        child: Row(
-          children: [
-            Icon(
-              checks.running
-                  ? Icons.stop_circle_outlined
-                  : Icons.fact_check_outlined,
-              color: hasProfiles ? _accentColor : Colors.white38,
-              size: 24,
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: DefaultTextStyle.merge(
-                style: const TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
+    final mine = checks.running && checks.runningScope == scope;
+    final elsewhere = checks.running && !mine;
+    final progress = checks.total == 0 ? null : checks.completed / checks.total;
+    return _subscriptionAction(
+      key: ValueKey('check-$scope'),
+      tooltip: mine
+          ? (checks.cancelling
+                ? 'Останавливаем проверку'
+                : 'Остановить проверку')
+          : 'Проверить серверы',
+      onPressed: uris.isEmpty || elsewhere || checks.cancelling
+          ? null
+          : () {
+              if (mine) {
+                NeuraHaptics.light();
+                unawaited(checks.cancel());
+                return;
+              }
+              NeuraHaptics.light();
+              if (scope != _localScope) {
+                setState(() => _expandedSubscriptions[scope] = true);
+              }
+              _syncCheckProfiles();
+              unawaited(checks.checkAll(uris, scope: scope));
+            },
+      child: mine
+          ? Stack(
+              alignment: Alignment.center,
+              children: [
+                SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(
+                    value: progress == 0 ? null : progress,
+                    strokeWidth: 2.2,
+                    color: _accentColor,
+                    backgroundColor: Colors.white.withValues(alpha: 0.12),
+                  ),
                 ),
-                child: IndexedStack(
-                  index: checks.cancelling
-                      ? 2
-                      : checks.running
-                      ? 1
-                      : 0,
-                  alignment: Alignment.centerLeft,
-                  children: const [
-                    Text('Проверить доступность'),
-                    Text('Остановить проверку'),
-                    Text('Остановка проверки'),
-                  ],
-                ),
-              ),
-            ),
-            // Reserve the progress width so starting a scan never moves the label.
-            SizedBox(
-              width: 52,
-              child: checks.running
-                  ? FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: Text(
-                        '${checks.completed}/${checks.total}',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white70,
-                        ),
-                      ),
-                    )
-                  : null,
-            ),
-          ],
-        ),
-      ),
+                const Icon(Icons.stop_rounded, size: 14, color: Colors.white),
+              ],
+            )
+          : const Icon(Icons.speed_rounded, size: 21),
     );
   }
 
-  Widget _buildSectionHeader(String title) {
+  /// "работают 12 из 20" after a check, or live progress while one runs.
+  String? _checkSummary(String scope, List<String> uris) {
+    final checks = _availability;
+    if (checks == null || uris.isEmpty) return null;
+    if (checks.running && checks.runningScope == scope) {
+      return 'проверено ${checks.completed} из ${checks.total}';
+    }
+    var judged = 0;
+    var working = 0;
+    for (final uri in uris) {
+      final status = checks.resultFor(uri).status;
+      if (status == ProfileAvailability.available) {
+        working++;
+        judged++;
+      } else if (status == ProfileAvailability.unavailable ||
+          status == ProfileAvailability.error) {
+        judged++;
+      }
+    }
+    if (judged == 0) return null;
+    return 'работают $working из $judged';
+  }
+
+  Widget _buildSectionHeader(String title, {Widget? trailing}) {
+    final label = Text(
+      title,
+      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+        color: NeuraUi.neutral.withValues(alpha: 0.62),
+        fontWeight: FontWeight.bold,
+      ),
+    );
+    if (trailing == null) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+        child: label,
+      );
+    }
     return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-      child: Text(
-        title,
-        style: Theme.of(context).textTheme.titleSmall?.copyWith(
-          color: NeuraUi.neutral.withOpacity(0.5),
-          fontWeight: FontWeight.bold,
-        ),
+      padding: const EdgeInsets.fromLTRB(16, 8, 4, 0),
+      child: Row(
+        children: [
+          Expanded(child: label),
+          trailing,
+        ],
       ),
     );
   }
@@ -511,84 +658,105 @@ class _ProfileListViewState extends State<ProfileListView> {
   List<Widget> _buildRegularKeys() {
     return List.generate(widget.profiles.length, (index) {
       final profile = widget.profiles[index];
-      final isSelected = widget.selectedProfile?.uri == profile.uri;
-
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 2),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(8),
-            color: isSelected ? _accentColor.withOpacity(0.14) : null,
-            border: Border.all(
-              color: isSelected
-                  ? _accentColor.withOpacity(0.95)
-                  : Colors.transparent,
-              width: isSelected ? 1.3 : 0,
+        child: _profileRow(
+          uri: profile.uri,
+          radius: BorderRadius.circular(8),
+          onTap: () => widget.onProfileSelected(profile),
+          actions: [
+            IconButton(
+              tooltip: 'Удалить профиль',
+              icon: const Icon(
+                Icons.delete_outline_rounded,
+                size: 20,
+                color: NeuraUi.danger,
+              ),
+              onPressed: () => _confirmDeleteProfile(profile),
             ),
-            boxShadow: isSelected
-                ? [
-                    BoxShadow(
-                      color: _accentColor.withOpacity(0.18),
-                      blurRadius: 14,
-                      offset: const Offset(0, 6),
-                    ),
-                  ]
-                : null,
-          ),
-          child: ListTile(
-            dense: true,
-            contentPadding: const EdgeInsets.fromLTRB(12, 6, 8, 6),
-            title: _configTitleMarquee(
-              _formatVlessSummary(profile.uri),
-              enabled: true,
-            ),
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_availability != null) _availabilityIcon(profile.uri),
-                IconButton(
-                  tooltip: 'Удалить профиль',
-                  icon: const Icon(
-                    Icons.delete,
-                    size: 18,
-                    color: NeuraUi.danger,
-                  ),
-                  onPressed: () async {
-                    final confirm = await showNeuraDialog<bool>(
-                      context: context,
-                      builder: (context) => NeuraOverlayDialog(
-                        title: const Text('Удалить профиль?'),
-                        child: Text(
-                          'Удалить "${profile.name}" с этого устройства?',
-                          style: TextStyle(
-                            color: Colors.white.withOpacity(0.78),
-                          ),
-                        ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(context, false),
-                            child: const Text('Отмена'),
-                          ),
-                          FilledButton(
-                            onPressed: () => Navigator.pop(context, true),
-                            child: const Text('Удалить'),
-                          ),
-                        ],
-                      ),
-                    );
-                    if (confirm == true) {
-                      widget.onDeleteProfile(profile);
-                    }
-                  },
-                ),
-              ],
-            ),
-            onTap: () => widget.onProfileSelected(profile),
-          ),
+          ],
         ),
       );
     });
+  }
+
+  Future<void> _confirmDeleteProfile(VpnProfile profile) async {
+    final confirm = await showNeuraDialog<bool>(
+      context: context,
+      builder: (context) => NeuraOverlayDialog(
+        title: const Text('Удалить профиль?'),
+        child: Text(
+          'Удалить «${_vlessDisplayName(profile.uri)}» с этого устройства?',
+          style: TextStyle(color: Colors.white.withValues(alpha: 0.78)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirm == true) widget.onDeleteProfile(profile);
+  }
+
+  /// One selectable profile row, shared by local keys and subscriptions so
+  /// both read the same: tint plus check mark when selected.
+  Widget _profileRow({
+    required String uri,
+    required VoidCallback onTap,
+    List<Widget> actions = const [],
+    BorderRadius? radius,
+    bool divider = false,
+  }) {
+    final selected = _effectiveSelectedUri == uri;
+    return Semantics(
+      button: true,
+      selected: selected,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: radius,
+        clipBehavior: radius == null ? Clip.none : Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          hoverColor: Colors.white.withValues(alpha: 0.035),
+          child: AnimatedContainer(
+            duration: NeuraUi.fast,
+            curve: NeuraUi.curve,
+            constraints: const BoxConstraints(minHeight: 60),
+            padding: const EdgeInsets.fromLTRB(14, 6, 6, 6),
+            decoration: BoxDecoration(
+              color: selected
+                  ? _accentColor.withValues(alpha: 0.12)
+                  : Colors.transparent,
+              border: divider
+                  ? Border(
+                      bottom: BorderSide(
+                        color: Colors.white.withValues(alpha: 0.05),
+                      ),
+                    )
+                  : null,
+            ),
+            child: Row(
+              children: [
+                Expanded(child: _profileTitle(uri)),
+                const SizedBox(width: 6),
+                if (_availability != null) _availabilityIcon(uri),
+                ...actions,
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  child: _selectionMark(uri),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   List<Widget> _buildSubscriptions() {
@@ -611,7 +779,7 @@ class _ProfileListViewState extends State<ProfileListView> {
         decoration: widget.mobile
             ? const BoxDecoration()
             : BoxDecoration(
-                color: Colors.white.withOpacity(0.018),
+                color: Colors.white.withValues(alpha: 0.018),
                 borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: _borderColor),
               ),
@@ -621,11 +789,7 @@ class _ProfileListViewState extends State<ProfileListView> {
             Material(
               color: Colors.transparent,
               child: InkWell(
-                onTap: () {
-                  setState(() {
-                    _expandedSubscriptions[subscription.id] = !isExpanded;
-                  });
-                },
+                onTap: () => _toggleExpanded(subscription.id, isExpanded),
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(12, 10, 6, 10),
                   child: Row(
@@ -634,7 +798,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                         width: 34,
                         height: 34,
                         decoration: BoxDecoration(
-                          color: _accentColor.withOpacity(0.11),
+                          color: _accentColor.withValues(alpha: 0.11),
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: const Icon(
@@ -665,12 +829,22 @@ class _ProfileListViewState extends State<ProfileListView> {
                               ),
                               const SizedBox(height: 3),
                               Text(
-                                subscription.error ?? '${_profileCountLabel(subscription.profileCount)} · ${_lastUpdatedLabel(subscription.lastUpdated)}',
-                                maxLines: 1,
+                                subscription.error ??
+                                [
+                                  _profileCountLabel(subscription.profileCount),
+                                  _checkSummary(
+                                        subscription.id,
+                                        subscription.profiles,
+                                      ) ??
+                                      _lastUpdatedLabel(
+                                        subscription.lastUpdated,
+                                      ),
+                                ].join(' · '),
+                                maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(
-                                  color: Colors.white.withOpacity(0.48),
-                                  fontSize: 11,
+                                  color: Colors.white.withValues(alpha: 0.62),
+                                  fontSize: 12,
                                   fontWeight: FontWeight.w500,
                                 ),
                               ),
@@ -678,11 +852,29 @@ class _ProfileListViewState extends State<ProfileListView> {
                           ),
                         ),
                       ),
+                      if (_availability != null)
+                        _checkAction(
+                          scope: subscription.id,
+                          uris: subscription.profiles,
+                        ),
                       if (widget.mobile)
                         _subscriptionAction(
-                          tooltip: 'Действия с подпиской',
-                          onPressed: () => _showMobileActions(subscription),
-                          child: const Icon(Icons.more_horiz_rounded),
+                          tooltip: isRefreshing
+                              ? 'Подписка обновляется'
+                              : 'Действия с подпиской',
+                          onPressed: isRefreshing
+                              ? null
+                              : () => _showMobileActions(subscription),
+                          child: isRefreshing
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: _accentColor,
+                                  ),
+                                )
+                              : const Icon(Icons.more_horiz_rounded),
                         ),
                       if (!widget.mobile)
                         _subscriptionAction(
@@ -705,7 +897,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                         _subscriptionAction(
                           tooltip: 'Удалить подписку',
                           onPressed: () => _deleteSubscription(subscription),
-                          hoverColor: NeuraUi.danger.withOpacity(0.12),
+                          hoverColor: NeuraUi.danger.withValues(alpha: 0.12),
                           child: const Icon(
                             Icons.delete_outline_rounded,
                             size: 18,
@@ -713,12 +905,8 @@ class _ProfileListViewState extends State<ProfileListView> {
                         ),
                       _subscriptionAction(
                         tooltip: isExpanded ? 'Свернуть' : 'Развернуть',
-                        onPressed: () {
-                          setState(() {
-                            _expandedSubscriptions[subscription.id] =
-                                !isExpanded;
-                          });
-                        },
+                        onPressed: () =>
+                            _toggleExpanded(subscription.id, isExpanded),
                         child: AnimatedRotation(
                           turns: isExpanded ? 0.5 : 0,
                           duration: NeuraUi.fast,
@@ -744,7 +932,7 @@ class _ProfileListViewState extends State<ProfileListView> {
                         children: [
                           Divider(
                             height: 1,
-                            color: Colors.white.withOpacity(0.06),
+                            color: Colors.white.withValues(alpha: 0.06),
                           ),
                           ..._buildSubscriptionProfiles(subscription),
                         ],
@@ -760,103 +948,27 @@ class _ProfileListViewState extends State<ProfileListView> {
 
   List<Widget> _buildSubscriptionProfiles(VpnSubscription subscription) {
     return List.generate(subscription.profiles.length, (index) {
-      final vlessUri = subscription.profiles[index];
-      final isSelected = widget.selectedProfile?.uri == vlessUri;
-
-      return Material(
-        color: Colors.transparent,
-        child: InkWell(
-          onTap: () {
-            final profile = VpnProfile(
-              name: _formatVlessSummary(vlessUri),
-              uri: vlessUri,
-            );
-            widget.onProfileSelected(profile);
-          },
-          hoverColor: Colors.white.withOpacity(0.035),
-          child: AnimatedContainer(
-            duration: NeuraUi.fast,
-            curve: NeuraUi.curve,
-            constraints: const BoxConstraints(minHeight: 58),
-            decoration: BoxDecoration(
-              color: isSelected
-                  ? _accentColor.withOpacity(0.095)
-                  : Colors.transparent,
-              border: Border(
-                bottom: BorderSide(color: Colors.white.withOpacity(0.045)),
-              ),
-            ),
-            child: Stack(
-              children: [
-                if (isSelected)
-                  const Positioned(
-                    left: 0,
-                    top: 9,
-                    bottom: 9,
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: _accentColor,
-                        borderRadius: BorderRadius.only(
-                          topRight: Radius.circular(3),
-                          bottomRight: Radius.circular(3),
-                        ),
-                      ),
-                      child: SizedBox(width: 3),
-                    ),
-                  ),
-                ListTile(
-                  dense: true,
-                  contentPadding: const EdgeInsets.fromLTRB(14, 6, 12, 6),
-                  title: _subscriptionProfileTitle(
-                    vlessUri,
-                    selected: isSelected,
-                  ),
-                  trailing: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_availability != null) _availabilityIcon(vlessUri),
-                      AnimatedSwitcher(
-                        duration: NeuraUi.fast,
-                        child: isSelected
-                            ? Container(
-                                key: const ValueKey('selected'),
-                                width: 24,
-                                height: 24,
-                                decoration: BoxDecoration(
-                                  color: _accentColor.withOpacity(0.16),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: const Icon(
-                                  Icons.check_rounded,
-                                  color: _accentColor,
-                                  size: 16,
-                                ),
-                              )
-                            : const SizedBox(
-                                key: ValueKey('not-selected'),
-                                width: 24,
-                                height: 24,
-                              ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
+      final uri = subscription.profiles[index];
+      return _profileRow(
+        uri: uri,
+        divider: index < subscription.profiles.length - 1,
+        onTap: () => widget.onProfileSelected(
+          VpnProfile(name: _formatVlessSummary(uri), uri: uri),
         ),
       );
     });
   }
 
-  Widget _buildCurrentSelection(VpnProfile profile) {
-    final subscription = _subscriptionForUri(profile.uri);
+  Widget _buildCurrentSelection(String uri) {
+    final subscription = _subscriptionForUri(uri);
     final subscriptionIndex = subscription == null
         ? -1
         : _subscriptions.indexOf(subscription);
     final source = subscription == null
         ? 'Локальная конфигурация'
-        : _subscriptionDisplayName(subscription, subscriptionIndex);
+        : 'Подписка «${_subscriptionDisplayName(subscription, subscriptionIndex)}»';
+    final pending = widget.pendingProfileUri == uri;
+    final label = _labelFor(uri);
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 4, 4, 6),
@@ -866,66 +978,97 @@ class _ProfileListViewState extends State<ProfileListView> {
           Padding(
             padding: const EdgeInsets.fromLTRB(8, 0, 8, 7),
             child: Text(
-              'Текущий выбор',
+              pending ? 'Применяем выбор…' : 'Текущий выбор',
               style: TextStyle(
-                color: Colors.white.withOpacity(0.48),
+                color: Colors.white.withValues(alpha: 0.62),
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
               ),
             ),
           ),
-          Container(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-            decoration: BoxDecoration(
-              color: _accentColor.withOpacity(0.085),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: _accentColor.withOpacity(0.2)),
-            ),
-            child: Row(
-              children: [
-                Container(
-                  width: 28,
-                  height: 28,
-                  decoration: BoxDecoration(
-                    color: _accentColor.withOpacity(0.16),
-                    shape: BoxShape.circle,
+          Semantics(
+            liveRegion: true,
+            label: pending
+                ? 'Применяем ${label.name}'
+                : 'Выбран ${label.name}, ${label.detail}, $source',
+            excludeSemantics: true,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              decoration: BoxDecoration(
+                color: _accentColor.withValues(alpha: 0.085),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: _accentColor.withValues(alpha: 0.22)),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      color: _accentColor.withValues(alpha: 0.16),
+                      shape: BoxShape.circle,
+                    ),
+                    child: AnimatedSwitcher(
+                      duration: NeuraUi.fast,
+                      child: pending
+                          ? const Padding(
+                              key: ValueKey('pending'),
+                              padding: EdgeInsets.all(6),
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: _accentColor,
+                              ),
+                            )
+                          : const Icon(
+                              Icons.check_rounded,
+                              key: ValueKey('selected'),
+                              color: _accentColor,
+                              size: 17,
+                            ),
+                    ),
                   ),
-                  child: const Icon(
-                    Icons.check_rounded,
-                    color: _accentColor,
-                    size: 17,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _vlessDisplayName(profile.uri),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          label.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        '$source · ${_vlessProtocolLine(profile.uri)}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.52),
-                          fontSize: 11,
-                          fontWeight: FontWeight.w500,
+                        const SizedBox(height: 3),
+                        Text(
+                          label.detail,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.72),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                    ],
+                        const SizedBox(height: 2),
+                        Text(
+                          source,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.58),
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ],
@@ -934,21 +1077,23 @@ class _ProfileListViewState extends State<ProfileListView> {
   }
 
   Widget _subscriptionAction({
+    Key? key,
     required String tooltip,
     required VoidCallback? onPressed,
     required Widget child,
     Color? hoverColor,
   }) {
     return SizedBox(
-      width: widget.mobile ? 44 : 34,
-      height: widget.mobile ? 44 : 34,
+      key: key,
+      width: widget.mobile ? 48 : 34,
+      height: widget.mobile ? 48 : 34,
       child: IconButton(
         tooltip: tooltip,
         onPressed: onPressed,
         padding: EdgeInsets.zero,
-        splashRadius: 18,
-        color: Colors.white54,
-        hoverColor: hoverColor ?? Colors.white.withOpacity(0.06),
+        splashRadius: widget.mobile ? 22 : 18,
+        color: Colors.white70,
+        hoverColor: hoverColor ?? Colors.white.withValues(alpha: 0.06),
         icon: child,
       ),
     );
@@ -1010,15 +1155,47 @@ class _ProfileListViewState extends State<ProfileListView> {
     return shared.join(' ').trim();
   }
 
-  String _profileCountLabel(int count) {
-    final mod10 = count % 10;
-    final mod100 = count % 100;
-    final noun = mod10 == 1 && mod100 != 11
-        ? 'сервер'
-        : (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14))
-        ? 'сервера'
-        : 'серверов';
-    return '$count $noun';
+  String _profileCountLabel(int count) => serverCountLabel(count);
+
+  void _toggleExpanded(String id, bool isExpanded) {
+    NeuraHaptics.selection();
+    setState(() => _expandedSubscriptions[id] = !isExpanded);
+  }
+
+  Widget _buildEmptyHint() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 20, 12, 20),
+      child: Column(
+        children: [
+          Icon(
+            Icons.vpn_key_outlined,
+            size: 28,
+            color: Colors.white.withValues(alpha: 0.5),
+          ),
+          const SizedBox(height: 10),
+          const Text(
+            'Пока нет профилей',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Нажмите «+», чтобы добавить подписку или ключ, '
+            'или отсканируйте QR-код.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.66),
+              fontSize: 13,
+              height: 1.35,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   String _lastUpdatedLabel(DateTime value) {

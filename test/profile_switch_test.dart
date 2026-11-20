@@ -419,7 +419,9 @@ void main() {
           await tester.tap(find.byTooltip('Действия с подпиской').first);
           await tester.pumpAndSettle();
           await tester.tap(find.text('Обновить'));
-          await tester.pumpAndSettle();
+          // The subscription row shows a spinner until the refresh answers,
+          // so the frame never settles here.
+          await tester.pump(const Duration(milliseconds: 400));
           await waitForMessage(); // Explicit refresh in the subscription menu.
           expect(requests, greaterThan(before));
           await tester.pumpAndSettle();
@@ -575,6 +577,48 @@ void main() {
     expect(core.calls, ['sync', 'stop', 'stop-complete', 'start']);
     expect(core.startedUris, [profiles[1].uri]);
     expect(profileList(tester).selectedProfile?.uri, profiles[1].uri);
+  });
+
+  testWidgets('tapped route is highlighted before the service answers', (
+    tester,
+  ) async {
+    final core = FakeVpnCore()..syncGate = Completer<void>();
+    await pumpApp(tester, core);
+    profileList(tester).onProfileSelected(profiles[1]);
+    await tester.pump();
+    // Same frame as the tap: the row is marked while the service round-trip
+    // is still pending.
+    expect(profileList(tester).pendingProfileUri, profiles[1].uri);
+    expect(find.text('Применяем выбор…'), findsOneWidget);
+    core.syncGate!.complete();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(profileList(tester).pendingProfileUri, isNull);
+    expect(profileList(tester).selectedProfile?.uri, profiles[1].uri);
+    expect(find.text('Текущий выбор'), findsOneWidget);
+    expect(core.startedUris, isEmpty);
+  });
+
+  testWidgets('a route tap while connecting explains why nothing changes', (
+    tester,
+  ) async {
+    final core = FakeVpnCore()..startGate = Completer<void>();
+    await pumpApp(tester, core);
+    await tester.tap(find.byKey(const ValueKey('main-connect-button')));
+    await tester.pump();
+    expect(find.text('Подключение...'), findsWidgets);
+    profileList(tester).onProfileSelected(profiles[1]);
+    await tester.pump();
+    expect(
+      find.text('Дождитесь подключения, затем выберите сервер'),
+      findsOneWidget,
+    );
+    expect(profileList(tester).pendingProfileUri, isNull);
+    expect(profileList(tester).selectedProfile?.uri, profiles.first.uri);
+    core.startGate!.complete();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(core.startedUris, [profiles.first.uri]);
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pumpAndSettle();
   });
 
   for (final phase in [AndroidVpnPhase.running, AndroidVpnPhase.stopping]) {

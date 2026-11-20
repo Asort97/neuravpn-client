@@ -364,25 +364,33 @@ void main() {
   });
 
   test(
-    'manual HTTPS check receives entire full profile, not first outbound',
+    'manual HTTPS check probes every candidate, not the first outbound',
     () async {
       const channel = MethodChannel('neuravpn/profile_probe');
       final messenger =
           TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
       final original = xraySubscriptionProfile(candidates: 6);
+      final candidates = (original['outbounds'] as List)
+          .cast<Map<String, dynamic>>()
+          .where((o) => const {'vless', 'hysteria'}.contains(o['protocol']))
+          .toList();
       messenger.setMockMethodCallHandler(channel, (call) async {
-        final config = jsonDecode(call.arguments['config'] as String);
-        expect(config['outbounds'], original['outbounds']);
-        expect(config['routing'], original['routing']);
-        expect(config['observatory'], original['observatory']);
-        expect(config['fullProfile'], isTrue);
-        return {'status': 'available', 'code': 'HTTPS_OK'};
+        if (call.method != 'check') return null;
+        final targets = (jsonDecode(call.arguments['targets'] as String)
+                as List)
+            .cast<Map<String, dynamic>>();
+        expect(targets.map((t) => t['outbound']), candidates);
+        return {'status': 'done'};
       });
       addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
-      expect(
-        (await AndroidProfileCheckBackend().check(jsonEncode(original))).status,
-        ProfileAvailability.available,
+      final plan = ProfileProbePlan.build([jsonEncode(original)]);
+      expect(plan.targets, hasLength(candidates.length));
+      expect(candidates.length, greaterThan(1));
+      final result = await AndroidProfileCheckBackend().run(
+        plan.targets,
+        (_) {},
       );
+      expect(result.code, isNull);
     },
   );
 

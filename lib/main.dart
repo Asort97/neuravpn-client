@@ -491,6 +491,13 @@ class _VlessHomePageState extends State<VlessHomePage>
   bool _isConnecting = false;
   bool _isDisconnecting = false;
   bool _isSwitchingProfile = false;
+
+  /// Set the instant the connect button is tapped, before the Android service
+  /// state round-trip finishes, so the button reacts on the same frame.
+  bool _connectPending = false;
+
+  /// Profile tapped while the switch is still being applied (optimistic).
+  String? _pendingProfileUri;
   int _connectionUiEpoch = 0;
   bool _connectButtonHovered = false;
   bool _connectButtonPressed = false;
@@ -1963,10 +1970,13 @@ $regItems = foreach ($rp in $regPaths) {
     }
   }
 
+  /// Connecting as the user perceives it: includes the optimistic phase.
+  bool get _showConnecting => _isConnecting || _connectPending;
+
   void _updateConnectGlowTicker() {
     // Animate only while connecting. A connected screen stays still: a
     // per-frame pulse re-blurs the glass card behind it and drains battery.
-    final shouldAnimate = !_mobileReduceMotion && _isConnecting;
+    final shouldAnimate = !_mobileReduceMotion && _showConnecting;
     if (shouldAnimate) {
       if (!_connectGlowController.isAnimating) {
         _connectGlowController.repeat();
@@ -1985,7 +1995,7 @@ $regItems = foreach ($rp in $regPaths) {
       _frameAnimController.value = 0;
       return;
     }
-    if (_isConnecting) {
+    if (_showConnecting) {
       if (!_frameAnimForward || !_frameAnimController.isAnimating) {
         _frameAnimForward = true;
         _frameAnimController.repeat();
@@ -2504,7 +2514,7 @@ $regItems = foreach ($rp in $regPaths) {
   Future<void> _pollAndroidVpnState() async {
     if (!Platform.isAndroid || !mounted) return;
     if (_androidStatePollInProgress) return;
-    if (_isConnecting || _isDisconnecting || _isSwitchingProfile) return;
+    if (_showConnecting || _isDisconnecting || _isSwitchingProfile) return;
     _androidStatePollInProgress = true;
     try {
       final wasRunning = _isRunning;
@@ -3804,7 +3814,17 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _onProfileSelected(VpnProfile profile) async {
-    if (_isConnecting || _isDisconnecting || _isSwitchingProfile) return;
+    if (_isSwitchingProfile) return;
+    if (_showConnecting || _isDisconnecting) {
+      // A silent no-op reads as a broken tap.
+      NeuraHaptics.warning();
+      _showFastSnack(
+        _isDisconnecting
+            ? 'Дождитесь отключения, затем выберите сервер'
+            : 'Дождитесь подключения, затем выберите сервер',
+      );
+      return;
+    }
     if (_selectedProfile?.uri == profile.uri) return;
     NeuraHaptics.selection();
 
@@ -3814,7 +3834,12 @@ $regItems = foreach ($rp in $regPaths) {
       return;
     }
 
-    setState(() => _isSwitchingProfile = true);
+    // Highlight the tapped row on this frame; the service round-trip and a
+    // possible reconnect follow while the row shows a spinner.
+    setState(() {
+      _isSwitchingProfile = true;
+      _pendingProfileUri = profile.uri;
+    });
     var expectedEpoch = _connectionUiEpoch;
     try {
       // Read our service, not the system's currently active VPN provider.
@@ -3841,9 +3866,14 @@ $regItems = foreach ($rp in $regPaths) {
         _isDisconnecting = false;
         _status = _isRunning ? 'Подключено' : 'Остановлено';
       });
-      _showFastSnack('Не удалось сменить обход. Попробуйте ещё раз.');
+      _showFastSnack('Не удалось сменить сервер. Попробуйте ещё раз.');
     } finally {
-      if (mounted) setState(() => _isSwitchingProfile = false);
+      if (mounted) {
+        setState(() {
+          _isSwitchingProfile = false;
+          _pendingProfileUri = null;
+        });
+      }
     }
   }
 
@@ -3867,10 +3897,15 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Future<void> _start({bool fromProfileSelection = false}) async {
-    if (_isConnecting || _isDisconnecting) return;
+    if (_isConnecting || _isDisconnecting || _connectPending) return;
     if (_isSwitchingProfile && !fromProfileSelection) return;
 
     var connectionEpoch = 0;
+    if (!_isRunning && mounted) {
+      setState(() => _connectPending = true);
+      _updateConnectGlowTicker();
+      _updateFrameAnimation();
+    }
     try {
       if (_usesNativeMobileVpn) {
         await _vpnCoreController.syncRuntimeState();
@@ -3888,6 +3923,7 @@ $regItems = foreach ($rp in $regPaths) {
         _status =
             '\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0430\u0435\u0442\u0441\u044f';
         _isConnecting = true;
+        _connectPending = false;
         _logLines.clear();
       });
       unawaited(_updateTrayMenu());
@@ -3987,6 +4023,14 @@ $regItems = foreach ($rp in $regPaths) {
       _stopTrafficMonitor();
       unawaited(_syncTrafficSamplingMode());
       _showFastSnack('Не удалось подключиться. Попробуйте ещё раз.');
+    } finally {
+      // Early exits (disposed, cancelled, stale epoch) must not leave the
+      // button spinning.
+      if (_connectPending && mounted) {
+        setState(() => _connectPending = false);
+        _updateConnectGlowTicker();
+        _updateFrameAnimation();
+      }
     }
   }
 
@@ -3995,6 +4039,7 @@ $regItems = foreach ($rp in $regPaths) {
     required bool isRunning,
   }) {
     if (_isSwitchingProfile && !_isConnecting) return;
+    if (_connectPending) return;
     if (_connectQuickActionsOpen) {
       setState(() {
         _connectQuickActionsOpen = false;
@@ -4023,6 +4068,26 @@ $regItems = foreach ($rp in $regPaths) {
     unawaited(_start());
   }
 
+  /// Plain-language stage of the running connection for the status hint.
+  String _connectStageHint() {
+    if (_connectPending) return 'Готовимся к подключению…';
+    final status = _status.toLowerCase();
+    if (status.contains('попытка') || status.contains('attempt')) {
+      return _status;
+    }
+    if (status.contains('разрешени')) return 'Проверяем разрешение на VPN…';
+    if (status.contains('генерац') || status.contains('конфиг')) {
+      return 'Готовим конфигурацию…';
+    }
+    if (status.contains('поиск') ||
+        status.contains('xray-core') ||
+        status.contains('tun backend')) {
+      return 'Готовим ядро VPN…';
+    }
+    if (status.contains('запуск')) return 'Запускаем защищённый туннель…';
+    return 'Устанавливается защищённое соединение';
+  }
+
   /// One spring impulse: the button swells and settles when the tunnel is up.
   void _playConnectPop() {
     if (_mobileReduceMotion) return;
@@ -4035,6 +4100,7 @@ $regItems = foreach ($rp in $regPaths) {
     required bool isEnabled,
     required bool isRunning,
   }) {
+    if (_connectPending) return 'Подключение...';
     if (_isConnecting) return 'Отменить подключение';
     if (_isDisconnecting) return 'Отключение...';
     if (isRunning) return 'Отключить VPN';
@@ -4528,12 +4594,20 @@ $regItems = foreach ($rp in $regPaths) {
                                   ),
                                 ),
                                 NeuraGlassPill(
-                                  active: _isRunning,
+                                  active: _isRunning && !_isDisconnecting,
                                   child: Text(
-                                    _isRunning ? 'Подключено' : 'Отключено',
+                                    _isDisconnecting
+                                        ? 'Отключение…'
+                                        : _isRunning
+                                        ? 'Подключено'
+                                        : _showConnecting
+                                        ? 'Подключение…'
+                                        : 'Отключено',
                                     style: TextStyle(
-                                      color: _isRunning
+                                      color: _isRunning && !_isDisconnecting
                                           ? _neuraRed
+                                          : _showConnecting
+                                          ? const Color(0xFFFBBF24)
                                           : Colors.white70,
                                       fontSize: 11,
                                       fontWeight: FontWeight.w700,
@@ -5617,21 +5691,30 @@ $regItems = foreach ($rp in $regPaths) {
     final isRunning = _isRunning;
     final isEnabled = _selectedProfile != null;
     final canInteract = !_isDisconnecting;
-    final statusColor = isRunning
+    final connecting = _showConnecting;
+    final statusColor = _isDisconnecting
+        ? const Color(0xFF9CA3AF)
+        : isRunning
         ? _neuraRed
-        : _isConnecting
+        : connecting
         ? const Color(0xFFFBBF24)
         : const Color(0xFF6B7280);
-    final statusText = isRunning
+    final statusText = _isDisconnecting
+        ? (connecting ? 'Отмена...' : 'Отключение...')
+        : isRunning
         ? 'Подключено'
-        : _isConnecting
+        : connecting
         ? 'Подключение...'
         : 'Не подключено';
-    final statusHint = isRunning
+    final statusHint = _isDisconnecting
+        ? 'Закрываем защищённое соединение'
+        : isRunning
         ? 'Соединение защищено'
-        : _isConnecting
-        ? 'Устанавливается защищённое соединение'
-        : 'Нажмите, чтобы подключиться';
+        : connecting
+        ? _connectStageHint()
+        : isEnabled
+        ? 'Нажмите, чтобы подключиться'
+        : 'Выберите сервер ниже, чтобы подключиться';
     final pingLabel = _pingInProgress
         ? '...'
         : (_pingMs != null ? '$_pingMs ms' : '--');
@@ -5644,7 +5727,7 @@ $regItems = foreach ($rp in $regPaths) {
     return _neuraCard(
       child: Stack(
         children: [
-          if (isRunning || _isConnecting)
+          if (isRunning || connecting)
             Positioned.fill(
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(20),
@@ -5686,7 +5769,7 @@ $regItems = foreach ($rp in $regPaths) {
                 ),
               ),
             ),
-          if (_isConnecting)
+          if (connecting)
             Positioned.fill(
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(20),
@@ -5744,10 +5827,16 @@ $regItems = foreach ($rp in $regPaths) {
                           ),
                         );
                       },
-                      child: Text(
-                        statusText,
+                      child: Semantics(
                         key: ValueKey(statusText),
-                        style: const TextStyle(color: Colors.white70),
+                        liveRegion: true,
+                        child: Text(
+                          statusText,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
                     ),
                     if (isEnabled)
@@ -5827,18 +5916,18 @@ $regItems = foreach ($rp in $regPaths) {
                             }
                           },
                           onLongPressStart:
-                              canInteract && !_isConnecting && !isRunning
+                              canInteract && !connecting && !isRunning
                               ? (_) => _openConnectQuickActions()
                               : null,
                           onLongPressMoveUpdate:
-                              canInteract && !_isConnecting && !isRunning
+                              canInteract && !connecting && !isRunning
                               ? (details) =>
                                     _updateConnectQuickActionFromGlobalPosition(
                                       details.globalPosition,
                                     )
                               : null,
                           onLongPressEnd:
-                              canInteract && !_isConnecting && !isRunning
+                              canInteract && !connecting && !isRunning
                               ? (_) => _commitConnectQuickAction()
                               : null,
                           onTap: canInteract
@@ -5861,7 +5950,7 @@ $regItems = foreach ($rp in $regPaths) {
                                         _connectButtonFocused)
                                   ? 1.04
                                   : 1.0;
-                              final pulse = _isConnecting
+                              final pulse = connecting
                                   ? 1 + 0.03 * math.sin(rotation)
                                   : 1.0;
                               final pop = 1 + 0.3 * _connectPopController.value;
@@ -5901,7 +5990,7 @@ $regItems = foreach ($rp in $regPaths) {
                                           gradient: RadialGradient(
                                             colors: [
                                               _neuraRed.withOpacity(
-                                                _isConnecting
+                                                connecting
                                                     ? 0.16
                                                     : (isRunning ? 0.12 : 0.04),
                                               ),
@@ -5911,7 +6000,7 @@ $regItems = foreach ($rp in $regPaths) {
                                           ),
                                         ),
                                       ),
-                                      if (_isConnecting)
+                                      if (connecting)
                                         Transform.rotate(
                                           angle: rotation,
                                           child: ring,
@@ -5928,7 +6017,7 @@ $regItems = foreach ($rp in $regPaths) {
                                             color: _neuraRed.withOpacity(
                                               _connectButtonHovered ||
                                                       _connectButtonFocused ||
-                                                      _isConnecting
+                                                      connecting
                                                   ? 0.35
                                                   : 0.12,
                                             ),
@@ -6000,14 +6089,14 @@ $regItems = foreach ($rp in $regPaths) {
                                                 : 1.0,
                                             child: AnimatedRotation(
                                               duration: NeuraUi.normal,
-                                              turns: _isConnecting ? 0.0125 : 0,
+                                              turns: connecting ? 0.0125 : 0,
                                               child: AnimatedBuilder(
                                                 animation: _frameAnimController,
                                                 builder: (context, _) {
                                                   final String framePath;
-                                                  if (_isConnecting ||
+                                                  if (connecting ||
                                                       _isDisconnecting) {
-                                                    final frames = _isConnecting
+                                                    final frames = connecting
                                                         ? _activeConnectFrames
                                                         : _activeDisconnectFrames;
                                                     final idx =
@@ -6089,7 +6178,7 @@ $regItems = foreach ($rp in $regPaths) {
                   statusHint,
                   key: ValueKey(statusHint),
                   textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white54),
+                  style: TextStyle(color: Colors.white.withValues(alpha: 0.7)),
                 ),
               ),
               const SizedBox(height: 8),
@@ -6272,55 +6361,75 @@ $regItems = foreach ($rp in $regPaths) {
   }
 
   Widget _buildWindowsInlineSmartRoutingToggle() {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        color: _neuraSurface.withOpacity(0.56),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withOpacity(0.07)),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 7, 8, 7),
-        child: Row(
-          children: [
-            Container(
-              width: 28,
-              height: 28,
-              decoration: BoxDecoration(
-                color: _neuraRed.withOpacity(_smartRouting ? 0.14 : 0.07),
-                borderRadius: BorderRadius.circular(9),
-              ),
-              child: Icon(
-                Icons.route_outlined,
-                color: _smartRouting ? _neuraRed : Colors.white54,
-                size: 15,
+    // The whole row toggles: the scaled-down switch alone was a 44x28 target.
+    return Semantics(
+      toggled: _smartRouting,
+      label: 'Умная маршрутизация',
+      excludeSemantics: true,
+      onTap: () => _setSmartRouting(!_smartRouting),
+      child: Material(
+        color: _neuraSurface.withValues(alpha: 0.56),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: Colors.white.withValues(alpha: 0.07)),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () {
+            NeuraHaptics.selection();
+            _setSmartRouting(!_smartRouting);
+          },
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 48),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 7, 8, 7),
+              child: Row(
+                children: [
+                  Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      color: _neuraRed.withOpacity(_smartRouting ? 0.14 : 0.07),
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                    child: Icon(
+                      Icons.route_outlined,
+                      color: _smartRouting ? _neuraRed : Colors.white54,
+                      size: 15,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Умная маршрутизация',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: 44,
+                    height: 28,
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: Switch.adaptive(
+                        value: _smartRouting,
+                        activeColor: _neuraRed,
+                        onChanged: (value) {
+                          NeuraHaptics.selection();
+                          _setSmartRouting(value);
+                        },
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(width: 10),
-            const Expanded(
-              child: Text(
-                'Умная маршрутизация',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            SizedBox(
-              width: 44,
-              height: 28,
-              child: FittedBox(
-                fit: BoxFit.contain,
-                child: Switch.adaptive(
-                  value: _smartRouting,
-                  activeColor: _neuraRed,
-                  onChanged: (value) => _setSmartRouting(value),
-                ),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -6386,6 +6495,7 @@ $regItems = foreach ($rp in $regPaths) {
             constraints: const BoxConstraints(maxHeight: 420),
             child: ProfileListView(
               mobile: !_isDesktopPlatform,
+              pendingProfileUri: _pendingProfileUri,
               checkBackend: Platform.isAndroid
                   ? AndroidProfileCheckBackend()
                   : null,

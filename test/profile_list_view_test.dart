@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -6,9 +7,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:happycat_vpnclient/models/vpn_profile.dart';
 import 'package:happycat_vpnclient/models/vpn_subscription.dart';
 import 'package:happycat_vpnclient/services/subscription_repository.dart';
+import 'package:happycat_vpnclient/vless/proxy_parser.dart';
 import 'package:happycat_vpnclient/widgets/neura_ui.dart';
 import 'package:happycat_vpnclient/widgets/profile_list_view.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'support/xray_subscription.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -76,6 +80,78 @@ void main() {
     expect(saved.single.profiles, subscription.profiles);
     expect(find.byKey(const ValueKey('profile-search')), findsNothing);
     expect(tester.takeException(), isNull);
+  });
+
+  test('profile labels describe the protocol in plain words', () {
+    expect(
+      ProfileLabel.fromUri(_vlessUri('Latvia', port: 443, type: 'xhttp')),
+      isA<ProfileLabel>()
+          .having((label) => label.name, 'name', 'Latvia')
+          .having((label) => label.detail, 'detail', 'VLESS · XHTTP · Reality'),
+    );
+    expect(
+      ProfileLabel.fromUri(
+        'hy2://password@example.com:443?sni=example.com#Hysteria',
+      ).detail,
+      'Hysteria 2',
+    );
+    final auto = ProfileLabel.fromUri(
+      jsonEncode(xraySubscriptionProfile(candidates: 5)),
+    );
+    expect(auto.name, '⚡ Автоматический выбор');
+    expect(auto.detail, 'Автовыбор · 6 серверов'); // 5 VLESS + Hysteria 2
+    expect(ProfileLabel.fromUri('not a link').name, 'Неподдерживаемый профиль');
+    expect(serverCountLabel(1), '1 сервер');
+    expect(serverCountLabel(3), '3 сервера');
+    expect(serverCountLabel(11), '11 серверов');
+  });
+
+  testWidgets('pending selection shows a spinner instead of the check mark', (
+    tester,
+  ) async {
+    final uri = _vlessUri('Latvia', port: 443, type: 'tcp');
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: NeuraUi.buildTheme(),
+        home: Scaffold(
+          body: ProfileListView(
+            mobile: true,
+            profiles: [VpnProfile(name: 'Latvia', uri: uri)],
+            selectedProfile: null,
+            pendingProfileUri: uri,
+            onProfileSelected: (_) {},
+            onDeleteProfile: (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('Применяем выбор…'), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNWidgets(2));
+    expect(find.byIcon(Icons.check_rounded), findsNothing);
+  });
+
+  testWidgets('empty list tells how to add a profile', (tester) async {
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: NeuraUi.buildTheme(),
+        home: Scaffold(
+          body: ProfileListView(
+            mobile: true,
+            profiles: const [],
+            selectedProfile: null,
+            onProfileSelected: (_) {},
+            onDeleteProfile: (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('Пока нет профилей'), findsOneWidget);
+    expect(find.textContaining('отсканируйте QR-код'), findsOneWidget);
   });
 
   testWidgets('subscription list uses the compact selected layout', (
