@@ -82,6 +82,7 @@ class XrayProfile extends ProxyLink {
       'outbounds',
       'routing',
       'observatory',
+      'burstObservatory',
       'policy',
       'stats',
     });
@@ -224,8 +225,17 @@ class XrayProfile extends ProxyLink {
       final balancer = _map(item);
       _keys(balancer, {'tag', 'selector', 'strategy', 'fallbackTag'});
       if (!balancerTags.add(_tag(balancer['tag']))) _invalid();
-      if (_map(balancer['strategy'])['type'] != 'leastPing' ||
-          protocols[balancer['fallbackTag']] != 'blackhole') {
+      final strategy = _map(balancer['strategy']);
+      _keys(strategy, {'type', 'settings'});
+      if (strategy['settings'] != null) _map(strategy['settings']);
+      // Until probes finish, traffic goes to the fallback: either fail closed
+      // (blackhole) or a real server. Never freedom, which would leak direct.
+      if (!const {'leastPing', 'leastLoad'}.contains(strategy['type']) ||
+          !const {
+            'blackhole',
+            'vless',
+            'hysteria',
+          }.contains(protocols[balancer['fallbackTag']])) {
         _invalid();
       }
       final selectors = _list(balancer['selector']).map(_tag).toList();
@@ -291,24 +301,50 @@ class XrayProfile extends ProxyLink {
       }
     }
     if (balancers.isNotEmpty) {
-      final observation = _map(root['observatory']);
-      _keys(observation, {
-        'subjectSelector',
-        'probeUrl',
-        'probeInterval',
-        'enableConcurrency',
-      });
-      final probe = Uri.tryParse(observation['probeUrl']?.toString() ?? '');
-      if (probe == null ||
-          probe.scheme != 'https' ||
-          probe.host.isEmpty ||
-          probe.userInfo.isNotEmpty ||
-          !_validProbeInterval(observation['probeInterval'])) {
-        _invalid();
+      // Every candidate must be measured by the classic or the burst observer;
+      // otherwise its balancer would pick blindly.
+      final selectors = <String>[];
+      if (root['observatory'] != null) {
+        final observation = _map(root['observatory']);
+        _keys(observation, {
+          'subjectSelector',
+          'probeUrl',
+          'probeInterval',
+          'enableConcurrency',
+        });
+        if (!_validProbeUrl(observation['probeUrl'], httpsOnly: true) ||
+            !_validProbeInterval(observation['probeInterval'])) {
+          _invalid();
+        }
+        selectors.addAll(_list(observation['subjectSelector']).map(_tag));
       }
-      final selectors = _list(
-        observation['subjectSelector'],
-      ).map(_tag).toList();
+      if (root['burstObservatory'] != null) {
+        final burst = _map(root['burstObservatory']);
+        _keys(burst, {'subjectSelector', 'pingConfig'});
+        final ping = _map(burst['pingConfig']);
+        _keys(ping, {
+          'destination',
+          'connectivity',
+          'interval',
+          'sampling',
+          'timeout',
+          'httpMethod',
+        });
+        final connectivity = ping['connectivity'];
+        if (!_validProbeUrl(ping['destination']) ||
+            (connectivity != null &&
+                connectivity != '' &&
+                !_validProbeUrl(connectivity)) ||
+            !_validProbeInterval(ping['interval']) ||
+            !_validProbeInterval(ping['timeout']) ||
+            (ping['sampling'] != null && ping['sampling'] is! int) ||
+            (ping['httpMethod'] != null &&
+                !const {'GET', 'HEAD'}.contains(ping['httpMethod']))) {
+          _invalid();
+        }
+        selectors.addAll(_list(burst['subjectSelector']).map(_tag));
+      }
+      if (selectors.isEmpty) _invalid();
       for (final item in balancers) {
         final balancer = _map(item);
         for (final out in protocols.keys.where(
@@ -330,6 +366,14 @@ class XrayProfile extends ProxyLink {
       Set.unmodifiable(endpoints),
       balancers.isNotEmpty,
     );
+  }
+
+  static bool _validProbeUrl(dynamic value, {bool httpsOnly = false}) {
+    final probe = Uri.tryParse(value?.toString() ?? '');
+    return probe != null &&
+        (probe.scheme == 'https' || !httpsOnly && probe.scheme == 'http') &&
+        probe.host.isNotEmpty &&
+        probe.userInfo.isEmpty;
   }
 
   static bool _validProbeInterval(dynamic value) {

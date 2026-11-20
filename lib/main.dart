@@ -26,6 +26,7 @@ import 'services/connectivity_targets.dart';
 import 'services/connectivity_tester.dart';
 import 'services/android_play_update_service.dart';
 import 'services/profile_availability.dart';
+import 'services/windows_profile_check.dart';
 import 'services/dpi_evasion_config.dart';
 import 'services/dpi_evasion_manager.dart';
 import 'services/domain_rule_normalizer.dart';
@@ -6498,6 +6499,8 @@ $regItems = foreach ($rp in $regPaths) {
               pendingProfileUri: _pendingProfileUri,
               checkBackend: Platform.isAndroid
                   ? AndroidProfileCheckBackend()
+                  : Platform.isWindows && _isDesktopPlatform
+                  ? WindowsProfileCheckBackend()
                   : null,
               profiles: _profiles,
               selectedProfile: _selectedProfile,

@@ -64,6 +64,43 @@ class SubscriptionService {
           'Проверьте доступ к данным приложения и попробуйте снова.',
         );
       }
+      try {
+        return await _fetchProfiles(uri, headers);
+      } on FormatException {
+        if (!(headers['Accept'] ?? '').contains(xrayJsonMediaType)) rethrow;
+        // A JSON shape this build cannot import must never cost the user the
+        // subscription: ask the same server for plain links instead.
+        return await _fetchProfiles(uri, {...headers, 'Accept': '*/*'});
+      }
+    } on SubscriptionFetchException {
+      rethrow;
+    } on FormatException {
+      throw const SubscriptionFetchException(
+        'Подписка содержит некорректный или неподдерживаемый Xray-профиль.',
+      );
+    } on HandshakeException {
+      throw const SubscriptionFetchException(
+        'Не удалось установить защищённое соединение с сервером подписки. '
+        'Попробуйте ещё раз или откройте ссылку через другую сеть.',
+      );
+    } on SocketException catch (e) {
+      throw SubscriptionFetchException('Ошибка сети: ${e.message}');
+    } on http.ClientException {
+      throw const SubscriptionFetchException('Не удалось загрузить подписку.');
+    } on TimeoutException {
+      throw const SubscriptionFetchException(
+        'Сервер подписки не ответил вовремя',
+      );
+    } catch (_) {
+      throw const SubscriptionFetchException('Не удалось обработать подписку.');
+    }
+  }
+
+  Future<List<String>> _fetchProfiles(
+    Uri uri,
+    Map<String, String> headers,
+  ) async {
+    {
       final response = await _fetchResponse(uri, headers);
       // A limit response may deliberately contain a syntactically valid dummy URI.
       // Check the headers before HTTP status, decoding or updating saved profiles.
@@ -103,27 +140,6 @@ class SubscriptionService {
       }
 
       return profiles;
-    } on SubscriptionFetchException {
-      rethrow;
-    } on FormatException {
-      throw const SubscriptionFetchException(
-        'Подписка содержит некорректный или неподдерживаемый Xray-профиль.',
-      );
-    } on HandshakeException {
-      throw const SubscriptionFetchException(
-        'Не удалось установить защищённое соединение с сервером подписки. '
-        'Попробуйте ещё раз или откройте ссылку через другую сеть.',
-      );
-    } on SocketException catch (e) {
-      throw SubscriptionFetchException('Ошибка сети: ${e.message}');
-    } on http.ClientException {
-      throw const SubscriptionFetchException('Не удалось загрузить подписку.');
-    } on TimeoutException {
-      throw const SubscriptionFetchException(
-        'Сервер подписки не ответил вовремя',
-      );
-    } catch (_) {
-      throw const SubscriptionFetchException('Не удалось обработать подписку.');
     }
   }
 

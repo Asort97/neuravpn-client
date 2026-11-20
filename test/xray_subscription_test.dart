@@ -27,15 +27,23 @@ void main() {
   });
   tearDown(() => directory.delete(recursive: true));
 
-  SubscriptionService service(http.Response response) => SubscriptionService(
+  // [links] answers the plain-links retry a build makes when it cannot import
+  // the JSON the server sent; without it the retry gets the same response.
+  SubscriptionService service(
+    http.Response response, {
+    http.Response? links,
+    List<String>? accepts,
+  }) => SubscriptionService(
     identity: testSubscriptionIdentity(directory),
     isWindowsOverride: false,
     client: MockClient((request) async {
-      expect(request.headers['Accept'], 'application/vnd.neuravpn.xray+json');
+      final accept = request.headers['Accept']!;
+      accepts?.add(accept);
+      expect(accept, anyOf('application/vnd.neuravpn.xray+json;v=2', '*/*'));
       expect(request.headers['X-HWID'], isNotEmpty);
       expect(request.headers['X-Ver-OS'], isNotEmpty);
       expect(request.headers['User-Agent'], startsWith('NeuraVPN/'));
-      return response;
+      return accept == '*/*' && links != null ? links : response;
     }),
   );
 
@@ -194,9 +202,19 @@ void main() {
         (c) => c['outbounds'][0]['streamSettings']['tlsSettings'] = {
           'certificateFile': 'secret',
         },
-        (c) => c['routing']['balancers'][0]['fallbackTag'] = 'auto-hysteria2',
+        // A balancer may fall back to a real server, never to a direct exit.
+        (c) {
+          c['outbounds'].add({'tag': 'direct', 'protocol': 'freedom'});
+          c['routing']['balancers'][0]['fallbackTag'] = 'direct';
+        },
+        (c) => c['routing']['balancers'][0]['strategy'] = {'type': 'random'},
         (c) => c['routing']['balancers'][0]['selector'] = ['unavailable'],
         (c) => c['observatory']['probeUrl'] = 'http://example.com',
+        (c) => c['observatory']['subjectSelector'] = ['nothing-'],
+        (c) => c['burstObservatory'] = {
+          'subjectSelector': ['auto-'],
+          'pingConfig': {'destination': 'file:///etc/passwd'},
+        },
         (c) => c['outbounds'][0]['mux']['enabled'] = true,
       ]) {
         final input = xraySubscriptionProfile();
@@ -219,6 +237,67 @@ void main() {
         ).fetchSubscription('https://example.com/sub'),
         throwsA(isA<SubscriptionFetchException>()),
       );
+    },
+  );
+
+  test(
+    'unimportable JSON falls back to plain links instead of losing keys',
+    () async {
+      final accepts = <String>[];
+      final invalid = xraySubscriptionProfile()..['api'] = {};
+      const link =
+          'vless://11111111-1111-4111-8111-111111111111@example.com:443'
+          '?type=tcp&security=reality&pbk=pkKO6JYPzg5UIiUdyksPj1eK5iPlA_ccqOQmDhGvhmc'
+          '&sni=example.org&sid=ab&fp=chrome&encryption=none#Plain';
+      final profiles = await service(
+        http.Response.bytes(utf8.encode(jsonEncode([invalid])), 200),
+        links: http.Response(link, 200),
+        accepts: accepts,
+      ).fetchSubscription('https://example.com/sub');
+      expect(profiles, [link]);
+      expect(accepts, ['application/vnd.neuravpn.xray+json;v=2', '*/*']);
+    },
+  );
+
+  test(
+    'every profile the bot sends to v=2 clients imports and starts',
+    () async {
+      final profiles =
+          jsonDecode(
+                File(
+                  'test/fixtures/bot_v2_subscription.json',
+                ).readAsStringSync(),
+              )
+              as List;
+      expect(profiles, isNotEmpty);
+      final body = jsonEncode(profiles);
+      expect(body, contains('leastLoad'));
+      expect(body, contains('burstObservatory'));
+      expect(body, contains('tlshello'));
+      final imported = await service(
+        http.Response.bytes(utf8.encode(body), 200),
+      ).fetchSubscription('https://example.com/sub');
+      expect(imported, hasLength(profiles.length));
+      if (!Platform.isWindows) return;
+      final xray = File('assets/bin/xray.exe').absolute.path;
+      final tmp = await Directory.systemTemp.createTemp('neura_v2_');
+      addTearDown(() => tmp.delete(recursive: true));
+      for (final uri in imported) {
+        final link = parseProxyUri(uri)!;
+        for (final config in [
+          generateWindowsXrayProxyConfig(link, SplitTunnelConfig(mode: 'all')),
+          generateAndroidXrayConfig(link, SplitTunnelConfig()),
+        ]) {
+          final file = File('${tmp.path}/c.json')..writeAsStringSync(config);
+          final result = await Process.run(xray, [
+            'run',
+            '-test',
+            '-c',
+            file.path,
+          ]);
+          expect(result.exitCode, 0, reason: '${link.tag}\n${result.stdout}');
+        }
+      }
     },
   );
 
@@ -376,9 +455,9 @@ void main() {
           .toList();
       messenger.setMockMethodCallHandler(channel, (call) async {
         if (call.method != 'check') return null;
-        final targets = (jsonDecode(call.arguments['targets'] as String)
-                as List)
-            .cast<Map<String, dynamic>>();
+        final targets =
+            (jsonDecode(call.arguments['targets'] as String) as List)
+                .cast<Map<String, dynamic>>();
         expect(targets.map((t) => t['outbound']), candidates);
         return {'status': 'done'};
       });

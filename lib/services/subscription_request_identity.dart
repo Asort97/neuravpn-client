@@ -7,6 +7,9 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 
+/// Full Xray JSON subscription format understood by the NeuraVPN bot.
+const xrayJsonMediaType = 'application/vnd.neuravpn.xray+json';
+
 class InstallationIdStore {
   InstallationIdStore(Directory directory)
     : _file = File(path.join(directory.path, 'subscription-installation-id'));
@@ -109,8 +112,11 @@ class SubscriptionRequestIdentity {
       'X-Device-Model': model.isEmpty ? 'Unknown' : model,
       'User-Agent':
           'NeuraVPN/$version ($os; build ${_headerValue(info.buildNumber)})',
+      // v=2: this build imports every balancer the server emits (leastLoad,
+      // burstObservatory, server fallbacks). The server gives bare-type
+      // clients plain links because older parsers reject those profiles.
       'Accept': os == 'Android' || os == 'Windows'
-          ? 'application/vnd.neuravpn.xray+json'
+          ? '$xrayJsonMediaType;v=2'
           : '*/*',
     });
   }
