@@ -102,7 +102,7 @@ msix_config:
   display_name: neuravpn
   publisher_display_name: neuravpn
   identity_name: com.neuravpn.client
-  msix_version: 1.0.15.0
+  msix_version: 1.0.18.0
   logo_path: assets/images/11zon_cropped.png
   capabilities: internetClient
   output_name: neuravpn
