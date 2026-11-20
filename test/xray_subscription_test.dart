@@ -225,20 +225,101 @@ void main() {
   );
 
   test(
-    'JSON is parsed atomically; a bad profile cannot drop only some nodes',
+    'a bad profile is left out whole; it never trims nodes or hides others',
     () async {
+      final good = xraySubscriptionProfile(candidates: 4);
       final invalid = xraySubscriptionProfile()..['api'] = {};
-      await expectLater(
-        service(
-          http.Response.bytes(
-            utf8.encode(jsonEncode([xraySubscriptionProfile(), invalid])),
-            200,
-          ),
-        ).fetchSubscription('https://example.com/sub'),
-        throwsA(isA<SubscriptionFetchException>()),
+      final profiles = await service(
+        http.Response.bytes(utf8.encode(jsonEncode([good, invalid])), 200),
+      ).fetchSubscription('https://example.com/sub');
+      expect(profiles, hasLength(1));
+      // The kept profile is complete: every candidate is still there.
+      expect(
+        (jsonDecode(profiles.single)['outbounds'] as List).length,
+        (good['outbounds'] as List).length,
       );
     },
   );
+
+  test('balanced node with Trojan, VMess and Shadowsocks members imports', () {
+    Map<String, dynamic> node() {
+      final profile =
+          jsonDecode(jsonEncode(xraySubscriptionProfile(candidates: 1)))
+              as Map<String, dynamic>;
+      final outbounds = profile['outbounds'] as List;
+      outbounds.insertAll(0, [
+        {
+          'tag': 'auto-trojan',
+          'protocol': 'trojan',
+          'settings': {
+            'servers': [
+              {'address': '192.0.2.10', 'port': 443, 'password': 'test'},
+            ],
+          },
+          'streamSettings': {
+            'network': 'tcp',
+            'security': 'tls',
+            'tlsSettings': {'serverName': 'example.org'},
+          },
+        },
+        {
+          'tag': 'auto-vmess',
+          'protocol': 'vmess',
+          'settings': {
+            'vnext': [
+              {
+                'address': '192.0.2.11',
+                'port': 443,
+                'users': [
+                  {
+                    'id': '33333333-3333-4333-8333-333333333333',
+                    'security': 'auto',
+                  },
+                ],
+              },
+            ],
+          },
+          'streamSettings': {'network': 'kcp', 'security': 'none'},
+        },
+        {
+          'tag': 'auto-ss',
+          'protocol': 'shadowsocks',
+          'settings': {
+            'servers': [
+              {
+                'address': '192.0.2.12',
+                'port': 8388,
+                'method': 'aes-128-gcm',
+                'password': 'test',
+              },
+            ],
+          },
+          'streamSettings': {'network': 'tcp', 'security': 'none'},
+        },
+      ]);
+      return profile;
+    }
+
+    final link = XrayProfile.fromJson(node());
+    expect(link.isAutomatic, isTrue);
+    expect(link.endpointHosts, containsAll(['192.0.2.10', '192.0.2.11']));
+    final plan = ProfileProbePlan.build([link.serialized]);
+    expect(
+      plan.targets.map((t) => t.outbound['protocol']),
+      containsAll(['trojan', 'vmess', 'shadowsocks']),
+    );
+    for (final mutate in <void Function(List)>[
+      // Trojan has no cipher of its own: TLS or REALITY is mandatory.
+      (o) => o[0]['streamSettings']['security'] = 'none',
+      (o) => o[1]['settings']['vnext'][0]['users'][0]['security'] = 'none',
+      (o) => o[2]['settings']['servers'][0]['method'] = 'none',
+      (o) => o[2]['settings']['servers'][0]['method'] = 'rc4-md5',
+    ]) {
+      final input = node();
+      mutate(input['outbounds'] as List);
+      expect(() => XrayProfile.fromJson(input), throwsFormatException);
+    }
+  });
 
   test(
     'unimportable JSON falls back to plain links instead of losing keys',

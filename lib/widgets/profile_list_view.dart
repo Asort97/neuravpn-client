@@ -95,14 +95,19 @@ class ProfileLabel {
 
   static String _detail(ProxyLink link) {
     if (link is XrayProfile) {
+      const names = {
+        'vless': 'VLESS',
+        'hysteria': 'Hysteria 2',
+        'trojan': 'Trojan',
+        'vmess': 'VMess',
+        'shadowsocks': 'Shadowsocks',
+      };
       final servers = (link.config['outbounds'] as List)
           .whereType<Map>()
-          .where((o) => o['protocol'] == 'vless' || o['protocol'] == 'hysteria')
+          .where((o) => names.containsKey(o['protocol']))
           .toList();
       if (!link.isAutomatic) {
-        return servers.isNotEmpty && servers.first['protocol'] == 'hysteria'
-            ? 'Hysteria 2'
-            : 'VLESS';
+        return servers.isEmpty ? 'Xray' : names[servers.first['protocol']]!;
       }
       return servers.length > 1
           ? 'Автовыбор · ${serverCountLabel(servers.length)}'
@@ -830,16 +835,18 @@ class _ProfileListViewState extends State<ProfileListView> {
                               const SizedBox(height: 3),
                               Text(
                                 subscription.error ??
-                                [
-                                  _profileCountLabel(subscription.profileCount),
-                                  _checkSummary(
-                                        subscription.id,
-                                        subscription.profiles,
-                                      ) ??
-                                      _lastUpdatedLabel(
-                                        subscription.lastUpdated,
+                                    [
+                                      _profileCountLabel(
+                                        subscription.profileCount,
                                       ),
-                                ].join(' · '),
+                                      _checkSummary(
+                                            subscription.id,
+                                            subscription.profiles,
+                                          ) ??
+                                          _lastUpdatedLabel(
+                                            subscription.lastUpdated,
+                                          ),
+                                    ].join(' · '),
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: TextStyle(

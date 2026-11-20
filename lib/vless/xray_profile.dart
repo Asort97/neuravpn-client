@@ -155,8 +155,7 @@ class XrayProfile extends ProxyLink {
       if (protocols.containsKey(tag)) _invalid();
       final protocol = out['protocol'];
       if (!const {
-        'vless',
-        'hysteria',
+        ..._proxyProtocols,
         'freedom',
         'blackhole',
         'dns',
@@ -167,8 +166,8 @@ class XrayProfile extends ProxyLink {
       if (out['mux'] != null && _map(out['mux'])['enabled'] != false) {
         _invalid();
       }
-      if (protocol != 'vless' && protocol != 'hysteria') continue;
-      final stream = _map(out['streamSettings']);
+      if (!_proxyProtocols.contains(protocol)) continue;
+      final stream = _map(out['streamSettings'] ?? <String, dynamic>{});
       _keys(stream, {
         'network',
         'security',
@@ -182,21 +181,42 @@ class XrayProfile extends ProxyLink {
         'grpcSettings',
         'httpupgradeSettings',
         'hysteriaSettings',
+        'kcpSettings',
         'finalmask',
       });
-      if (!const {'tls', 'reality'}.contains(stream['security'])) _invalid();
+      // VLESS and Trojan carry no encryption of their own: TLS or REALITY is
+      // mandatory. VMess and Shadowsocks encrypt every payload themselves.
+      final security = stream['security'];
+      final ownCipher = protocol == 'vmess' || protocol == 'shadowsocks';
+      if (!(const {'tls', 'reality'}.contains(security) ||
+          ownCipher && (security == null || security == 'none'))) {
+        _invalid();
+      }
       final tls = stream['tlsSettings'];
       if (tls is Map &&
           (tls['allowInsecure'] == true || tls['insecure'] == true)) {
         _invalid();
       }
       final settings = _map(out['settings']);
-      final servers = protocol == 'vless'
-          ? _list(settings['vnext'])
-          : [settings];
+      final servers = switch (protocol) {
+        'vless' || 'vmess' => _list(settings['vnext']),
+        'trojan' || 'shadowsocks' => _list(settings['servers']),
+        _ => [settings],
+      };
       if (servers.isEmpty) _invalid();
       for (final server in servers) {
         final endpoint = _map(server);
+        if (protocol == 'shadowsocks' &&
+            !_shadowsocksMethods.contains(endpoint['method'])) {
+          _invalid();
+        }
+        if (protocol == 'vmess') {
+          for (final user in _list(endpoint['users'])) {
+            if (const {'none', 'zero'}.contains(_map(user)['security'])) {
+              _invalid();
+            }
+          }
+        }
         final address = endpoint['address'];
         final port = endpoint['port'];
         if (address is! String ||
@@ -233,8 +253,7 @@ class XrayProfile extends ProxyLink {
       if (!const {'leastPing', 'leastLoad'}.contains(strategy['type']) ||
           !const {
             'blackhole',
-            'vless',
-            'hysteria',
+            ..._proxyProtocols,
           }.contains(protocols[balancer['fallbackTag']])) {
         _invalid();
       }
@@ -243,9 +262,7 @@ class XrayProfile extends ProxyLink {
           .where((out) => selectors.any(out.key.startsWith))
           .toList();
       if (candidates.isEmpty ||
-          candidates.any(
-            (out) => !const {'vless', 'hysteria'}.contains(out.value),
-          )) {
+          candidates.any((out) => !_proxyProtocols.contains(out.value))) {
         _invalid();
       }
     }
@@ -367,6 +384,28 @@ class XrayProfile extends ProxyLink {
       balancers.isNotEmpty,
     );
   }
+
+  /// Outbounds that always leave through a remote server.
+  static const _proxyProtocols = {
+    'vless',
+    'hysteria',
+    'trojan',
+    'vmess',
+    'shadowsocks',
+  };
+
+  /// AEAD and 2022 ciphers only; never `none`/`plain` or legacy stream ciphers.
+  static const _shadowsocksMethods = {
+    'aes-128-gcm',
+    'aes-256-gcm',
+    'chacha20-poly1305',
+    'chacha20-ietf-poly1305',
+    'xchacha20-poly1305',
+    'xchacha20-ietf-poly1305',
+    '2022-blake3-aes-128-gcm',
+    '2022-blake3-aes-256-gcm',
+    '2022-blake3-chacha20-poly1305',
+  };
 
   static bool _validProbeUrl(dynamic value, {bool httpsOnly = false}) {
     final probe = Uri.tryParse(value?.toString() ?? '');

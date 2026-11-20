@@ -330,9 +330,21 @@ class SubscriptionService {
     if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       final decoded = jsonDecode(trimmed);
       final objects = decoded is List ? decoded : [decoded];
-      return objects
-          .map((value) => XrayProfile.fromJson(value).serialized)
-          .toList();
+      // Each profile is all-or-nothing, never trimmed to some of its servers.
+      // A profile this build cannot import is left out so the others still
+      // arrive; if none can be imported the caller falls back to plain links.
+      final profiles = <String>[];
+      for (final value in objects) {
+        try {
+          profiles.add(XrayProfile.fromJson(value).serialized);
+        } on FormatException {
+          continue;
+        }
+      }
+      if (profiles.isEmpty) {
+        throw const FormatException('No importable Xray profile');
+      }
+      return profiles;
     }
     final profiles = <String>[];
     final seen = <String>{};
